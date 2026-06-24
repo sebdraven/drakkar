@@ -1,0 +1,18 @@
+meta:
+  id: T1430
+  name: Location Tracking
+  tactic: collection
+  references:
+    - https://attack.mitre.org/techniques/T1430/
+  authors:
+    - sebastien.larinier
+features:
+  and:
+    - or:
+        - permission: android.permission.ACCESS_FINE_LOCATION
+        - permission: android.permission.ACCESS_COARSE_LOCATION
+    - sequence:
+        - api: Landroid/location/LocationManager;->getLastKnownLocation
+        - or:
+            - api: Landroid/telephony/SmsManager;->sendTextMessage
+            - api: Ljava/net/HttpURLConnection;->connect

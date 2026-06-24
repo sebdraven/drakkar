@@ -1,0 +1,12 @@
+meta:
+  id: T1516
+  name: Input Injection
+  tactic: defense-evasion
+  references:
+    - https://attack.mitre.org/techniques/T1516/
+  authors:
+    - sebastien.larinier
+features:
+  and:
+    - permission: android.permission.BIND_ACCESSIBILITY_SERVICE
+    - api: Landroid/accessibilityservice/AccessibilityService;->performGlobalAction
