@@ -1,21 +1,17 @@
-//! Parsing AndroidManifest.xml (binaire) via LIEF Android : permissions,
-//! intent filters, services (dont accessibility).
+//! Parsing AndroidManifest.xml (format binaire AXML) depuis l'APK :
+//! permissions, intent filters, services (dont accessibility) -> ApkFeatures.
+//!
+//! Implémentation à venir via un décodeur AXML dédié (ex. crate `axmldecoder`),
+//! le manifest binaire n'étant couvert ni par `dex` ni nécessairement par LIEF.
 use crate::model::ApkFeatures;
 use anyhow::Result;
 use std::path::Path;
 
-#[cfg(not(feature = "lief-backend"))]
-pub fn extract(_path: &Path, features: &mut ApkFeatures) -> Result<()> {
-    tracing::warn!("manifest stub — features vides");
-    features.package = "com.example.stub".into();
-    Ok(())
-}
-
-#[cfg(feature = "lief-backend")]
-pub fn extract(path: &Path, features: &mut ApkFeatures) -> Result<()> {
-    // TODO(lief): décoder le manifest binaire (axml) -> permissions,
-    // <intent-filter><action>, <service> + flag accessibilityService.
-    tracing::info!(apk = %path.display(), "manifest extract (lief-backend) — à implémenter");
+pub fn extract(apk_path: &Path, features: &mut ApkFeatures) -> Result<()> {
+    // TODO(axml): ouvrir l'entrée "AndroidManifest.xml" du zip APK, décoder l'AXML,
+    // extraire <uses-permission>, <intent-filter><action>, <service> (+ flag
+    // android:permission=BIND_ACCESSIBILITY_SERVICE) vers `features`.
+    tracing::debug!(apk = %apk_path.display(), "manifest stub — features manifest vides");
     let _ = features;
     Ok(())
 }
