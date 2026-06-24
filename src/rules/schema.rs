@@ -1,4 +1,9 @@
 //! Schéma des règles (YAML), DSL composable style capa.
+//!
+//! serde_yaml 0.9 ne désérialise plus les enums externally-tagged depuis des
+//! maps à clé unique (`and:` …) — il exige des tags `!and`. Pour garder un YAML
+//! de règles lisible (maps à clé unique), on désérialise `Feature` à la main
+//! depuis une map générique.
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -18,15 +23,12 @@ pub struct Meta {
     pub authors: Vec<String>,
 }
 
-/// Expression de feature. Représentation YAML externally-tagged :
-///   and:   [ ... ]
-///   or:    [ ... ]
-///   not:   { ... }
+/// Expression de feature. Chaque variante est une map à clé unique en YAML :
+///   and: [ ... ] | or: [ ... ] | not: { ... }
 ///   count: { feature: {...}, min: 2 }
 ///   sequence: [ {api: ...}, {api: ...} ]
 ///   api / string / permission / intent-action / native-symbol : scalaire
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone)]
 pub enum Feature {
     And(Vec<Feature>),
     Or(Vec<Feature>),
@@ -38,4 +40,79 @@ pub enum Feature {
     Permission(String),
     IntentAction(String),
     NativeSymbol(String),
+}
+
+impl<'de> Deserialize<'de> for Feature {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        use serde_yaml::Value;
+
+        let value = Value::deserialize(deserializer)?;
+        let map = value
+            .as_mapping()
+            .ok_or_else(|| D::Error::custom("feature must be a single-key map"))?;
+        let (key, val) = map
+            .iter()
+            .next()
+            .ok_or_else(|| D::Error::custom("empty feature map"))?;
+        let key = key
+            .as_str()
+            .ok_or_else(|| D::Error::custom("feature key must be a string"))?;
+
+        // Helper : parse une liste de sous-features.
+        let parse_list = |v: &Value| -> Result<Vec<Feature>, D::Error> {
+            let seq = v
+                .as_sequence()
+                .ok_or_else(|| D::Error::custom(format!("`{key}` expects a list")))?;
+            seq.iter()
+                .map(|item| {
+                    Feature::deserialize(item.clone()).map_err(D::Error::custom)
+                })
+                .collect()
+        };
+
+        // Helper : parse une feature scalaire (string).
+        let as_string = |v: &Value| -> Result<String, D::Error> {
+            v.as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| D::Error::custom(format!("`{key}` expects a string")))
+        };
+
+        let feature = match key {
+            "and" => Feature::And(parse_list(val)?),
+            "or" => Feature::Or(parse_list(val)?),
+            "not" => Feature::Not(Box::new(
+                Feature::deserialize(val.clone()).map_err(D::Error::custom)?,
+            )),
+            "sequence" => Feature::Sequence(parse_list(val)?),
+            "count" => {
+                let m = val
+                    .as_mapping()
+                    .ok_or_else(|| D::Error::custom("`count` expects a map"))?;
+                let feature = m
+                    .get(Value::from("feature"))
+                    .ok_or_else(|| D::Error::custom("`count` missing `feature`"))?;
+                let min = m
+                    .get(Value::from("min"))
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| D::Error::custom("`count` missing `min`"))?;
+                Feature::Count {
+                    feature: Box::new(
+                        Feature::deserialize(feature.clone()).map_err(D::Error::custom)?,
+                    ),
+                    min: min as usize,
+                }
+            }
+            "api" => Feature::Api(as_string(val)?),
+            "string" => Feature::String(as_string(val)?),
+            "permission" => Feature::Permission(as_string(val)?),
+            "intent-action" => Feature::IntentAction(as_string(val)?),
+            "native-symbol" => Feature::NativeSymbol(as_string(val)?),
+            other => return Err(D::Error::custom(format!("unknown feature `{other}`"))),
+        };
+        Ok(feature)
+    }
 }

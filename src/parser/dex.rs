@@ -101,10 +101,16 @@ fn u16_to_le_bytes(insns: &[u16]) -> Vec<u8> {
     out
 }
 
-/// Descripteur de méthode. À affiner selon l'API proto exacte du crate `dex`
-/// (shorty est une approximation suffisante pour le matching API par sous-chaîne).
+/// Descripteur Dalvik complet du caller : (params)return.
+/// Ex. (Landroid/content/Context;I)V — reconstruit depuis params() + return_type().
 fn descriptor_of(method: &dex::method::Method) -> String {
-    method.shorty().to_string()
+    let mut d = String::from("(");
+    for p in method.params() {
+        d.push_str(p.type_descriptor());
+    }
+    d.push(')');
+    d.push_str(method.return_type().type_descriptor());
+    d
 }
 
 /// true si l'instruction est un invoke-* (virtual/super/direct/static/interface, +/range).
@@ -150,9 +156,28 @@ fn resolve_method(dex: &dex::Dex<impl AsRef<[u8]>>, idx: u64) -> Result<MethodRe
     let name = dex
         .get_string(item.name_idx() as StringId)?
         .to_string();
-    let descriptor = dex
-        .get_proto_item(item.proto_idx() as ProtoId)
-        .map(|p| p.shorty().to_string())
-        .unwrap_or_default();
+    let descriptor = resolve_proto_descriptor(dex, item.proto_idx() as ProtoId);
     Ok(MethodRef { class, name, descriptor })
+}
+
+/// Reconstruit un descripteur lisible pour le callee depuis son ProtoIdItem.
+/// return_type est résolu exactement (TypeId -> descripteur) ; les params sont
+/// approximés via le shorty (formes courtes : L pour tout objet, types primitifs
+/// exacts). Suffisant pour le matching MITRE par class->name.
+fn resolve_proto_descriptor(dex: &dex::Dex<impl AsRef<[u8]>>, proto: dex::method::ProtoId) -> String {
+    let proto = match dex.get_proto_item(proto) {
+        Ok(p) => p,
+        Err(_) => return String::new(),
+    };
+    // shorty : 1er char = return, le reste = params (formes courtes).
+    let shorty = dex
+        .get_string(proto.shorty())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let params: String = shorty.chars().skip(1).collect();
+    let ret = dex
+        .get_type(proto.return_type())
+        .map(|t| t.type_descriptor().to_string())
+        .unwrap_or_else(|_| "V".into());
+    format!("({params}){ret}")
 }
