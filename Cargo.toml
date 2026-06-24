@@ -17,7 +17,19 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# LIEF: build C++ lourd, activé à la demande -> `cargo build --features lief-backend`
+# DEX parsing structurel (stable, crates.io) : classes -> methods -> code_item
+dex = "0.5"
+
+# Lecture de l'archive APK (zip) pour extraire classes*.dex et lib/*/*.so
+zip = "2"
+tempfile = "3"
+
+# Décodage bytecode Dalvik (invoke-* + CFG intra-méthode). Repo Androguard,
+# pas encore de release -> dépendance git. À pinner sur un rev une fois l'API stable.
+dex-bytecode = { git = "https://github.com/androguard/dex-bytecode", branch = "main" }
+
+# LIEF: réservé au parsing ELF natif (lib/*/*.so). Build C++ lourd, activé à la
+# demande -> `cargo build --features lief-backend`.
 lief = { version = "0.16", optional = true }
 
 [features]
