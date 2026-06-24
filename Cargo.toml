@@ -1,0 +1,29 @@
+[package]
+name = "drakkar"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Static MITRE ATT&CK for Mobile detection on Android APKs via inter-procedural CFG"
+authors = ["Sebastien Larinier"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+petgraph = { version = "0.6", features = ["serde-1"] }
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# LIEF: build C++ lourd, activé à la demande -> `cargo build --features lief-backend`
+lief = { version = "0.16", optional = true }
+
+[features]
+default = []
+lief-backend = ["dep:lief"]
+
+[[bin]]
+name = "drakkar"
+path = "src/main.rs"
