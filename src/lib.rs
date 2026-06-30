@@ -1,11 +1,11 @@
 //! Drakkar — static MITRE ATT&CK for Mobile detection on Android APKs.
 //!
-//! Pipeline: LIEF (DEX/ELF/manifest) -> CFG inter-proc -> matching MITRE
-//!           -> export NetworkX (pour APKolgomorov) + candidats Kharon.
+//! Pipeline: DEX (dex + dex-bytecode) + manifest (AXML) + ELF natif (LIEF)
+//!           -> CFG inter-proc -> matching MITRE (catalogue auto-update STIX)
+//!           -> export NetworkX (pour APKolgomorov).
 
 pub mod model;
 pub mod parser;
 pub mod cfg;
 pub mod rules;
 pub mod export;
-pub mod kharon;

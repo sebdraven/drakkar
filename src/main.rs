@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use drakkar::{export, kharon, parser, rules::Engine};
+use drakkar::{export, parser, rules::Engine};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -9,17 +9,17 @@ struct Cli {
     /// APK à analyser
     apk: PathBuf,
 
-    /// Répertoire des règles MITRE (*.yaml)
-    #[arg(short, long, default_value = "rules/mitre")]
-    rules: PathBuf,
+    /// Répertoire de règles à utiliser à la place du cache auto-généré (override).
+    #[arg(short, long)]
+    rules: Option<PathBuf>,
+
+    /// Force le re-téléchargement du catalogue MITRE et la régénération du cache.
+    #[arg(long)]
+    refresh: bool,
 
     /// Export du CFG en NetworkX node-link JSON (pour APKolgomorov)
     #[arg(long)]
     export_graph: Option<PathBuf>,
-
-    /// Summary Kharon pour confirmation dynamique des candidats
-    #[arg(long)]
-    kharon: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -33,13 +33,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let parsed = parser::parse_apk(&cli.apk)?;
-    let engine = Engine::load(&cli.rules)?;
-    let mut matches = engine.run(&parsed.features, &parsed.call_graph);
-
-    if let Some(k) = &cli.kharon {
-        let summary = kharon::load_summary(k)?;
-        kharon::confirm(&mut matches, &summary);
-    }
+    let engine = match &cli.rules {
+        Some(dir) => Engine::load(dir)?,
+        None => Engine::load_cached(cli.refresh)?,
+    };
+    let matches = engine.run(&parsed.features, &parsed.call_graph);
 
     if let Some(out) = &cli.export_graph {
         export::networkx::write(&parsed.call_graph, out)?;
