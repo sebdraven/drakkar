@@ -21,6 +21,17 @@ pub struct Meta {
     pub references: Vec<String>,
     #[serde(default)]
     pub authors: Vec<String>,
+    /// Détectabilité par analyse statique Drakkar :
+    /// `static` (permissions/API/CFG suffisent), `partial` (heuristique faible),
+    /// `out-of-scope` (réseau/serveur/hardware, non observable dans l'APK).
+    #[serde(default = "default_detectability")]
+    pub detectability: String,
+    #[serde(default)]
+    pub platforms: Vec<String>,
+}
+
+fn default_detectability() -> String {
+    "static".to_string()
 }
 
 /// Expression de feature. Chaque variante est une map à clé unique en YAML :
@@ -40,6 +51,13 @@ pub enum Feature {
     Permission(String),
     IntentAction(String),
     NativeSymbol(String),
+    /// Vrai si l'APK déclare un service lié à l'accessibility (BIND_ACCESSIBILITY_SERVICE).
+    AccessibilityService(bool),
+    /// Match sur le nom d'un service déclaré (sous-chaîne).
+    Service(String),
+    /// Marqueur explicite : technique non détectable statiquement (toujours faux).
+    /// Documente l'out-of-scope au lieu de laisser un trou dans la couverture.
+    Unsupported(String),
 }
 
 impl<'de> Deserialize<'de> for Feature {
@@ -84,9 +102,16 @@ impl<'de> Deserialize<'de> for Feature {
         let feature = match key {
             "and" => Feature::And(parse_list(val)?),
             "or" => Feature::Or(parse_list(val)?),
-            "not" => Feature::Not(Box::new(
-                Feature::deserialize(val.clone()).map_err(D::Error::custom)?,
-            )),
+            "not" => {
+                // `not` accepte soit une feature unique (map à clé unique), soit une
+                // liste (négation de la conjonction des sous-features).
+                let inner = if val.is_sequence() {
+                    Feature::And(parse_list(val)?)
+                } else {
+                    Feature::deserialize(val.clone()).map_err(D::Error::custom)?
+                };
+                Feature::Not(Box::new(inner))
+            }
             "sequence" => Feature::Sequence(parse_list(val)?),
             "count" => {
                 let m = val
@@ -111,6 +136,12 @@ impl<'de> Deserialize<'de> for Feature {
             "permission" => Feature::Permission(as_string(val)?),
             "intent-action" => Feature::IntentAction(as_string(val)?),
             "native-symbol" => Feature::NativeSymbol(as_string(val)?),
+            "accessibility-service" => Feature::AccessibilityService(
+                val.as_bool()
+                    .ok_or_else(|| D::Error::custom("`accessibility-service` expects a bool"))?,
+            ),
+            "service" => Feature::Service(as_string(val)?),
+            "unsupported" => Feature::Unsupported(as_string(val)?),
             other => return Err(D::Error::custom(format!("unknown feature `{other}`"))),
         };
         Ok(feature)
