@@ -1,4 +1,6 @@
 //! Moteur de règles MITRE (DSL composable style capa).
+pub mod catalog;
+pub mod fetch;
 pub mod schema;
 
 use crate::cfg::CallGraph;
