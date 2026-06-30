@@ -38,4 +38,9 @@ pub struct ApkFeatures {
     pub methods: Vec<MethodRef>,
     pub strings: Vec<String>,
     pub native_symbols: Vec<String>,
+    /// Classes des composants déclarés au manifest (activity/service/receiver/
+    /// provider/application), au format descripteur Dalvik `Lcom/foo/Bar;`.
+    /// Sert à valider les entrypoints du CFG (un callback ne compte que si sa
+    /// classe est un composant réellement déclaré).
+    pub components: Vec<String>,
 }

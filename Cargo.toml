@@ -24,6 +24,14 @@ dex = "0.5"
 zip = "2"
 tempfile = "3"
 
+# Décodage du manifest binaire (AXML) : permissions, services, intent filters.
+# Léger (pas de resources.arsc à linker).
+axmldecoder = "0.5"
+
+# Auto-update du catalogue MITRE : DL du STIX + cache local.
+ureq = { version = "2", features = ["json"] }
+dirs = "5"
+
 # Décodage bytecode Dalvik (invoke-* + CFG intra-méthode). Repo Androguard,
 # pas encore de release -> dépendance git. À pinner sur un rev une fois l'API stable.
 dex-bytecode = { git = "https://github.com/androguard/dex-bytecode", branch = "main" }
