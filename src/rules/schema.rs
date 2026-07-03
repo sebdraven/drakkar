@@ -46,6 +46,32 @@ pub enum Feature {
     Not(Box<Feature>),
     Count { feature: Box<Feature>, min: usize },
     Sequence(Vec<Feature>),
+    /// Co-atteignabilité depuis un pivot commun : `first` ET `second` (deux API)
+    /// sont atteintes depuis un même nœud du CFG, qualifié par les trois garde-fous.
+    /// Exprime « une même région de code enchaîne ces deux primitifs » (ex. crypto
+    /// puis réseau), bien plus fort qu'une simple co-présence.
+    CoReachable {
+        first: String,
+        second: String,
+        exclude_entrypoints: bool,
+        max_dist: Option<usize>,
+        exclude_allowlisted: bool,
+    },
+    /// Score d'intimité (à la IntDroid) entre deux GROUPES de primitifs via leurs
+    /// pivots communs : `n_pivots / (avg_dist + 1)`. `first` et `second` sont des
+    /// listes d'API équivalentes (ex. tous les sinks réseau système) ; un nœud
+    /// compte s'il matche l'un des membres du groupe. Matche si le score normalisé
+    /// dépasse `min_score` (défaut 0.0). Le score est toujours écrit dans l'evidence
+    /// pour tri/calibration en post-traitement. `label` nomme le couplage mesuré.
+    Intimacy {
+        first: Vec<String>,
+        second: Vec<String>,
+        label: Option<String>,
+        exclude_entrypoints: bool,
+        max_dist: Option<usize>,
+        exclude_allowlisted: bool,
+        min_score: f64,
+    },
     Api(String),
     String(String),
     Permission(String),
@@ -129,6 +155,97 @@ impl<'de> Deserialize<'de> for Feature {
                         Feature::deserialize(feature.clone()).map_err(D::Error::custom)?,
                     ),
                     min: min as usize,
+                }
+            }
+            "co-reachable" => {
+                let m = val
+                    .as_mapping()
+                    .ok_or_else(|| D::Error::custom("`co-reachable` expects a map"))?;
+                let req_str = |k: &str| -> Result<String, D::Error> {
+                    m.get(Value::from(k))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| D::Error::custom(format!("`co-reachable` missing `{k}`")))
+                };
+                let first = req_str("first")?;
+                let second = req_str("second")?;
+                // Garde-fous optionnels ; défauts = exclude-entrypoints activé seul.
+                let exclude_entrypoints = m
+                    .get(Value::from("exclude-entrypoints"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let max_dist = m
+                    .get(Value::from("max-dist"))
+                    .and_then(|v| v.as_u64())
+                    .map(|d| d as usize);
+                let exclude_allowlisted = m
+                    .get(Value::from("exclude-allowlisted"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                Feature::CoReachable {
+                    first,
+                    second,
+                    exclude_entrypoints,
+                    max_dist,
+                    exclude_allowlisted,
+                }
+            }
+            "intimacy" => {
+                let m = val
+                    .as_mapping()
+                    .ok_or_else(|| D::Error::custom("`intimacy` expects a map"))?;
+                // `first`/`second` acceptent une string unique OU une liste de strings
+                // (groupe d'API équivalentes, ex. tous les sinks réseau).
+                let as_list = |k: &str| -> Result<Vec<String>, D::Error> {
+                    match m.get(Value::from(k)) {
+                        Some(Value::String(s)) => Ok(vec![s.clone()]),
+                        Some(Value::Sequence(seq)) => {
+                            let v: Vec<String> = seq
+                                .iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect();
+                            if v.is_empty() {
+                                Err(D::Error::custom(format!("`intimacy` `{k}` is empty")))
+                            } else {
+                                Ok(v)
+                            }
+                        }
+                        _ => Err(D::Error::custom(format!(
+                            "`intimacy` missing `{k}` (string or list)"
+                        ))),
+                    }
+                };
+                let first = as_list("first")?;
+                let second = as_list("second")?;
+                let label = m
+                    .get(Value::from("label"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let exclude_entrypoints = m
+                    .get(Value::from("exclude-entrypoints"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let max_dist = m
+                    .get(Value::from("max-dist"))
+                    .and_then(|v| v.as_u64())
+                    .map(|d| d as usize);
+                let exclude_allowlisted = m
+                    .get(Value::from("exclude-allowlisted"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                // min-score accepte un entier ou un flottant YAML ; défaut 0.0.
+                let min_score = m
+                    .get(Value::from("min-score"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                Feature::Intimacy {
+                    first,
+                    second,
+                    label,
+                    exclude_entrypoints,
+                    max_dist,
+                    exclude_allowlisted,
+                    min_score,
                 }
             }
             "api" => Feature::Api(as_string(val)?),

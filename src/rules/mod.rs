@@ -3,9 +3,10 @@ pub mod catalog;
 pub mod fetch;
 pub mod schema;
 
-use crate::cfg::CallGraph;
+use crate::cfg::{CallGraph, PivotConstraints};
 use crate::model::ApkFeatures;
 use anyhow::{Context, Result};
+use petgraph::graph::NodeIndex;
 use schema::{Feature, Rule};
 use std::fs;
 use std::path::Path;
@@ -24,7 +25,8 @@ pub struct Match {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Evidence {
     /// Type de preuve : "permission", "api", "string", "intent-action",
-    /// "service", "accessibility-service", "native-symbol".
+    /// "service", "accessibility-service", "native-symbol", "co-reachable",
+    /// "intimacy".
     pub kind: String,
     /// Valeur exacte trouvée dans l'APK (la permission déclarée, l'API résolue…).
     pub value: String,
@@ -32,6 +34,10 @@ pub struct Evidence {
     /// None pour les preuves non-API (permission, string…).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reachable: Option<bool>,
+    /// Score continu pour les preuves "intimacy" (None sinon). Exposé pour tri et
+    /// calibration de seuil en post-traitement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
     /// Chemins entrypoint -> ... -> API (vide si non atteignable ou non-API).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<Vec<String>>,
@@ -40,11 +46,11 @@ pub struct Evidence {
 impl Evidence {
     /// Preuve non-API (permission, string, service…) : pas de reachability.
     fn simple(kind: &str, value: String) -> Self {
-        Evidence { kind: kind.into(), value, reachable: None, paths: Vec::new() }
+        Evidence { kind: kind.into(), value, reachable: None, score: None, paths: Vec::new() }
     }
     /// Preuve API : reachability calculée ultérieurement (enrich_reachability).
     fn api(value: String) -> Self {
-        Evidence { kind: "api".into(), value, reachable: None, paths: Vec::new() }
+        Evidence { kind: "api".into(), value, reachable: None, score: None, paths: Vec::new() }
     }
 }
 
@@ -87,9 +93,10 @@ impl Engine {
         let mut out = Vec::new();
         for r in &self.rules {
             let mut evidence = Vec::new();
-            if eval(&r.features, features, cg, &mut evidence) {
+            if eval(&r.features, features, cg, &entrypoints, &mut evidence) {
                 dedup_evidence(&mut evidence);
                 // Enrichit les preuves API avec leur atteignabilité depuis un entrypoint.
+                // (Les preuves "co-reachable"/"intimacy" portent déjà leurs chemins.)
                 for e in evidence.iter_mut() {
                     if e.kind == "api" {
                         let reach = cg.reachability(&e.value, &entrypoints);
@@ -111,12 +118,20 @@ impl Engine {
 
 /// Évalue une feature et collecte les preuves atomiques qui l'ont satisfaite.
 /// Les preuves ne sont conservées que pour les branches réellement vraies.
-fn eval(f: &Feature, feat: &ApkFeatures, cg: &CallGraph, ev: &mut Vec<Evidence>) -> bool {
+/// `eps` = entrypoints validés par le manifest (nécessaires au garde-fou pivot
+/// de `co-reachable` / `intimacy`) ; ignoré par les autres variants.
+fn eval(
+    f: &Feature,
+    feat: &ApkFeatures,
+    cg: &CallGraph,
+    eps: &[NodeIndex],
+    ev: &mut Vec<Evidence>,
+) -> bool {
     match f {
         Feature::And(xs) => {
             // Tous vrais : on évalue tout et on garde les preuves de chaque sous-feature.
             let mut local = Vec::new();
-            let ok = xs.iter().all(|x| eval(x, feat, cg, &mut local));
+            let ok = xs.iter().all(|x| eval(x, feat, cg, eps, &mut local));
             if ok {
                 ev.append(&mut local);
             }
@@ -127,7 +142,7 @@ fn eval(f: &Feature, feat: &ApkFeatures, cg: &CallGraph, ev: &mut Vec<Evidence>)
             let mut any = false;
             for x in xs {
                 let mut local = Vec::new();
-                if eval(x, feat, cg, &mut local) {
+                if eval(x, feat, cg, eps, &mut local) {
                     any = true;
                     ev.append(&mut local);
                 }
@@ -137,11 +152,11 @@ fn eval(f: &Feature, feat: &ApkFeatures, cg: &CallGraph, ev: &mut Vec<Evidence>)
         Feature::Not(x) => {
             // Une absence n'est pas une preuve positive : on ne propage rien.
             let mut sink = Vec::new();
-            !eval(x, feat, cg, &mut sink)
+            !eval(x, feat, cg, eps, &mut sink)
         }
         Feature::Count { feature, min } => {
             let mut local = Vec::new();
-            let n = count_matches(feature, feat, cg, &mut local);
+            let n = count_matches(feature, feat, cg, eps, &mut local);
             if n >= *min {
                 ev.append(&mut local);
                 true
@@ -150,6 +165,82 @@ fn eval(f: &Feature, feat: &ApkFeatures, cg: &CallGraph, ev: &mut Vec<Evidence>)
             }
         }
         Feature::Sequence(xs) => eval_sequence(xs, cg, ev),
+        Feature::CoReachable {
+            first,
+            second,
+            exclude_entrypoints,
+            max_dist,
+            exclude_allowlisted,
+        } => {
+            let constraints = PivotConstraints {
+                exclude_entrypoints: *exclude_entrypoints,
+                max_dist: (*max_dist).map(|d| d as u32),
+                exclude_allowlisted: *exclude_allowlisted,
+            };
+            let cr = cg.reaches_both(first, second, eps, &constraints);
+            if cr.reachable {
+                ev.push(Evidence {
+                    kind: "co-reachable".into(),
+                    value: match &cr.pivot {
+                        Some(p) => format!("{first} + {second} @ {p}"),
+                        None => format!("{first} + {second}"),
+                    },
+                    reachable: Some(true),
+                    score: None,
+                    paths: vec![cr.path_first, cr.path_second]
+                        .into_iter()
+                        .filter(|p| !p.is_empty())
+                        .collect(),
+                });
+                true
+            } else {
+                false
+            }
+        }
+        Feature::Intimacy {
+            first,
+            second,
+            label,
+            exclude_entrypoints,
+            max_dist,
+            exclude_allowlisted,
+            min_score,
+        } => {
+            let constraints = PivotConstraints {
+                exclude_entrypoints: *exclude_entrypoints,
+                max_dist: (*max_dist).map(|d| d as u32),
+                exclude_allowlisted: *exclude_allowlisted,
+            };
+            let intim = cg.intimacy(first, second, eps, &constraints);
+            // Matche si le score normalisé dépasse le seuil (défaut 0.0 => tout pivot
+            // qualifié). `score` = normalisé par diamètre effectif ; on expose aussi
+            // n, ad, eff et le score brut dans la value pour calibration en Python.
+            if intim.score > *min_score {
+                let tag = label.clone().unwrap_or_else(|| "coupling".to_string());
+                ev.push(Evidence {
+                    kind: "intimacy".into(),
+                    value: match &intim.pivot {
+                        Some(p) => format!(
+                            "{tag} @ {p} (n={}, ad={:.1}, eff={:.1}, raw={:.3})",
+                            intim.n_pivots, intim.avg_dist, intim.eff_diam, intim.score_raw
+                        ),
+                        None => format!(
+                            "{tag} (n={}, ad={:.1}, eff={:.1}, raw={:.3})",
+                            intim.n_pivots, intim.avg_dist, intim.eff_diam, intim.score_raw
+                        ),
+                    },
+                    reachable: Some(true),
+                    score: Some(intim.score),
+                    paths: vec![intim.path_first, intim.path_second]
+                        .into_iter()
+                        .filter(|p| !p.is_empty())
+                        .collect(),
+                });
+                true
+            } else {
+                false
+            }
+        }
         Feature::Api(a) => {
             // Preuve = la signature résolue qui contient l'API recherchée.
             if let Some(m) = feat.methods.iter().find(|m| m.api().contains(a)) {
@@ -244,6 +335,7 @@ fn count_matches(
     f: &Feature,
     feat: &ApkFeatures,
     cg: &CallGraph,
+    eps: &[NodeIndex],
     ev: &mut Vec<Evidence>,
 ) -> usize {
     match f {
@@ -266,7 +358,7 @@ fn count_matches(
             }
             hits.len()
         }
-        other => eval(other, feat, cg, ev) as usize,
+        other => eval(other, feat, cg, eps, ev) as usize,
     }
 }
 

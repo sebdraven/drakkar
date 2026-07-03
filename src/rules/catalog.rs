@@ -188,16 +188,51 @@ pub fn detection_for(id: &str) -> Option<&'static str> {
         - api: Landroid/service/notification/StatusBarNotification;->getNotification"#,
         ),
         "T1521" => Some(
-            r#"  or:
-    - api: Ljavax/crypto/Cipher;->getInstance
-    - api: Ljavax/net/ssl/SSLSocket;->startHandshake"#,
+            r#"  intimacy:
+    label: crypto-network
+    first:
+      - Ljavax/crypto/Cipher;->doFinal
+      - Ljavax/crypto/Mac;->doFinal
+    second:
+      - Ljava/net/HttpURLConnection;->getOutputStream
+      - Ljava/net/HttpURLConnection;->connect
+      - Ljava/net/URL;->openConnection
+      - Ljava/net/URL;->openStream
+      - Ljava/net/Socket;->getOutputStream
+      - Ljava/net/Socket;->connect
+      - Ljavax/net/ssl/SSLSocketFactory;->createSocket
+      - Ljavax/net/ssl/SSLContext;->init
+      - Lokhttp3/OkHttpClient;->newCall
+      - Lokhttp3/Call;->execute
+      - Ljava/net/DatagramSocket;->send
+    exclude-entrypoints: true
+    exclude-allowlisted: true
+    min-score: 0.0"#,
         ),
         "T1521.001" => Some(
             r#"  and:
-    - api: Ljavax/crypto/Cipher;->getInstance
     - or:
         - string: AES
-        - string: DES"#,
+        - string: DES
+    - intimacy:
+        label: symmetric-crypto-network
+        first:
+          - Ljavax/crypto/Cipher;->doFinal
+        second:
+          - Ljava/net/HttpURLConnection;->getOutputStream
+          - Ljava/net/HttpURLConnection;->connect
+          - Ljava/net/URL;->openConnection
+          - Ljava/net/URL;->openStream
+          - Ljava/net/Socket;->getOutputStream
+          - Ljava/net/Socket;->connect
+          - Ljavax/net/ssl/SSLSocketFactory;->createSocket
+          - Ljavax/net/ssl/SSLContext;->init
+          - Lokhttp3/OkHttpClient;->newCall
+          - Lokhttp3/Call;->execute
+          - Ljava/net/DatagramSocket;->send
+        exclude-entrypoints: true
+        exclude-allowlisted: true
+        min-score: 0.0"#,
         ),
         "T1521.003" => Some(
             r#"  or:
@@ -222,9 +257,15 @@ pub fn detection_for(id: &str) -> Option<&'static str> {
     - api: Landroid/app/Notification$Builder;->setOngoing"#,
         ),
         "T1544" => Some(
-            r#"  or:
-    - api: Landroid/app/DownloadManager;->enqueue
-    - api: Ljava/net/URL;->openStream"#,
+            r#"  and:
+    - or:
+        - api: Landroid/app/DownloadManager;->enqueue
+        - api: Ljava/net/URL;->openStream
+    - or:
+        - api: Ldalvik/system/DexClassLoader;-><init>
+        - api: Ldalvik/system/DexClassLoader;->loadClass
+        - api: Ljava/lang/Runtime;->exec
+        - api: Ljava/lang/ProcessBuilder;->start"#,
         ),
         "T1575" => Some(
             r#"  or:
@@ -260,7 +301,10 @@ pub fn detection_for(id: &str) -> Option<&'static str> {
             r#"  or:
     - string: de.robv.android.xposed
     - string: libsubstrate
-    - api: Ljava/lang/reflect/Method;->invoke"#,
+    - string: XC_MethodHook
+    - string: LSPosed
+    - string: re.frida.server
+    - string: frida-gadget"#,
         ),
         "T1623" => Some(
             r#"  or:
@@ -358,7 +402,25 @@ pub fn detection_for(id: &str) -> Option<&'static str> {
         "T1637.001" => Some(
             r#"  or:
     - string: DGA
-    - api: Ljava/security/MessageDigest;->digest"#,
+    - intimacy:
+        label: digest-network
+        first:
+          - Ljava/security/MessageDigest;->digest
+        second:
+          - Ljava/net/HttpURLConnection;->getOutputStream
+          - Ljava/net/HttpURLConnection;->connect
+          - Ljava/net/URL;->openConnection
+          - Ljava/net/URL;->openStream
+          - Ljava/net/Socket;->getOutputStream
+          - Ljava/net/Socket;->connect
+          - Ljavax/net/ssl/SSLSocketFactory;->createSocket
+          - Ljavax/net/ssl/SSLContext;->init
+          - Lokhttp3/OkHttpClient;->newCall
+          - Lokhttp3/Call;->execute
+          - Ljava/net/DatagramSocket;->send
+        exclude-entrypoints: true
+        exclude-allowlisted: true
+        min-score: 0.0"#,
         ),
         "T1638" => Some(
             r#"  or:
@@ -377,9 +439,27 @@ pub fn detection_for(id: &str) -> Option<&'static str> {
     - permission: android.permission.MANAGE_ACCOUNTS"#,
         ),
         "T1646" => Some(
-            r#"  or:
-    - api: Ljava/net/HttpURLConnection;->getOutputStream
-    - api: Lokhttp3/RequestBody;->create"#,
+            r#"  intimacy:
+    label: collection-network
+    first:
+      - Landroid/content/pm/PackageManager;->getInstalledApplications
+      - Landroid/content/pm/PackageManager;->getInstalledPackages
+      - Landroid/util/Base64;->encode
+    second:
+      - Ljava/net/HttpURLConnection;->getOutputStream
+      - Ljava/net/HttpURLConnection;->connect
+      - Ljava/net/URL;->openConnection
+      - Ljava/net/URL;->openStream
+      - Ljava/net/Socket;->getOutputStream
+      - Ljava/net/Socket;->connect
+      - Ljavax/net/ssl/SSLSocketFactory;->createSocket
+      - Ljavax/net/ssl/SSLContext;->init
+      - Lokhttp3/OkHttpClient;->newCall
+      - Lokhttp3/Call;->execute
+      - Ljava/net/DatagramSocket;->send
+    exclude-entrypoints: true
+    exclude-allowlisted: true
+    min-score: 0.0"#,
         ),
         "T1655.001" => Some(
             r#"  or:

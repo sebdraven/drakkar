@@ -9,3 +9,4 @@ pub mod parser;
 pub mod cfg;
 pub mod rules;
 pub mod export;
+pub mod bulk;

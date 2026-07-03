@@ -24,6 +24,11 @@ dex = "0.5"
 zip = "2"
 tempfile = "3"
 
+# Mode bulk : parallélisme de l'analyse d'un répertoire d'APK.
+rayon = "1"
+# Parcours récursif optionnel du répertoire d'APK en mode bulk.
+walkdir = "2"
+
 # Décodage du manifest binaire (AXML) : permissions, services, intent filters.
 # Léger (pas de resources.arsc à linker).
 axmldecoder = "0.5"

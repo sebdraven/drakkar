@@ -15,14 +15,30 @@ use std::path::{Path, PathBuf};
 const STIX_URL: &str =
     "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/mobile-attack/mobile-attack.json";
 
+/// Source du catalogue embarqué, inclus à la compilation : sert d'empreinte de
+/// version. Si `catalog.rs` change et que le binaire est recompilé, le hash
+/// change et le cache est régénéré automatiquement (fini le `rm -rf` manuel).
+const CATALOG_SRC: &str = include_str!("catalog.rs");
+
+/// Hash FNV-1a du source du catalogue, utilisé comme clé de version du cache.
+fn catalog_hash() -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in CATALOG_SRC.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// Répertoire de cache des règles : ~/.cache/drakkar/rules/
 pub fn cache_dir() -> Result<PathBuf> {
     let base = dirs::cache_dir().context("cannot resolve user cache dir")?;
     Ok(base.join("drakkar").join("rules"))
 }
 
-/// S'assure que le cache existe ; le génère s'il est absent ou si `refresh`.
-/// Retourne le répertoire des règles prêt à charger.
+/// S'assure que le cache existe et correspond au catalogue courant ; le génère
+/// s'il est absent, périmé (catalog modifié) ou si `refresh`. Retourne le
+/// répertoire des règles prêt à charger.
 pub fn ensure_cache(refresh: bool) -> Result<PathBuf> {
     let dir = cache_dir()?;
     let populated = dir.is_dir()
@@ -34,26 +50,39 @@ pub fn ensure_cache(refresh: bool) -> Result<PathBuf> {
             }))
             .unwrap_or(false);
 
-    if populated && !refresh {
+    // Le cache n'est valide que si sa version (hash du catalogue au moment de la
+    // génération) correspond au catalogue compilé dans ce binaire.
+    let current = catalog_hash();
+    let version_ok = std::fs::read_to_string(dir.join(".catalog_hash"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|stored| stored == current)
+        .unwrap_or(false);
+
+    if populated && version_ok && !refresh {
         tracing::info!(dir = %dir.display(), "rules cache hit");
         return Ok(dir);
     }
 
-    tracing::info!(refresh, "generating rules cache from MITRE STIX");
-    generate_cache(&dir)?;
+    let reason = if !populated {
+        "absent"
+    } else if !version_ok {
+        "catalog changed"
+    } else {
+        "refresh"
+    };
+    tracing::info!(reason, "regenerating rules cache");
+    generate_cache(&dir, refresh)?;
+    std::fs::write(dir.join(".catalog_hash"), current.to_string())
+        .context("write catalog hash")?;
     Ok(dir)
 }
 
-/// Télécharge le STIX, fusionne avec le catalogue, écrit les YAML.
-fn generate_cache(dir: &Path) -> Result<()> {
+/// Fusionne le STIX (caché ou téléchargé) avec le catalogue, écrit les YAML.
+fn generate_cache(dir: &Path, refresh: bool) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
 
-    tracing::info!(url = STIX_URL, "downloading MITRE ATT&CK Mobile STIX");
-    let bundle: StixBundle = ureq::get(STIX_URL)
-        .call()
-        .context("download STIX bundle")?
-        .into_json()
-        .context("parse STIX JSON")?;
+    let bundle = load_or_download_stix(dir, refresh)?;
 
     let techniques = extract_android_techniques(&bundle);
     let mut static_count = 0usize;
@@ -88,6 +117,29 @@ fn generate_cache(dir: &Path) -> Result<()> {
         "rules cache generated"
     );
     Ok(())
+}
+
+/// Charge le bundle STIX depuis le cache disque ; le télécharge (et le persiste)
+/// s'il est absent ou si `refresh`. Découple le download de la fusion : un simple
+/// changement de catalogue régénère les YAML sans retélécharger le STIX (et
+/// fonctionne hors-ligne tant que le STIX a déjà été récupéré une fois).
+/// serde_yaml parse aussi le JSON (JSON ⊂ YAML), ce qui évite une dépendance
+/// serde_json directe.
+fn load_or_download_stix(dir: &Path, refresh: bool) -> Result<StixBundle> {
+    let stix_path = dir.join("mobile-attack.json");
+    if stix_path.is_file() && !refresh {
+        let raw = std::fs::read_to_string(&stix_path).context("read cached STIX")?;
+        return serde_yaml::from_str(&raw).context("parse cached STIX");
+    }
+    tracing::info!(url = STIX_URL, "downloading MITRE ATT&CK Mobile STIX");
+    let raw = ureq::get(STIX_URL)
+        .call()
+        .context("download STIX bundle")?
+        .into_string()
+        .context("read STIX body")?;
+    std::fs::write(&stix_path, &raw)
+        .with_context(|| format!("cache STIX to {}", stix_path.display()))?;
+    serde_yaml::from_str(&raw).context("parse STIX")
 }
 
 /// Sérialise une règle au format YAML attendu par le loader.
