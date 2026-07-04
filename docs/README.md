@@ -10,6 +10,9 @@ un accent sur le stalkerware.
 - [`intimacy.md`](intimacy.md) — la feature `intimacy` : détection de couplage
   (crypto↔réseau, collecte↔exfiltration) par intimité de call graph, adaptée
   d'IntDroid. Formule, garde-fous, diamètre effectif, résultats empiriques.
+- [`calibration.md`](calibration.md) — protocole de calibration du seuil
+  `min-score` : constitution du corpus, test de Mann-Whitney, choix et validation
+  du seuil par label.
 
 ## En bref
 
