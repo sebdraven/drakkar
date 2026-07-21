@@ -49,13 +49,23 @@ pub struct ManifestReport {
     pub anomalies: Vec<String>,
 }
 
-/// Niveaux d'API déclarés.
+/// Niveaux d'API déclarés, plus les marqueurs de chaîne de build injectés dans
+/// le manifest par AAPT/AGP.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SdkInfo {
     pub min_sdk: Option<u32>,
     pub target_sdk: Option<u32>,
     pub max_sdk: Option<u32>,
+    /// `android:compileSdkVersion` — injecté par AGP >= 3.0 (2017). Absent des
+    /// builds plus anciens ou non-Gradle : donnée manquante, pas zéro.
     pub compile_sdk: Option<u32>,
+    /// `android:compileSdkVersionCodename` — nom de version de la plateforme
+    /// compilée (ex. "9", "11"), injecté par la même passe qu'AGP.
+    pub compile_sdk_codename: Option<String>,
+    /// `platformBuildVersionCode` — écrit par les AAPT antérieurs à AGP 3.
+    /// Complémentaire de `compile_sdk` : les deux coexistent rarement.
+    pub platform_build_version_code: Option<String>,
+    pub platform_build_version_name: Option<String>,
 }
 
 /// Une entrée `<uses-permission>` / `<uses-permission-sdk-23>`.
@@ -415,6 +425,9 @@ fn build(root: &Element) -> ManifestReport {
         ..Default::default()
     };
     r.sdk.compile_sdk = attr_u32(root, "compileSdkVersion");
+    r.sdk.compile_sdk_codename = attr(root, "compileSdkVersionCodename");
+    r.sdk.platform_build_version_code = attr(root, "platformBuildVersionCode");
+    r.sdk.platform_build_version_name = attr(root, "platformBuildVersionName");
 
     let pkg = r.package.clone();
 

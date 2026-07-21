@@ -4,6 +4,7 @@
 //! crate `dex` + `dex-bytecode`) et les `lib/*/*.so` (parsés par LIEF, derrière
 //! la feature `lief-backend`). Le manifest binaire est traité par `manifest`.
 pub mod cert;
+pub mod dating;
 pub mod dex;
 pub mod elf;
 pub mod manifest;
