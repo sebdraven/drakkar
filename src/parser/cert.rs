@@ -823,7 +823,7 @@ pub fn hex_colons(hex: &str) -> String {
 ///
 /// Conversion jours -> date civile : algorithme de Howard Hinnant
 /// (`civil_from_days`), valide sur toute la plage proleptique grégorienne.
-fn fmt_unix_utc(secs: i64) -> String {
+pub fn fmt_unix_utc(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
     let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);

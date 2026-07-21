@@ -10,3 +10,4 @@ pub mod cfg;
 pub mod rules;
 pub mod export;
 pub mod bulk;
+pub mod enrich;
