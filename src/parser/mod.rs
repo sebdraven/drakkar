@@ -3,9 +3,13 @@
 //! Un APK est une archive zip : on extrait les `classes*.dex` (parsés par le
 //! crate `dex` + `dex-bytecode`) et les `lib/*/*.so` (parsés par LIEF, derrière
 //! la feature `lief-backend`). Le manifest binaire est traité par `manifest`.
+pub mod cert;
 pub mod dex;
 pub mod elf;
 pub mod manifest;
+pub mod manifest_info;
+pub mod native_arch;
+pub mod native_extract;
 
 use crate::cfg::CallGraph;
 use crate::model::ApkFeatures;
