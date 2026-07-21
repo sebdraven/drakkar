@@ -211,17 +211,8 @@ fn main() -> Result<()> {
     match (&cli.apk, &cli.bulk) {
         // ── Mode bulk : répertoire d'APK, parallèle ──
         (None, Some(dir)) => {
-            if cli.jobs > 0 {
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(cli.jobs)
-                    .build_global()?;
-            }
-            let opts = bulk::BulkOptions {
-                out_dir: cli.out.clone(),
-                recursive: cli.recursive,
-                overwrite: cli.overwrite,
-            };
-            bulk::run(dir, &engine, &opts)?;
+            setup_jobs(cli.jobs)?;
+            bulk::run(dir, &engine, &bulk_options(&cli))?;
         }
 
         // ── Mode single : comportement historique inchangé ──
