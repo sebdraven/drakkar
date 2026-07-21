@@ -37,6 +37,19 @@ axmldecoder = "0.5"
 ureq = { version = "2", features = ["json"] }
 dirs = "5"
 
+# Signature APK : PKCS#7 (v1, META-INF/*.RSA) + X.509 des blocs v2/v3.
+# Pur Rust (RustCrypto), pas de toolchain C. Les versions sont couplées :
+# x509-cert 0.2 / cms 0.2 / der 0.7 partagent le même socle.
+der = "0.7"
+x509-cert = "0.2"
+cms = "0.2"
+
+# Empreintes de certificat (SHA-256 pivot CTI, SHA-1 et MD5 pour recoupement
+# avec les bases publiques qui les exposent encore).
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+
 # Décodage bytecode Dalvik (invoke-* + CFG intra-méthode). Repo Androguard,
 # pas encore de release -> dépendance git. À pinner sur un rev une fois l'API stable.
 dex-bytecode = { git = "https://github.com/androguard/dex-bytecode", branch = "main" }
