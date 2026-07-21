@@ -89,13 +89,20 @@ struct Cli {
     /// Inventaire complet du AndroidManifest.xml (permissions, composants,
     /// intent-filters, points d'entrée dérivés) puis sort. Fonctionne en single
     /// (APK en argument) comme en bulk (--bulk DIR).
-    #[arg(long, conflicts_with = "cert")]
+    #[arg(long, conflicts_with_all = ["cert", "dating"])]
     manifest: bool,
 
     /// Inventaire de la signature : schémas v1/v2/v3/v3.1 et certificats X.509
     /// (DN, validité, empreintes) puis sort. Single ou bulk.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "dating")]
     cert: bool,
+
+    /// Indicateurs de datation bruts : dates de signature, planchers de chaîne de
+    /// build (format DEX, schémas, compileSdk, versions de bibliothèques),
+    /// horodatages de l'archive, littéraux de date du code, cibles d'API.
+    /// Aucune date n'est estimée — voir --dating --legend. Single ou bulk.
+    #[arg(long)]
+    dating: bool,
 
     /// Rendu des sorties --manifest / --cert.
     #[arg(long, value_enum, default_value_t = Format::Text)]
@@ -175,6 +182,15 @@ fn main() -> Result<()> {
                         let report = parser::cert::extract(apk)?;
                         if cli.format.wants_text() {
                             print_cert(&report);
+                        }
+                        if cli.format.wants_json() {
+                            emit_json(&report, cli.json_out.as_deref())?;
+                        }
+                    }
+                    bulk::Inventory::Dating => {
+                        let report = parser::dating::extract(apk)?;
+                        if cli.format.wants_text() {
+                            print_dating(&report);
                         }
                         if cli.format.wants_json() {
                             emit_json(&report, cli.json_out.as_deref())?;
@@ -562,6 +578,99 @@ fn print_cert(r: &drakkar::parser::cert::SigningReport) {
     }
 
     println!("\n(légende des champs : --cert --legend)");
+}
+
+/// Rendu console des indicateurs de datation (mode `--dating`).
+fn print_dating(r: &drakkar::parser::dating::DatingReport) {
+    println!("== Indicateurs de datation ==\n");
+    println!("{} {}", r.package, r.version_name.as_deref().unwrap_or(""));
+
+    println!("\nCibles d'API (déclarées, pas des dates) :");
+    println!(
+        "  min={}  target={}  compile={}{}",
+        opt_num(r.sdk.min_sdk),
+        opt_num(r.sdk.target_sdk),
+        opt_num(r.sdk.compile_sdk),
+        r.sdk
+            .compile_sdk_codename
+            .as_deref()
+            .map(|c| format!(" ({c})"))
+            .unwrap_or_default()
+    );
+    match r.sdk.compile_minus_target {
+        Some(d) => println!("  compile - target = {d}"),
+        None => println!("  compile - target = indisponible (compileSdk absent)"),
+    }
+    if let Some(p) = &r.sdk.platform_build_version_code {
+        println!("  platformBuildVersion   {p}");
+    }
+
+    println!("\nBornes basses (le build est postérieur) :");
+    for s in &r.signatures {
+        println!(
+            "  clé {}  {}  ({})",
+            s.not_before,
+            s.subject_cn.as_deref().unwrap_or("?"),
+            s.source
+        );
+    }
+    if !r.signing_schemes.is_empty() {
+        println!("  schémas de signature   {}", r.signing_schemes.join("+"));
+    }
+    for d in &r.dex_files {
+        println!(
+            "  {:<14} format {}  -> API {}  ({} chaînes)",
+            d.entry,
+            d.format_version,
+            d.api_floor.map(|a| a.to_string()).unwrap_or_else(|| "?".into()),
+            d.string_count
+        );
+    }
+    println!(
+        "  plancher retenu        {}",
+        r.toolchain_floor_api
+            .map(|a| format!("API {a}"))
+            .unwrap_or_else(|| "indisponible".into())
+    );
+
+    println!("\nHorodatages de l'archive ({} entrées) :", r.archive.entry_count);
+    println!(
+        "  {} -> {}  ({} valeurs distinctes)",
+        r.archive.earliest.as_deref().unwrap_or("?"),
+        r.archive.latest.as_deref().unwrap_or("?"),
+        r.archive.distinct_count
+    );
+    if r.archive.normalized {
+        println!("  NORMALISÉS — build reproductible, ces dates ne datent rien");
+    }
+    if let Some(s) = &r.archive.sentinel {
+        println!("  sentinelle reconnue    {s}");
+    }
+
+    if !r.library_versions.is_empty() {
+        println!("\nVersions de bibliothèques ({}) :", r.library_versions.len());
+        for l in &r.library_versions {
+            println!("  {:<48} {}", l.module, l.version);
+        }
+    }
+
+    if !r.build_metadata.is_empty() {
+        println!("\nMétadonnées de build :");
+        for m in &r.build_metadata {
+            println!("  {}  ({} o conservés)", m.entry, m.content.len());
+        }
+    }
+
+    if r.code_dates.is_empty() {
+        println!("\nLittéraux de date dans le code : aucun");
+    } else {
+        println!("\nLittéraux de date dans le code ({}) :", r.code_dates.len());
+        for d in &r.code_dates {
+            println!("  {}  ({} occurrence(s))", d.value, d.occurrences);
+        }
+    }
+
+    println!("\n(nature exacte de chaque indicateur : --dating --legend)");
 }
 
 fn opt_num(v: Option<u32>) -> String {
