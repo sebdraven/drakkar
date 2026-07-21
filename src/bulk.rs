@@ -47,6 +47,8 @@ pub enum Inventory {
     Manifest,
     /// Rapport `cert::SigningReport`, suffixe `.cert.json`.
     Cert,
+    /// Rapport `dating::DatingReport`, suffixe `.dating.json`.
+    Dating,
 }
 
 impl Inventory {
@@ -55,6 +57,7 @@ impl Inventory {
         match self {
             Inventory::Manifest => "manifest.json",
             Inventory::Cert => "cert.json",
+            Inventory::Dating => "dating.json",
         }
     }
 
@@ -62,6 +65,7 @@ impl Inventory {
         match self {
             Inventory::Manifest => "manifest",
             Inventory::Cert => "signature",
+            Inventory::Dating => "datation",
         }
     }
 
@@ -70,6 +74,7 @@ impl Inventory {
         match self {
             Inventory::Manifest => "manifests.csv",
             Inventory::Cert => "certificates.csv",
+            Inventory::Dating => "dating.csv",
         }
     }
 }
@@ -229,6 +234,7 @@ pub fn run_inventory(input_dir: &Path, what: Inventory, opts: &BulkOptions) -> R
     let certs: Mutex<Vec<(String, parser::cert::SigningReport)>> = Mutex::new(Vec::new());
     let manifests: Mutex<Vec<(String, parser::manifest_info::ManifestReport)>> =
         Mutex::new(Vec::new());
+    let datings: Mutex<Vec<(String, parser::dating::DatingReport)>> = Mutex::new(Vec::new());
 
     apks.par_iter().for_each(|apk| {
         let stem = apk
@@ -279,6 +285,25 @@ pub fn run_inventory(input_dir: &Path, what: Inventory, opts: &BulkOptions) -> R
                     }
                     Ok(summary)
                 }
+                Inventory::Dating => {
+                    let r = parser::dating::extract(apk)?;
+                    let summary = format!(
+                        "target={} compile={} écart={} archive={}",
+                        opt_u32(r.sdk.target_sdk),
+                        opt_u32(r.sdk.compile_sdk),
+                        r.sdk
+                            .compile_minus_target
+                            .map(|d| d.to_string())
+                            .unwrap_or_else(|| "?".into()),
+                        r.archive.latest.clone().unwrap_or_else(|| "?".into())
+                    );
+                    if collect {
+                        push_collected(&datings, stem.clone(), r);
+                    } else {
+                        std::fs::write(&out_path, serde_json::to_string_pretty(&r)?)?;
+                    }
+                    Ok(summary)
+                }
             }
         }));
 
@@ -312,6 +337,8 @@ pub fn run_inventory(input_dir: &Path, what: Inventory, opts: &BulkOptions) -> R
             (Inventory::Cert, false) => json_array(into_inner(certs))?,
             (Inventory::Manifest, true) => manifest_csv(into_inner(manifests)),
             (Inventory::Manifest, false) => json_array(into_inner(manifests))?,
+            (Inventory::Dating, true) => dating_csv(into_inner(datings)),
+            (Inventory::Dating, false) => json_array(into_inner(datings))?,
         };
 
         if to_stdout {
@@ -468,6 +495,121 @@ entrypoints,triggers,application_class,anomalies\n",
 
 fn opt_u32(v: Option<u32>) -> String {
     v.map(|n| n.to_string()).unwrap_or_default()
+}
+
+/// CSV du lot de datation : une ligne par échantillon, toutes sources confondues.
+///
+/// C'est la table de corrélation : chaque colonne est un indicateur brut, avec sa
+/// nature propre (borne basse, valeur exacte falsifiable, simple indice). Aucune
+/// date de build n'est estimée ici — voir `dating::legend()` pour la nature de
+/// chaque champ. Les champs multivalués sont joints par `|`.
+fn dating_csv(rows: Vec<(String, parser::dating::DatingReport)>) -> String {
+    use parser::dating::{library_version, DATING_LIBRARIES};
+
+    let lib_headers = DATING_LIBRARIES
+        .iter()
+        .map(|(col, _)| *col)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let mut out = format!(
+        "sample,file_sha256,package,version_name,version_code,\
+min_sdk,target_sdk,compile_sdk,compile_minus_target,platform_build_version,\
+cert_count,cert_not_before,cert_not_after,cert_sha256,signing_schemes,\
+dex_count,dex_versions,toolchain_floor_api,\
+archive_entries,archive_dated,archive_earliest,archive_latest,archive_distinct,\
+archive_normalized,archive_sentinel,\
+code_date_min,code_date_max,code_date_count,\
+lib_count,{lib_headers},build_metadata\n"
+    );
+
+    for (stem, r) in &rows {
+        // Le certificat le plus ancien : borne basse la plus défendable.
+        let cert = r
+            .signatures
+            .iter()
+            .min_by(|a, b| a.not_before.cmp(&b.not_before));
+
+        let dex_versions = r
+            .dex_files
+            .iter()
+            .map(|d| d.format_version.clone())
+            .collect::<Vec<_>>()
+            .join("|");
+
+        // Bibliothèques retenues, une colonne chacune. La liste complète reste
+        // dans le JSON : 2 000 caractères dans une cellule sont inexploitables.
+        let libs = DATING_LIBRARIES
+            .iter()
+            .map(|(_, module)| {
+                csv_field(&library_version(&r.library_versions, module).unwrap_or_default())
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let metadata = r
+            .build_metadata
+            .iter()
+            .map(|m| m.entry.clone())
+            .collect::<Vec<_>>()
+            .join("|");
+
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            csv_field(stem),
+            csv_field(&r.file_sha256),
+            csv_field(&r.package),
+            csv_field(r.version_name.as_deref().unwrap_or_default()),
+            csv_field(r.version_code.as_deref().unwrap_or_default()),
+            opt_u32(r.sdk.min_sdk),
+            opt_u32(r.sdk.target_sdk),
+            opt_u32(r.sdk.compile_sdk),
+            r.sdk
+                .compile_minus_target
+                .map(|d| d.to_string())
+                .unwrap_or_default(),
+            csv_field(
+                r.sdk
+                    .platform_build_version_code
+                    .as_deref()
+                    .unwrap_or_default()
+            ),
+            r.signatures.len(),
+            csv_field(cert.map(|c| c.not_before.as_str()).unwrap_or_default()),
+            csv_field(cert.map(|c| c.not_after.as_str()).unwrap_or_default()),
+            csv_field(cert.map(|c| c.sha256.as_str()).unwrap_or_default()),
+            csv_field(&r.signing_schemes.join("+")),
+            r.dex_files.len(),
+            csv_field(&dex_versions),
+            r.toolchain_floor_api
+                .map(|a| a.to_string())
+                .unwrap_or_default(),
+            r.archive.entry_count,
+            r.archive.dated_entry_count,
+            csv_field(r.archive.earliest.as_deref().unwrap_or_default()),
+            csv_field(r.archive.latest.as_deref().unwrap_or_default()),
+            r.archive.distinct_count,
+            r.archive.normalized,
+            csv_field(r.archive.sentinel.as_deref().unwrap_or_default()),
+            csv_field(
+                r.code_dates
+                    .first()
+                    .map(|d| d.value.as_str())
+                    .unwrap_or_default()
+            ),
+            csv_field(
+                r.code_dates
+                    .last()
+                    .map(|d| d.value.as_str())
+                    .unwrap_or_default()
+            ),
+            r.code_dates.len(),
+            r.library_versions.len(),
+            libs,
+            csv_field(&metadata),
+        ));
+    }
+    out
 }
 
 /// Échappe un champ CSV (RFC 4180) : guillemets doublés, encadrement si le champ
