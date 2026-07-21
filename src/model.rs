@@ -38,6 +38,9 @@ pub struct ApkFeatures {
     pub methods: Vec<MethodRef>,
     pub strings: Vec<String>,
     pub native_symbols: Vec<String>,
+    /// Architecture des .so natifs (ABI/bits/machine par lib + agrégat).
+    /// Renseigné par `parser::native_arch` (pur en-tête ELF, en mémoire).
+    pub native_arch: crate::parser::native_arch::NativeArchSummary,
     /// Classes des composants déclarés au manifest (activity/service/receiver/
     /// provider/application), au format descripteur Dalvik `Lcom/foo/Bar;`.
     /// Sert à valider les entrypoints du CFG (un callback ne compte que si sa

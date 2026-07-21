@@ -52,6 +52,17 @@ pub fn parse_apk(path: &Path) -> Result<ParsedApk> {
             .with_context(|| format!("parse {}", so_path.display()))?;
     }
 
+    // Architecture native (pur en-tête ELF, en mémoire — indépendant de LIEF).
+    // Conditionne la convention d'appel côté SE (Kharon) : arm=AArch32/Thumb,
+    // arm64=AAPCS64. Deuxième passe zip header-only, coût négligeable.
+    features.native_arch = native_arch::scan_apk_file(path).context("scan arch native")?;
+    tracing::info!(
+        abis = ?features.native_arch.abis,
+        fat = features.native_arch.is_fat,
+        anomalies = features.native_arch.anomalies.len(),
+        "native arch"
+    );
+
     Ok(ParsedApk { features, call_graph })
 }
 
