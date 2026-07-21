@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
-use drakkar::{bulk, export, parser, rules::Engine};
+use drakkar::{bulk, enrich, export, parser, rules::Engine};
 use std::path::PathBuf;
 
 /// Rendu des sorties d'inventaire (`--manifest`, `--cert`).
@@ -114,9 +114,33 @@ struct Cli {
     json_out: Option<PathBuf>,
 
     /// Affiche la légende des étiquettes et règles de dérivation, puis sort.
-    /// Se combine avec --manifest ou --cert.
+    /// Se combine avec --manifest, --cert, --dating ou --enrich.
     #[arg(long)]
     legend: bool,
+
+    /// Enrichit une liste de SHA-256 via les services externes : `vt`, `koodous`,
+    /// ou les deux séparés par une virgule. Les jetons se lisent dans
+    /// VT_API_KEY et KOODOUS_TOKEN — jamais en argument.
+    #[arg(long, value_name = "SOURCES")]
+    enrich: Option<String>,
+
+    /// Entrée de --enrich : CSV de datation (colonne file_sha256), liste d'un
+    /// hachage par ligne, répertoire de *.dating.json, ou `-` pour stdin.
+    #[arg(long, value_name = "PATH", default_value = "-")]
+    enrich_input: PathBuf,
+
+    /// Cache des réponses brutes, un sous-répertoire par service. Une réponse
+    /// déjà obtenue n'est jamais redemandée : le lot est reprenable.
+    #[arg(long, value_name = "DIR", default_value = "./cache/enrich")]
+    cache: PathBuf,
+
+    /// Requêtes par minute et par service. 4 = quota public VirusTotal.
+    #[arg(long, default_value_t = 4)]
+    rate: u32,
+
+    /// Ignore le cache et refait tous les appels.
+    #[arg(long)]
+    force: bool,
 }
 
 fn main() -> Result<()> {
@@ -147,19 +171,53 @@ fn main() -> Result<()> {
     if cli.legend {
         if cli.cert {
             println!("{}", parser::cert::legend());
+        } else if cli.dating {
+            println!("{}", parser::dating::legend());
+        } else if cli.enrich.is_some() {
+            println!("{}", enrich::legend());
         } else {
             println!("{}", parser::manifest_info::legend());
         }
         return Ok(());
     }
 
-    // Sortie rapide : inventaires manifest / signature. Aucun DEX n'est parsé,
-    // le catalogue MITRE n'est pas chargé. Single (APK) ou bulk (--bulk DIR).
-    if cli.manifest || cli.cert {
+    // Sortie rapide : enrichissement réseau. Ne lit aucun APK — il n'a besoin que
+    // des SHA-256, produits par la passe --dating.
+    if let Some(sources) = &cli.enrich {
+        let sources = enrich::Source::parse_list(sources)?;
+        let hashes = enrich::read_hashes(&cli.enrich_input)?;
+        if hashes.is_empty() {
+            bail!(
+                "aucun SHA-256 lu depuis {} — attendu un CSV à colonne file_sha256, \
+                 une liste d'un hachage par ligne, ou un répertoire de *.dating.json",
+                cli.enrich_input.display()
+            );
+        }
+        let opts = enrich::EnrichOptions {
+            sources,
+            cache_dir: cli.cache.clone(),
+            rate_per_min: cli.rate,
+            force: cli.force,
+        };
+        let rows = enrich::run(&hashes, &opts)?;
+
+        if cli.format == Format::Json {
+            emit_json(&rows, cli.json_out.as_deref())?;
+        } else {
+            print!("{}", enrich::to_csv(&rows));
+        }
+        return Ok(());
+    }
+
+    // Sortie rapide : inventaires manifest / signature / datation. Aucun DEX n'est
+    // décompilé, le catalogue MITRE n'est pas chargé. Single (APK) ou bulk.
+    if cli.manifest || cli.cert || cli.dating {
         let what = if cli.manifest {
             bulk::Inventory::Manifest
-        } else {
+        } else if cli.cert {
             bulk::Inventory::Cert
+        } else {
+            bulk::Inventory::Dating
         };
 
         match (&cli.apk, &cli.bulk) {
