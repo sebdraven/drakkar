@@ -459,6 +459,30 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Sortie rapide : liste des entrées de l'archive. Rien n'est extrait.
+    if cli.list_entries {
+        let Some(apk) = &cli.apk else {
+            bail!("--list-entries requiert un APK (mode single)");
+        };
+        for name in parser::entry_extract::list_entries(apk)? {
+            println!("{name}");
+        }
+        return Ok(());
+    }
+
+    // Sortie rapide : extraction ciblée d'entrées par motif de chemin. Seules
+    // les entrées demandées sont lues — l'archive n'est jamais déballée en
+    // entier. Cas d'usage : APK de plugin embarqué (res/raw/plugin des
+    // conteneurs DroidPlugin), payload d'un packer dans assets/.
+    if !cli.extract_entry.is_empty() {
+        let Some(apk) = &cli.apk else {
+            bail!("--extract-entry requiert un APK (mode single)");
+        };
+        let extraction = parser::entry_extract::extract_matching(apk, &cli.extract_entry)?;
+        print_and_dump_entries(&extraction, &cli.out)?;
+        return Ok(());
+    }
+
     // Moteur de règles : chargé une seule fois, réutilisé en single comme en bulk.
     let engine = match &cli.rules {
         Some(dir) => Engine::load(dir)?,
@@ -916,6 +940,42 @@ fn print_dating(r: &drakkar::parser::dating::DatingReport) {
 
 fn opt_num(v: Option<u32>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "?".into())
+}
+
+/// Affiche le résultat d'une extraction ciblée et écrit les entrées dans `dir`.
+///
+/// Le SHA-256 est celui du contenu **décompressé** : c'est lui qu'on rapproche du
+/// corpus. Le type est reniflé sur les octets de tête, jamais déduit de
+/// l'extension — un APK embarqué s'appelle souvent `plugin`, sans extension.
+fn print_and_dump_entries(
+    ex: &drakkar::parser::entry_extract::EntryExtraction,
+    dir: &std::path::Path,
+) -> Result<()> {
+    println!("== Extraction ciblée ==");
+    println!("Motifs   : {}", ex.patterns.join(", "));
+    println!("Entrées  : {} retenue(s) sur {} dans l'archive", ex.count(), ex.scanned);
+
+    if ex.is_empty() {
+        println!("\nAucune entrée ne correspond. `--list-entries` donne l'arborescence.");
+        return Ok(());
+    }
+
+    println!();
+    for e in &ex.entries {
+        let dest = e.write_to(dir)?;
+        println!("  {}", e.entry);
+        println!("      type      {}", e.kind);
+        println!(
+            "      taille    {} o  (compressé {} o)",
+            e.size, e.compressed_size
+        );
+        println!("      entropie  {:.2}", e.entropy);
+        println!("      SHA-256   {}", e.sha256);
+        println!("      écrit     {}", dest.display());
+    }
+
+    println!("\n(nature exacte de chaque champ : --extract-entry --legend)");
+    Ok(())
 }
 
 fn opt_bool(v: Option<bool>) -> String {
