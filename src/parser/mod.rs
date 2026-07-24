@@ -6,7 +6,10 @@
 pub mod cert;
 pub mod dating;
 pub mod dex;
+pub mod dex_strings;
+pub mod dyn_entrypoints;
 pub mod elf;
+pub mod entry_extract;
 pub mod manifest;
 pub mod manifest_info;
 pub mod native_arch;
