@@ -152,7 +152,7 @@ pub fn run(input_dir: &Path, engine: &Engine, opts: &BulkOptions) -> Result<()> 
 /// La sélection se fait sur le **contenu**, jamais sur l'extension : les corpus
 /// nommés par hash n'en ont pas, et un `.apk` peut être n'importe quoi. Voir
 /// [`is_apk`].
-fn collect_apks(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
+pub fn collect_apks(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
     let mut apks = Vec::new();
     if recursive {
         for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
