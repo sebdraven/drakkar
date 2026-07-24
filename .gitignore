@@ -10,3 +10,40 @@ Cargo.lock
 **/*.rs.bk
 *.json
 *.log
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sorties d'analyse et artefacts extraits d'échantillons
+#
+# Deux raisons de ne jamais versionner ce qui suit :
+#   1. ce sont des morceaux de malware (DEX, .so, APK de plugin embarqué) ;
+#   2. ce sont des dérivés reproductibles — l'échantillon fait foi, pas la sortie.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Répertoires de sortie (--out, défaut ./reports) et cache réseau (--cache).
+/reports/
+/cache/
+/out/
+/plugins/
+/extracted/
+
+# Répertoires de lots déjà présents à la racine.
+/cert_named/
+/dating_named/
+
+# Sorties tabulaires des passes d'inventaire (--format csv) à la racine.
+# Portée limitée à la racine : un CSV de référence sous docs/ ou rules/ reste suivi.
+/*.csv
+
+# Artefacts extraits par --extract-libs et --extract-entry, où qu'ils atterrissent.
+# ⚠️ --extract-entry nomme sa sortie d'après le chemin dans l'archive
+# (res/raw/plugin -> res_raw_plugin), donc SANS extension : les motifs ci-dessous
+# ne suffisent pas. Extraire dans un des répertoires ignorés ci-dessus.
+*.apk
+*.dex
+*.dey
+*.so
+*.odex
+*.vdex
+*.oat
+*.arsc
+*.tsv
