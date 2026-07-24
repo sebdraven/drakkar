@@ -86,6 +86,36 @@ struct Cli {
     #[arg(long)]
     extract_libs: bool,
 
+    /// Extrait de l'APK les entrées dont le chemin correspond au motif, vers
+    /// --out. Répétable. Trois formes : chemin exact (`res/raw/plugin`), glob
+    /// (`assets/*.so`, `res/raw/*`), ou sous-chaîne (`plugin`). Insensible à la
+    /// casse. N'extrait QUE les entrées demandées — l'archive n'est jamais
+    /// déballée en entier. Le SHA-256 et le type réel (reniflé sur les octets de
+    /// tête, pas l'extension) sont affichés. Mode single.
+    #[arg(long, value_name = "MOTIF", num_args = 1..)]
+    extract_entry: Vec<String>,
+
+    /// Liste les chemins de toutes les entrées de l'APK, puis sort. Sert à
+    /// trouver quoi passer à --extract-entry. Mode single, rien n'est extrait.
+    #[arg(long)]
+    list_entries: bool,
+
+    /// Points d'entrée DYNAMIQUES : classes de composants atteintes autrement
+    /// que par une déclaration au manifest — registerReceiver, startActivity,
+    /// startService, bindService, new Intent(ctx, X.class), setClass*,
+    /// setComponent, Class.forName. Accepte un **APK ou un DEX brut** (reconnu
+    /// au contenu, pas à l'extension), ce qui permet de passer les DEX déballés
+    /// des échantillons packés. Single ou bulk (--bulk DIR), puis sort.
+    #[arg(long)]
+    dyn_entrypoints: bool,
+
+    /// Chaînes littérales du pool DEX. Sans motif : dump complet. Avec un ou
+    /// plusieurs motifs (répéter l'option) : ne sort que les chaînes qui les
+    /// contiennent, comparaison INSENSIBLE À LA CASSE. Accepte APK ou DEX brut,
+    /// single ou bulk. Sortie TSV : sample, motif, chaine.
+    #[arg(long, value_name = "MOTIF", num_args = 0..)]
+    strings: Option<Vec<String>>,
+
     /// Inventaire complet du AndroidManifest.xml (permissions, composants,
     /// intent-filters, points d'entrée dérivés) puis sort. Fonctionne en single
     /// (APK en argument) comme en bulk (--bulk DIR).
