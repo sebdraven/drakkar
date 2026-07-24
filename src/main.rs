@@ -197,12 +197,165 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Sortie rapide : points d'entrée dynamiques. Ne charge ni le catalogue
+    // MITRE ni le moteur de règles — deux passages sur les classes*.dex.
+    // Fonctionne en single (APK en argument) comme en bulk (--bulk DIR).
+    if cli.dyn_entrypoints {
+        let apks: Vec<PathBuf> = match (&cli.apk, &cli.bulk) {
+            (Some(apk), None) => vec![apk.clone()],
+            (None, Some(dir)) => {
+                let found = parser::dyn_entrypoints::collect_inputs(dir, cli.recursive)?;
+                if found.is_empty() {
+                    bail!("aucun APK ni DEX trouvé dans {}", dir.display());
+                }
+                found
+            }
+            _ => bail!("--dyn-entrypoints requiert soit un APK ou un DEX, soit --bulk DIR"),
+        };
+
+        // Traitement séquentiel : la sortie est un flux TSV ordonné, destiné à
+        // être filtré (`awk`, `sort`). Du parallélisme entrelacerait les lignes
+        // pour un gain négligeable sur un corpus de quelques dizaines d'APK.
+        println!("sample\torigine\tclasse\tsink\toffset\tappelant\tdetail");
+        for apk in &apks {
+            let sample = apk
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".into());
+
+            // Un DEX malformé peut faire paniquer le crate : on isole pour qu'un
+            // échantillon pourri ne tue pas le lot.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                parser::dyn_entrypoints::extract_any(apk)
+            }));
+            let report = match outcome {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    eprintln!("[FAIL]  {sample} — {e:#}");
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("[PANIC] {sample} — parsing abandonné");
+                    continue;
+                }
+            };
+
+            for e in &report.entrypoints {
+                println!(
+                    "{}\t{}\t{}\t{}\t+{}\t{}\t",
+                    sample,
+                    e.provenance.as_str(),
+                    e.class,
+                    e.via,
+                    e.site,
+                    e.caller.api()
+                );
+            }
+            for u in &report.unresolved {
+                println!(
+                    "{}\t?\t\t{}\t+{}\t{}\t{} {} {}",
+                    sample,
+                    u.via,
+                    u.site,
+                    u.caller.api(),
+                    u.reason.as_str(),
+                    u.target_reg.map(|r| format!("v{r}")).unwrap_or_else(|| "-".into()),
+                    u.blocking_insn.as_deref().unwrap_or("-")
+                );
+            }
+            eprintln!(
+                "[OK]    {sample} — {} resolus ({} classes distinctes), {} non resolus",
+                report.entrypoints.len(),
+                report.classes().len(),
+                report.unresolved.len()
+            );
+        }
+        return Ok(());
+    }
+
+    // Sortie rapide : chaines litterales du pool DEX. Single ou bulk, APK ou DEX.
+    if let Some(motifs) = &cli.strings {
+        let inputs: Vec<PathBuf> = match (&cli.apk, &cli.bulk) {
+            (Some(apk), None) => vec![apk.clone()],
+            (None, Some(dir)) => {
+                let found = parser::dyn_entrypoints::collect_inputs(dir, cli.recursive)?;
+                if found.is_empty() {
+                    bail!("aucun APK ni DEX trouvé dans {}", dir.display());
+                }
+                found
+            }
+            _ => bail!("--strings requiert soit un APK ou un DEX, soit --bulk DIR"),
+        };
+
+        // Motifs normalisés une fois pour toutes : la comparaison est
+        // insensible à la casse, car les constantes hexadécimales du corpus
+        // apparaissent tantôt en majuscules tantôt en minuscules.
+        let needles: Vec<(String, String)> = motifs
+            .iter()
+            .map(|m| (m.clone(), m.to_lowercase()))
+            .collect();
+
+        println!("sample\tmotif\tchaine");
+        for input in &inputs {
+            let sample = input
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".into());
+
+            let pool = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                parser::dex_strings::extract_any(input)
+            })) {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
+                    eprintln!("[FAIL]  {sample} — {e:#}");
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("[PANIC] {sample} — parsing abandonné");
+                    continue;
+                }
+            };
+
+            let mut hits = 0usize;
+            for s in &pool.strings {
+                if needles.is_empty() {
+                    // Dump complet : les retours à la ligne casseraient le TSV.
+                    println!("{}\t-\t{}", sample, s.replace(['\n', '\r', '\t'], " "));
+                    hits += 1;
+                    continue;
+                }
+                let lower = s.to_lowercase();
+                for (motif, needle) in &needles {
+                    if lower.contains(needle) {
+                        println!(
+                            "{}\t{}\t{}",
+                            sample,
+                            motif,
+                            s.replace(['\n', '\r', '\t'], " ")
+                        );
+                        hits += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "[OK]    {sample} — {} chaines lues sur {} declarees, {} illisibles, {} correspondances",
+                pool.strings.len(),
+                pool.declared,
+                pool.unreadable,
+                hits
+            );
+        }
+        return Ok(());
+    }
+
     // Sortie rapide : légende seule (aucun APK requis).
     if cli.legend {
         if cli.cert {
             println!("{}", parser::cert::legend());
         } else if cli.dating {
             println!("{}", parser::dating::legend());
+        } else if !cli.extract_entry.is_empty() || cli.list_entries {
+            println!("{}", parser::entry_extract::legend());
         } else if cli.enrich.is_some() {
             println!("{}", enrich::legend());
         } else {
