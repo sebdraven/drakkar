@@ -64,7 +64,9 @@ pub enum ColorMode {
 }
 
 impl ColorMode {
-    fn enabled(self) -> bool {
+    /// `pub` : `diff_strings` s'en sert aussi — une seule définition du
+    /// comportement `auto` pour toutes les sorties colorées de l'outil.
+    pub fn enabled(self) -> bool {
         match self {
             Self::Always => true,
             Self::Never => false,
