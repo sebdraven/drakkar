@@ -213,6 +213,30 @@ struct Cli {
     #[arg(long, default_value_t = 2000)]
     explain_align_cap: usize,
 
+    /// Diff des POOLS DE CHAÎNES de deux DEX (ou APK). Complément indispensable
+    /// de --diff-explain : un champ `static final String` n'est pas écrit par une
+    /// instruction (sa valeur vit dans `encoded_static_values`), donc les diffs
+    /// d'instructions y sont aveugles — endpoints C2 compris. Le pool, lui,
+    /// contient tout. Divergences classées par nature. Puis sort.
+    #[arg(long, value_names = ["A", "B"], num_args = 2)]
+    diff_strings: Option<Vec<PathBuf>>,
+
+    /// (--diff-strings) Substitution `DEPUIS=VERS` appliquée AVANT comparaison.
+    /// Répétable. Ex. `com/duiyun=com/dy`, ou `spyzie=<MARQUE>` et
+    /// `safespy=<MARQUE>` pour ne garder que ce qui diffère au-delà du nom.
+    #[arg(long, value_name = "DEPUIS=VERS", num_args = 1..)]
+    strings_normalize: Vec<String>,
+
+    /// (--diff-strings) Masque le bruit structurel du format DEX : descripteurs
+    /// Dalvik et identifiants nus (noms de méthodes, de champs). Ne garde que
+    /// les vraies constantes.
+    #[arg(long)]
+    strings_literals: bool,
+
+    /// (--diff-strings) Ignore les chaînes plus courtes que N caractères.
+    #[arg(long, default_value_t = 0)]
+    strings_min_len: usize,
+
     /// Couleur des sorties qui en ont. `auto` (défaut) n'émet des séquences ANSI
     /// que si stdout est un terminal et que NO_COLOR est absent.
     #[arg(long, value_name = "QUAND", default_value = "auto")]
