@@ -580,6 +580,39 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Sortie rapide : matrice de similarité sur un répertoire. Un parsing par
+    // échantillon, puis des intersections d'ensembles — c'est ce qui rend le
+    // tous-contre-tous tenable sur un corpus entier.
+    if let Some(dir) = &cli.diff_matrix {
+        use parser::diff_matrix::Metric;
+
+        if cli.legend {
+            println!("{}", parser::diff_matrix::legend());
+            return Ok(());
+        }
+        let metric = match cli.matrix_metric.as_str() {
+            "opcodes" => Metric::Opcodes,
+            "strings" | "chaines" | "chaînes" => Metric::Strings,
+            other => bail!("--matrix-metric attend opcodes|strings, reçu {other:?}"),
+        };
+        check_json_dest(cli.format, cli.json_out.as_deref())?;
+        let opts = parser::diff_matrix::MatrixOptions {
+            metric,
+            normalize: parse_substitutions(&cli.matrix_normalize, "--matrix-normalize")?,
+            threshold: cli.matrix_threshold,
+            recursive: cli.recursive,
+            top: cli.matrix_top,
+        };
+        let report = parser::diff_matrix::run(dir, &opts)?;
+        if cli.format.wants_text() {
+            print!("{}", parser::diff_matrix::render(&report, &opts));
+        }
+        if cli.format.wants_json() {
+            emit_json(&report, cli.json_out.as_deref())?;
+        }
+        return Ok(());
+    }
+
     // Sortie rapide : désassemblage lisible d'une sélection de classes. Ne
     // charge ni catalogue MITRE ni moteur de règles. Mode single uniquement :
     // la sortie est destinée à être diffée, un fichier par binaire.
