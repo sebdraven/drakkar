@@ -481,6 +481,39 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Sortie rapide : diff des pools de chaînes. Ferme l'angle mort des diffs
+    // d'instructions sur les constantes `static final`.
+    if let Some(pair) = &cli.diff_strings {
+        use parser::diff_explain::ColorMode;
+
+        if cli.legend {
+            println!("{}", parser::diff_strings::legend());
+            return Ok(());
+        }
+        let color = match cli.color.as_str() {
+            "auto" => ColorMode::Auto,
+            "always" => ColorMode::Always,
+            "never" => ColorMode::Never,
+            other => bail!("--color attend auto|always|never, reçu {other:?}"),
+        };
+        check_json_dest(cli.format, cli.json_out.as_deref())?;
+        let opts = parser::diff_strings::StringDiffOptions {
+            normalize: parse_substitutions(&cli.strings_normalize, "--strings-normalize")?,
+            literals_only: cli.strings_literals,
+            min_len: cli.strings_min_len,
+            color,
+            ..Default::default()
+        };
+        let report = parser::diff_strings::run(&pair[0], &pair[1], &opts)?;
+        if cli.format.wants_text() {
+            print!("{}", parser::diff_strings::render(&report, &opts));
+        }
+        if cli.format.wants_json() {
+            emit_json(&report, cli.json_out.as_deref())?;
+        }
+        return Ok(());
+    }
+
     // Sortie rapide : diff expliqué. Compare les OPÉRANDES des méthodes de même
     // empreinte — là où --diff-dex ne voit que la structure. En mémoire, donc
     // sans la dérive d'offsets qui pourrit un diff textuel de désassemblage.
