@@ -9,6 +9,7 @@ pub mod dex;
 pub mod dex_strings;
 pub mod diff_dex;
 pub mod diff_explain;
+pub mod diff_matrix;
 pub mod diff_strings;
 pub mod disasm;
 pub mod dyn_entrypoints;
