@@ -134,6 +134,90 @@ struct Cli {
     #[arg(long)]
     dating: bool,
 
+    /// Diff sémantique de deux DEX (ou APK) par empreinte d'opcodes. Prend deux
+    /// entrées A et B ; chaque entrée est un DEX brut ou un APK (reconnu au
+    /// contenu). Mesure « même arbre source » en s'affranchissant du renommage
+    /// de package et de ProGuard : de chaque méthode seule la séquence de
+    /// mnémoniques est retenue. Puis sort.
+    /// Réf. : Lee, Jung, Kim & Kim, ICTC 2019, p. 178-183 (vérifiée à la source).
+    #[arg(long, value_names = ["A", "B"], num_args = 2)]
+    diff_dex: Option<Vec<PathBuf>>,
+
+    /// (--diff-dex) Ne comparer que les classes dont le descripteur Dalvik
+    /// commence par ce préfixe (ex. Lcom/dy/). Répétable — passer les préfixes
+    /// applicatifs des DEUX côtés. Sans lui : exclusion best-effort des libs.
+    #[arg(long, value_name = "PREFIXE", num_args = 1..)]
+    diff_include: Vec<String>,
+
+    /// (--diff-dex) Seuil de Jaccard des méthodes au-delà duquel deux classes
+    /// non identiques sont dites « proches ». ⚠️ 0.85 est un paramètre de cet
+    /// outil, PAS un seuil empirique publié — ne pas l'attribuer au papier.
+    #[arg(long, default_value_t = 0.85)]
+    diff_threshold: f64,
+
+    /// (--diff-dex) Taille de fenêtre du n-gram global de mots-méthodes, comme
+    /// dans le papier. Défaut : 2.
+    #[arg(long, default_value_t = 2)]
+    diff_ngram: usize,
+
+    /// (--diff-dex) Substitution `DEPUIS=VERS` appliquée au descripteur de classe
+    /// pour construire la CLÉ d'appariement (ex. `com/duiyun=com/dy`). Répétable.
+    /// N'affecte ni les empreintes, ni les mesures, ni les noms affichés. Sans
+    /// elle, entre deux namespaces différents, l'appariement par nom échoue et on
+    /// retombe sur le glouton par empreinte — qui mélange les POJO.
+    #[arg(long, value_name = "DEPUIS=VERS", num_args = 1..)]
+    diff_normalize: Vec<String>,
+
+    /// Désassemble les classes dont le descripteur Dalvik contient l'un des
+    /// motifs, avec les opérandes indexées RÉSOLUES en clair (chaînes, types,
+    /// méthodes, champs). Accepte un APK ou un DEX brut, reconnu au contenu.
+    /// Complément de --diff-dex, qui est aveugle aux opérandes. Ce n'est PAS un
+    /// décompilateur — pas de reconstruction de flot ni de types. Puis sort.
+    #[arg(long, value_name = "MOTIF", num_args = 0..)]
+    disasm: Option<Vec<String>>,
+
+    /// (--disasm) Substitution `DEPUIS=VERS` appliquée aux descripteurs et aux
+    /// chaînes avant affichage, pour comparer deux lots de namespaces
+    /// différents (ex. `com/duiyun=com/dy`). Répétable. N'affecte que
+    /// l'affichage, jamais l'empreinte d'opcodes.
+    #[arg(long, value_name = "DEPUIS=VERS", num_args = 1..)]
+    disasm_normalize: Vec<String>,
+
+    /// Diff EXPLIQUÉ de deux DEX (ou APK), en mémoire : compare les opérandes
+    /// RÉSOLUES des méthodes de même empreinte d'opcodes, index par index, et
+    /// catégorise chaque divergence (chaîne / cible de méthode / type / champ
+    /// réel / champ renommé). Ferme l'angle mort de --diff-dex, qui est aveugle
+    /// aux opérandes. Sortie colorée. Puis sort.
+    #[arg(long, value_names = ["A", "B"], num_args = 2)]
+    diff_explain: Option<Vec<PathBuf>>,
+
+    /// (--diff-explain) Ne comparer que les classes dont le descripteur Dalvik
+    /// commence par ce préfixe. Répétable — passer les préfixes des DEUX côtés.
+    #[arg(long, value_name = "PREFIXE", num_args = 1..)]
+    explain_include: Vec<String>,
+
+    /// (--diff-explain) Substitution `DEPUIS=VERS` appliquée AVANT comparaison
+    /// (ex. `com/duiyun=com/dy`). Répétable. Indispensable entre deux lots de
+    /// namespaces différents, sinon chaque opérande diverge sur le namespace.
+    #[arg(long, value_name = "DEPUIS=VERS", num_args = 1..)]
+    explain_normalize: Vec<String>,
+
+    /// (--diff-explain) Lignes de contexte identiques affichées autour de chaque
+    /// changement dans le rendu aligné par LCS. 0 = changements seuls.
+    #[arg(long, default_value_t = 3)]
+    explain_context: usize,
+
+    /// (--diff-explain) Plafond d'instructions par méthode pour l'alignement
+    /// LCS. La table de programmation dynamique est en O(n·m) en temps et en
+    /// mémoire ; au-delà la méthode est signalée mais pas alignée.
+    #[arg(long, default_value_t = 2000)]
+    explain_align_cap: usize,
+
+    /// Couleur des sorties qui en ont. `auto` (défaut) n'émet des séquences ANSI
+    /// que si stdout est un terminal et que NO_COLOR est absent.
+    #[arg(long, value_name = "QUAND", default_value = "auto")]
+    color: String,
+
     /// Rendu des sorties --manifest / --cert.
     #[arg(long, value_enum, default_value_t = Format::Text)]
     format: Format,
