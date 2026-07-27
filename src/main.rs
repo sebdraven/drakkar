@@ -237,6 +237,35 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     strings_min_len: usize,
 
+    /// Matrice de similarité TOUS-CONTRE-TOUS sur un répertoire d'échantillons
+    /// (APK ou DEX, reconnus au contenu). Chaque entrée n'est parsée QU'UNE FOIS,
+    /// puis les n(n-1)/2 comparaisons se font sur des ensembles en mémoire.
+    /// Sort la matrice, le classement des paires et un regroupement par lien
+    /// simple. Puis sort.
+    #[arg(long, value_name = "DIR")]
+    diff_matrix: Option<PathBuf>,
+
+    /// (--diff-matrix) Métrique qui pilote la matrice et le regroupement.
+    /// `opcodes` = « même moteur ? », `strings` = « mêmes constantes ? ».
+    /// Les deux sont calculées dans tous les cas.
+    #[arg(long, value_name = "NOM", default_value = "opcodes")]
+    matrix_metric: String,
+
+    /// (--diff-matrix) Substitution `DEPUIS=VERS` appliquée aux descripteurs ET
+    /// aux chaînes avant comparaison. Répétable. Indispensable sur un lot
+    /// multi-namespace (`com/duiyun=com/dy`), sinon les descripteurs font
+    /// chuter la similarité pour une raison qui n'a rien à voir avec le code.
+    #[arg(long, value_name = "DEPUIS=VERS", num_args = 1..)]
+    matrix_normalize: Vec<String>,
+
+    /// (--diff-matrix) Seuil de regroupement par lien simple.
+    #[arg(long, default_value_t = 0.85)]
+    matrix_threshold: f64,
+
+    /// (--diff-matrix) Nombre de paires listées dans le classement. 0 = toutes.
+    #[arg(long, default_value_t = 40)]
+    matrix_top: usize,
+
     /// Couleur des sorties qui en ont. `auto` (défaut) n'émet des séquences ANSI
     /// que si stdout est un terminal et que NO_COLOR est absent.
     #[arg(long, value_name = "QUAND", default_value = "auto")]
