@@ -432,6 +432,98 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Sortie rapide : diff sémantique de deux DEX/APK par empreinte d'opcodes.
+    // Ne charge ni catalogue MITRE ni moteur de règles. L'appariement des
+    // classes est nom-agnostique : com.dy↔com.duiyun et ProGuard sont absorbés.
+    if let Some(pair) = &cli.diff_dex {
+        if cli.legend {
+            println!("{}", parser::diff_dex::legend());
+            return Ok(());
+        }
+        check_json_dest(cli.format, cli.json_out.as_deref())?;
+        let opts = parser::diff_dex::DiffOptions {
+            include_prefixes: cli.diff_include.clone(),
+            threshold: cli.diff_threshold,
+            ngram: cli.diff_ngram,
+            normalize: parse_substitutions(&cli.diff_normalize, "--diff-normalize")?,
+        };
+        let report = parser::diff_dex::run(&pair[0], &pair[1], &opts)?;
+        if cli.format.wants_text() {
+            print_diff_dex(&report);
+        }
+        if cli.format.wants_json() {
+            emit_json(&report, cli.json_out.as_deref())?;
+        }
+        return Ok(());
+    }
+
+    // Sortie rapide : diff expliqué. Compare les OPÉRANDES des méthodes de même
+    // empreinte — là où --diff-dex ne voit que la structure. En mémoire, donc
+    // sans la dérive d'offsets qui pourrit un diff textuel de désassemblage.
+    if let Some(pair) = &cli.diff_explain {
+        use parser::diff_explain::ColorMode;
+
+        let color = match cli.color.as_str() {
+            "auto" => ColorMode::Auto,
+            "always" => ColorMode::Always,
+            "never" => ColorMode::Never,
+            other => bail!("--color attend auto|always|never, reçu {other:?}"),
+        };
+
+        let opts = parser::diff_explain::ExplainOptions {
+            include_prefixes: cli.explain_include.clone(),
+            normalize: parse_substitutions(&cli.explain_normalize, "--explain-normalize")?,
+            color,
+            context: cli.explain_context,
+            align_cap: cli.explain_align_cap,
+            ..Default::default()
+        };
+
+        if cli.legend {
+            println!("{}", parser::diff_explain::legend());
+            return Ok(());
+        }
+
+        let report = parser::diff_explain::run(&pair[0], &pair[1], &opts)?;
+        if cli.format.wants_text() {
+            print!("{}", parser::diff_explain::render_report(&report, &opts));
+        }
+        if cli.format.wants_json() {
+            emit_json(&report, cli.json_out.as_deref())?;
+        }
+        return Ok(());
+    }
+
+    // Sortie rapide : désassemblage lisible d'une sélection de classes. Ne
+    // charge ni catalogue MITRE ni moteur de règles. Mode single uniquement :
+    // la sortie est destinée à être diffée, un fichier par binaire.
+    if let Some(patterns) = &cli.disasm {
+        if cli.legend {
+            println!("{}", parser::disasm::legend());
+            return Ok(());
+        }
+        let Some(input) = &cli.apk else {
+            bail!("--disasm requiert un APK ou un DEX en argument (mode single)");
+        };
+
+        // `DEPUIS=VERS` : on découpe sur le PREMIER `=` seulement, pour ne pas
+        // casser un motif qui en contiendrait un.
+        let normalize = parse_substitutions(&cli.disasm_normalize, "--disasm-normalize")?;
+
+        let opts = parser::disasm::DisasmOptions {
+            patterns: patterns.clone(),
+            normalize,
+        };
+        let report = parser::disasm::run(input, &opts)?;
+        print!("{}", parser::disasm::render(&report));
+        eprintln!(
+            "[OK]    {} classe(s) désassemblée(s) sur {} lues",
+            report.classes.len(),
+            report.scanned
+        );
+        return Ok(());
+    }
+
     // Sortie rapide : légende seule (aucun APK requis).
     if cli.legend {
         if cli.cert {
@@ -1038,6 +1130,69 @@ fn print_dating(r: &drakkar::parser::dating::DatingReport) {
 
 fn opt_num(v: Option<u32>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "?".into())
+}
+
+/// Rendu console du diff DEX (mode `--diff-dex`).
+fn print_diff_dex(r: &drakkar::parser::diff_dex::DiffReport) {
+    println!("== Diff DEX ==\n");
+    println!("A  {}", r.input_a);
+    println!("B  {}", r.input_b);
+    println!(
+        "\nClasses applicatives : A={}  B={}   Méthodes : A={}  B={}",
+        r.classes_a, r.classes_b, r.methods_a, r.methods_b
+    );
+
+    println!("\nSimilarité globale :");
+    println!(
+        "  méthodes identiques (Jaccard, ordre-insensible)   {:.4}",
+        r.jaccard_methods
+    );
+    println!(
+        "  {}-gramme de méthodes (Jaccard, ordre-sensible)    {:.4}",
+        r.ngram, r.jaccard_ngram
+    );
+
+    println!("\nAppariement par classe (seuil proche = {:.2}) :", r.threshold);
+    println!(
+        "  identiques   {}   (par nom {}, par empreinte seule {})",
+        r.identical_classes, r.identical_by_name, r.identical_by_hash
+    );
+    if r.identical_by_hash > 0 {
+        println!(
+            "               /!\\ {} paire(s) appariée(s) sur la seule empreinte : soit un renommage",
+            r.identical_by_hash
+        );
+        println!("                   réel de classe, soit un appariement douteux entre classes de");
+        println!("                   même forme (POJO). À vérifier dans le JSON.");
+    }
+    println!("  proches      {}", r.near_classes);
+    println!("  only in A    {}", r.only_in_a.len());
+    println!("  only in B    {}", r.only_in_b.len());
+
+    if !r.near.is_empty() {
+        println!("\nClasses proches (Jaccard décroissant) :");
+        for p in &r.near {
+            println!(
+                "  {:.4}  {:<44} ↔ {:<44} ({}/{} méthodes)",
+                p.jaccard, p.class_a, p.class_b, p.methods_a, p.methods_b
+            );
+        }
+    }
+
+    if !r.only_in_a.is_empty() {
+        println!("\nClasses propres à A ({}) :", r.only_in_a.len());
+        for c in &r.only_in_a {
+            println!("  {c}");
+        }
+    }
+    if !r.only_in_b.is_empty() {
+        println!("\nClasses propres à B ({}) :", r.only_in_b.len());
+        for c in &r.only_in_b {
+            println!("  {c}");
+        }
+    }
+
+    println!("\n(le détail des classes identiques est dans le JSON ; légende : --diff-dex --legend)");
 }
 
 /// Affiche le résultat d'une extraction ciblée et écrit les entrées dans `dir`.
