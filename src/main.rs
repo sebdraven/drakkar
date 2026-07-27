@@ -604,6 +604,20 @@ fn print_and_dump_extract(
     Ok(())
 }
 
+/// Analyse une liste de substitutions `DEPUIS=VERS`.
+///
+/// Découpe sur le PREMIER `=` seulement : un motif peut lui-même en contenir.
+fn parse_substitutions(specs: &[String], flag: &str) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for spec in specs {
+        match spec.split_once('=') {
+            Some((from, to)) if !from.is_empty() => out.push((from.to_string(), to.to_string())),
+            _ => bail!("{flag} attend `DEPUIS=VERS`, reçu {spec:?}"),
+        }
+    }
+    Ok(out)
+}
+
 /// Dimensionne le pool rayon global (0 = auto, tous les cœurs).
 fn setup_jobs(jobs: usize) -> Result<()> {
     if jobs > 0 {
