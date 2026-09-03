@@ -3,6 +3,11 @@
 //! Un APK est une archive zip : on extrait les `classes*.dex` (parsés par le
 //! crate `dex` + `dex-bytecode`) et les `lib/*/*.so` (parsés par LIEF, derrière
 //! la feature `lief-backend`). Le manifest binaire est traité par `manifest`.
+//!
+//! Certaines familles trafiquent la structure ZIP pour casser les outils sans
+//! gêner l'installation par Android. Quand le crate `zip` refuse l'archive, on
+//! bascule sur `apkzip`, un lecteur tolérant calqué sur le chargeur d'APK.
+pub mod apkzip;
 pub mod cert;
 pub mod dating;
 pub mod dex;
@@ -81,10 +86,30 @@ struct ApkEntries {
     so_files: Vec<std::path::PathBuf>,
 }
 
+/// Vrai si l'entrée nous intéresse : un `classes*.dex` ou un `lib/**/*.so`.
+fn wanted(name: &str) -> (bool, bool) {
+    let is_dex = name.starts_with("classes") && name.ends_with(".dex");
+    let is_so = name.starts_with("lib/") && name.ends_with(".so");
+    (is_dex, is_so)
+}
+
 /// Dézippe l'APK : écrit les classes*.dex et lib/**/*.so dans `out_dir`.
+///
+/// Chemin nominal via le crate `zip`. Si celui-ci refuse l'archive (structure
+/// trafiquée), on retombe sur le lecteur tolérant.
 fn extract_apk(apk: &Path, out_dir: &Path) -> Result<ApkEntries> {
     let file = std::fs::File::open(apk).with_context(|| format!("open {}", apk.display()))?;
-    let mut zip = zip::ZipArchive::new(file).context("read apk as zip")?;
+    let mut zip = match zip::ZipArchive::new(file) {
+        Ok(z) => z,
+        Err(e) => {
+            tracing::warn!(
+                apk = %apk.display(),
+                error = %e,
+                "crate zip en échec, repli sur le lecteur tolérant"
+            );
+            return extract_apk_tolerant(apk, out_dir);
+        }
+    };
 
     let mut dex_files = Vec::new();
     let mut so_files = Vec::new();
@@ -93,8 +118,7 @@ fn extract_apk(apk: &Path, out_dir: &Path) -> Result<ApkEntries> {
         let mut entry = zip.by_index(i)?;
         let name = entry.name().to_string();
 
-        let is_dex = name.starts_with("classes") && name.ends_with(".dex");
-        let is_so = name.starts_with("lib/") && name.ends_with(".so");
+        let (is_dex, is_so) = wanted(&name);
         if !is_dex && !is_so {
             continue;
         }
@@ -117,6 +141,62 @@ fn extract_apk(apk: &Path, out_dir: &Path) -> Result<ApkEntries> {
         dex = dex_files.len(),
         so = so_files.len(),
         "APK extracted"
+    );
+    Ok(ApkEntries { dex_files, so_files })
+}
+
+/// Repli quand le crate `zip` refuse l'archive : lecteur calqué sur le
+/// chargeur d'APK d'Android (cf. `apkzip`). Une entrée illisible est ignorée
+/// plutôt que de faire échouer l'extraction complète.
+fn extract_apk_tolerant(apk: &Path, out_dir: &Path) -> Result<ApkEntries> {
+    let zip = apkzip::TolerantZip::open(apk)
+        .with_context(|| format!("lecteur tolérant sur {}", apk.display()))?;
+    tracing::warn!(
+        entries = zip.len(),
+        tampered = zip.tampered_count(),
+        "lecteur tolérant actif"
+    );
+
+    let mut dex_files = Vec::new();
+    let mut so_files = Vec::new();
+
+    for (i, entry) in zip.entries().iter().enumerate() {
+        let name = &entry.name;
+        let (is_dex, is_so) = wanted(name);
+        if !is_dex && !is_so {
+            continue;
+        }
+
+        // Les noms trafiqués peuvent contenir n'importe quoi : on aplatit et on
+        // refuse toute tentative de sortie du répertoire de destination.
+        let flat = name.replace('/', "__").replace("..", "__");
+        if flat.is_empty() || flat.starts_with('/') {
+            tracing::warn!(entry = %name, "nom d'entrée refusé");
+            continue;
+        }
+
+        let buf = match zip.read(i) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(entry = %name, error = %e, "entrée illisible, ignorée");
+                continue;
+            }
+        };
+
+        let dest = out_dir.join(&flat);
+        std::fs::write(&dest, &buf)?;
+
+        if is_dex {
+            dex_files.push(dest);
+        } else {
+            so_files.push(dest);
+        }
+    }
+
+    tracing::info!(
+        dex = dex_files.len(),
+        so = so_files.len(),
+        "APK extracted (lecteur tolérant)"
     );
     Ok(ApkEntries { dex_files, so_files })
 }
