@@ -24,6 +24,10 @@ dex = "0.5"
 zip = "2"
 tempfile = "3"
 
+# Décompression deflate brute, utilisée par le lecteur ZIP tolérant
+# (src/parser/apkzip.rs) quand le crate `zip` refuse une archive trafiquée.
+flate2 = "1"
+
 # Mode bulk : parallélisme de l'analyse d'un répertoire d'APK.
 rayon = "1"
 # Parcours récursif optionnel du répertoire d'APK en mode bulk.
