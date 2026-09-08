@@ -95,8 +95,10 @@ fn wanted(name: &str) -> (bool, bool) {
 
 /// Dézippe l'APK : écrit les classes*.dex et lib/**/*.so dans `out_dir`.
 ///
-/// Chemin nominal via le crate `zip`. Si celui-ci refuse l'archive (structure
-/// trafiquée), on retombe sur le lecteur tolérant.
+/// Chemin nominal via le crate `zip`. On retombe sur le lecteur tolérant dès
+/// qu'il refuse quoi que ce soit — l'archive à l'ouverture, mais aussi une
+/// entrée à la lecture : le drapeau de chiffrement et la méthode de compression
+/// ne sont contrôlés qu'à ce moment, et c'est là que le trafiquage frappe.
 fn extract_apk(apk: &Path, out_dir: &Path) -> Result<ApkEntries> {
     let file = std::fs::File::open(apk).with_context(|| format!("open {}", apk.display()))?;
     let mut zip = match zip::ZipArchive::new(file) {
@@ -115,7 +117,18 @@ fn extract_apk(apk: &Path, out_dir: &Path) -> Result<ApkEntries> {
     let mut so_files = Vec::new();
 
     for i in 0..zip.len() {
-        let mut entry = zip.by_index(i)?;
+        let mut entry = match zip.by_index(i) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    apk = %apk.display(),
+                    index = i,
+                    error = %e,
+                    "entrée refusée par le crate zip, repli sur le lecteur tolérant"
+                );
+                return extract_apk_tolerant(apk, out_dir);
+            }
+        };
         let name = entry.name().to_string();
 
         let (is_dex, is_so) = wanted(&name);
@@ -127,7 +140,17 @@ fn extract_apk(apk: &Path, out_dir: &Path) -> Result<ApkEntries> {
         let flat = name.replace('/', "__");
         let dest = out_dir.join(&flat);
         let mut buf = Vec::with_capacity(entry.size() as usize);
-        entry.read_to_end(&mut buf)?;
+        let read = entry.read_to_end(&mut buf);
+        drop(entry);
+        if let Err(e) = read {
+            tracing::warn!(
+                apk = %apk.display(),
+                entry = %name,
+                error = %e,
+                "lecture d'entrée en échec, repli sur le lecteur tolérant"
+            );
+            return extract_apk_tolerant(apk, out_dir);
+        }
         std::fs::write(&dest, &buf)?;
 
         if is_dex {
