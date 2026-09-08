@@ -3,6 +3,10 @@
 //! chaque `.so` directement depuis l'archive zip. Aucun `.so` n'est écrit sur
 //! disque, LIEF n'est pas requis → le module tourne dans le build par défaut.
 //!
+//! Exception : sur une archive trafiquée, le repli tolérant décompresse chaque
+//! entrée en entier avant d'en lire l'en-tête — le lecteur ne sait pas s'arrêter
+//! aux premiers octets. Rien n'est écrit sur disque pour autant.
+//!
 //! Objectif : savoir *quelles ABI / quels bits* embarque un APK avant toute
 //! analyse native. C'est l'info qui conditionne la convention d'appel à poser
 //! côté exécution symbolique (Kharon) :
