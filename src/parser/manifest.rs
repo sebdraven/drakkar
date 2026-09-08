@@ -1,36 +1,26 @@
-//! Parsing AndroidManifest.xml (format binaire AXML) depuis l'APK via `axmldecoder` :
-//! permissions, intent actions, services (dont accessibility) -> ApkFeatures.
+//! Parsing AndroidManifest.xml (format binaire AXML) depuis l'APK via
+//! `parser::axml` : permissions, intent actions, services (dont accessibility)
+//! -> ApkFeatures.
 use crate::model::{ApkFeatures, ServiceDecl};
+use crate::parser::axml::{self, Element};
 use anyhow::{Context, Result};
-use axmldecoder::{Element, Node, XmlDocument};
 use std::io::Read;
 use std::path::Path;
 
 pub fn extract(apk_path: &Path, features: &mut ApkFeatures) -> Result<()> {
     let raw = read_manifest_bytes(apk_path)?;
-    // axmldecoder indexe le string pool sans borner ses offsets : sur un AXML
-    // trafiqué il panique au lieu de rendre une erreur.
-    let parsed = std::panic::catch_unwind(|| axmldecoder::parse(&raw));
-    let doc: XmlDocument = match parsed {
-        Ok(Ok(d)) => d,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "AXML parse failed — manifest features vides");
-            return Ok(());
-        }
-        Err(_) => {
+    let root = match axml::decode(&raw) {
+        Ok(decoded) => decoded.root,
+        Err(e) => {
             tracing::warn!(
                 apk = %apk_path.display(),
-                "AXML parse panic — manifest features vides"
+                error = %e,
+                "AXML illisible, y compris par le décodeur tolérant — manifest features vides"
             );
             return Ok(());
         }
     };
-
-    if let Some(root) = doc.get_root() {
-        if let Node::Element(root_elem) = root {
-            walk(root_elem, features);
-        }
-    }
+    walk(&root, features);
 
     tracing::info!(
         package = %features.package,
@@ -81,17 +71,17 @@ fn read_manifest_bytes(apk_path: &Path) -> Result<Vec<u8>> {
 fn walk(elem: &Element, features: &mut ApkFeatures) {
     match elem.get_tag() {
         "manifest" => {
-            if let Some(pkg) = attr(elem, "package") {
+            if let Some(pkg) = elem.attr("package") {
                 features.package = pkg;
             }
         }
         "uses-permission" | "uses-permission-sdk-23" => {
-            if let Some(name) = attr_name(elem) {
+            if let Some(name) = elem.attr("name") {
                 features.permissions.push(name);
             }
         }
         "action" => {
-            if let Some(name) = attr_name(elem) {
+            if let Some(name) = elem.attr("name") {
                 features.intent_actions.push(name);
             }
         }
@@ -110,16 +100,14 @@ fn walk(elem: &Element, features: &mut ApkFeatures) {
     }
 
     for child in elem.get_children() {
-        if let Node::Element(child_elem) = child {
-            walk(child_elem, features);
-        }
+        walk(child, features);
     }
 }
 
 /// Résout le `android:name` d'un composant en descripteur Dalvik `Lcom/foo/Bar;`.
 /// Gère les noms relatifs (`.MyService` ou `MyService` -> package + nom).
 fn component_class(elem: &Element, package: &str) -> Option<String> {
-    let name = attr_name(elem)?;
+    let name = elem.attr("name")?;
     let fqcn = if let Some(stripped) = name.strip_prefix('.') {
         format!("{package}.{stripped}")
     } else if name.contains('.') {
@@ -133,8 +121,8 @@ fn component_class(elem: &Element, package: &str) -> Option<String> {
 
 /// Construit un ServiceDecl, en détectant le binding accessibility.
 fn parse_service(elem: &Element) -> ServiceDecl {
-    let name = attr_name(elem).unwrap_or_default();
-    let permission = attr(elem, "permission");
+    let name = elem.attr("name").unwrap_or_default();
+    let permission = elem.attr("permission");
     let is_accessibility = permission
         .as_deref()
         .map(|p| p.contains("BIND_ACCESSIBILITY_SERVICE"))
@@ -159,30 +147,11 @@ fn parse_service(elem: &Element) -> ServiceDecl {
 /// Collecte les <action> sous un élément (via ses intent-filters).
 fn collect_child_actions(elem: &Element, out: &mut Vec<String>) {
     for child in elem.get_children() {
-        if let Node::Element(child_elem) = child {
-            if child_elem.get_tag() == "action" {
-                if let Some(name) = attr_name(child_elem) {
-                    out.push(name);
-                }
+        if child.get_tag() == "action" {
+            if let Some(name) = child.attr("name") {
+                out.push(name);
             }
-            collect_child_actions(child_elem, out);
         }
+        collect_child_actions(child, out);
     }
-}
-
-/// Récupère un attribut par nom exact ou suffixe (gère le préfixe `android:`).
-fn attr(elem: &Element, key: &str) -> Option<String> {
-    let attrs = elem.get_attributes();
-    if let Some(v) = attrs.get(key) {
-        return Some(v.clone());
-    }
-    attrs
-        .iter()
-        .find(|(k, _)| k.split(':').last() == Some(key))
-        .map(|(_, v)| v.clone())
-}
-
-/// Raccourci pour l'attribut `name` (souvent `android:name`).
-fn attr_name(elem: &Element) -> Option<String> {
-    attr(elem, "name")
 }
