@@ -399,16 +399,36 @@ pub fn extract(apk_path: &Path) -> Result<ManifestReport> {
 }
 
 /// Extrait les octets de l'entrée `AndroidManifest.xml` de l'archive APK.
+///
+/// Même repli que `parser::manifest` : le crate `zip` ne contrôle le drapeau de
+/// chiffrement et la méthode de compression qu'à la lecture de l'entrée.
 fn read_manifest_bytes(apk_path: &Path) -> Result<Vec<u8>> {
     let file = std::fs::File::open(apk_path)
         .with_context(|| format!("ouverture {}", apk_path.display()))?;
-    let mut zip = zip::ZipArchive::new(file).context("lecture de l'APK comme zip")?;
-    let mut entry = zip
-        .by_name("AndroidManifest.xml")
-        .context("AndroidManifest.xml absent de l'APK")?;
-    let mut buf = Vec::with_capacity(entry.size() as usize);
-    entry.read_to_end(&mut buf)?;
-    Ok(buf)
+
+    let nominal = (|| -> Result<Vec<u8>> {
+        let mut zip = zip::ZipArchive::new(file).context("lecture de l'APK comme zip")?;
+        let mut entry = zip
+            .by_name("AndroidManifest.xml")
+            .context("AndroidManifest.xml absent de l'APK")?;
+        let mut buf = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut buf)?;
+        Ok(buf)
+    })();
+
+    match nominal {
+        Ok(buf) => Ok(buf),
+        Err(e) => {
+            tracing::warn!(
+                apk = %apk_path.display(),
+                error = %e,
+                "manifest illisible par le crate zip, repli sur le lecteur tolérant"
+            );
+            super::apkzip::TolerantZip::open(apk_path)?
+                .read_by_name("AndroidManifest.xml")
+                .context("AndroidManifest.xml illisible, y compris par le lecteur tolérant")
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
