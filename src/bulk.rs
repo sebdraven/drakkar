@@ -88,15 +88,25 @@ impl Inventory {
 pub fn run(input_dir: &Path, engine: &Engine, opts: &BulkOptions) -> Result<()> {
     std::fs::create_dir_all(&opts.out_dir)?;
 
-    let apks = collect_apks(input_dir, opts.recursive)?;
-    if apks.is_empty() {
+    let found = collect_apks(input_dir, opts.recursive)?;
+    let apks = found.apks;
+    if apks.is_empty() && found.rejected.is_empty() {
         anyhow::bail!("aucun APK trouvé dans {}", input_dir.display());
     }
-    tracing::info!(count = apks.len(), out = %opts.out_dir.display(), "bulk: démarrage");
+    tracing::info!(
+        count = apks.len(),
+        rejected = found.rejected.len(),
+        out = %opts.out_dir.display(),
+        "bulk: démarrage"
+    );
 
     let ok = AtomicUsize::new(0);
-    let failed = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(found.rejected.len());
     let skipped = AtomicUsize::new(0);
+
+    for (path, why) in &found.rejected {
+        eprintln!("[FAIL]  {}  — non reconnu comme APK : {why}", path.display());
+    }
 
     apks.par_iter().for_each(|apk| {
         let stem = apk
@@ -146,31 +156,59 @@ pub fn run(input_dir: &Path, engine: &Engine, opts: &BulkOptions) -> Result<()> 
     Ok(())
 }
 
+/// Ce qu'a donné la collecte d'un répertoire.
+pub struct Collected {
+    /// APK confirmés, triés.
+    pub apks: Vec<PathBuf>,
+    /// Fichiers à signature ZIP dont aucun lecteur n'a tiré d'AndroidManifest.xml.
+    /// Ils sont comptés en échec plutôt qu'écartés en silence : sur un corpus
+    /// nommé par hachage, une exclusion muette est indiscernable d'une absence.
+    pub rejected: Vec<(PathBuf, String)>,
+}
+
 /// Collecte les APK d'un répertoire (récursif optionnel), triés pour un ordre de
 /// traitement déterministe.
 ///
 /// La sélection se fait sur le **contenu**, jamais sur l'extension : les corpus
 /// nommés par hash n'en ont pas, et un `.apk` peut être n'importe quoi. Voir
-/// [`is_apk`].
-pub fn collect_apks(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
+/// [`recognize`].
+pub fn collect_apks(dir: &Path, recursive: bool) -> Result<Collected> {
     let mut apks = Vec::new();
+    let mut rejected = Vec::new();
+
+    let mut consider = |p: PathBuf| match recognize(&p) {
+        Recognition::Apk => apks.push(p),
+        Recognition::ZipWithoutManifest(why) => rejected.push((p, why)),
+        Recognition::NotZip => {}
+    };
+
     if recursive {
         for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
             let p = entry.path();
-            if p.is_file() && is_apk(p) {
-                apks.push(p.to_path_buf());
+            if p.is_file() {
+                consider(p.to_path_buf());
             }
         }
     } else {
         for entry in std::fs::read_dir(dir)? {
             let p = entry?.path();
-            if p.is_file() && is_apk(&p) {
-                apks.push(p);
+            if p.is_file() {
+                consider(p);
             }
         }
     }
     apks.sort();
-    Ok(apks)
+    rejected.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(Collected { apks, rejected })
+}
+
+/// Verdict de reconnaissance d'un fichier.
+enum Recognition {
+    Apk,
+    /// Archive ZIP sans manifeste exploitable — porte la raison, à afficher.
+    ZipWithoutManifest(String),
+    /// Ni ZIP ni APK : DEX, ELF, image, résidu de corpus. Écarté sans bruit.
+    NotZip,
 }
 
 /// Reconnaît un APK à son contenu, en trois étapes de coût croissant :
@@ -185,27 +223,42 @@ pub fn collect_apks(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
 ///
 /// L'extension n'entre jamais en compte : `.apk` ne garantit rien et son absence
 /// n'exclut rien.
-fn is_apk(p: &Path) -> bool {
+fn recognize(p: &Path) -> Recognition {
     use std::io::Read;
 
     let Ok(mut f) = std::fs::File::open(p) else {
-        return false;
+        return Recognition::NotZip;
     };
     let mut magic = [0u8; 4];
     if f.read_exact(&mut magic).is_err() || magic != [0x50, 0x4b, 0x03, 0x04] {
-        return false;
+        return Recognition::NotZip;
     }
 
     // Lecture du central directory uniquement : le contenu n'est pas décompressé.
-    if let Ok(mut zip) = zip::ZipArchive::new(f) {
-        if zip.by_name("AndroidManifest.xml").is_ok() {
-            return true;
+    let nominal = match zip::ZipArchive::new(f) {
+        Ok(mut zip) => {
+            if zip.by_name("AndroidManifest.xml").is_ok() {
+                return Recognition::Apk;
+            }
+            "pas d'AndroidManifest.xml".to_string()
         }
-    }
+        Err(e) => format!("crate zip : {e}"),
+    };
 
     match parser::apkzip::TolerantZip::open(p) {
-        Ok(zip) => zip.entries().iter().any(|e| e.name == "AndroidManifest.xml"),
-        Err(_) => false,
+        Ok(zip) => {
+            if zip.entries().iter().any(|e| e.name == "AndroidManifest.xml") {
+                Recognition::Apk
+            } else {
+                Recognition::ZipWithoutManifest(format!(
+                    "{nominal} ; lecteur tolérant : {} entrée(s), aucune AndroidManifest.xml",
+                    zip.len()
+                ))
+            }
+        }
+        Err(e) => Recognition::ZipWithoutManifest(format!(
+            "{nominal} ; lecteur tolérant : {e:#}"
+        )),
     }
 }
 
@@ -221,20 +274,26 @@ pub fn run_inventory(input_dir: &Path, what: Inventory, opts: &BulkOptions) -> R
         std::fs::create_dir_all(&opts.out_dir)?;
     }
 
-    let apks = collect_apks(input_dir, opts.recursive)?;
-    if apks.is_empty() {
+    let found = collect_apks(input_dir, opts.recursive)?;
+    let apks = found.apks;
+    if apks.is_empty() && found.rejected.is_empty() {
         anyhow::bail!("aucun APK trouvé dans {}", input_dir.display());
     }
     tracing::info!(
         count = apks.len(),
+        rejected = found.rejected.len(),
         kind = what.label(),
         out = %opts.out_dir.display(),
         "bulk inventaire: démarrage"
     );
 
     let ok = AtomicUsize::new(0);
-    let failed = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(found.rejected.len());
     let skipped = AtomicUsize::new(0);
+
+    for (path, why) in &found.rejected {
+        eprintln!("[FAIL]  {}  — non reconnu comme APK : {why}", path.display());
+    }
     let csv_mode = opts.format == BulkFormat::Csv;
     // Un rendu groupé (CSV, ou JSON vers stdout) impose d'accumuler les rapports
     // en mémoire ; le JSON vers fichier les écrit au fil de l'eau.
