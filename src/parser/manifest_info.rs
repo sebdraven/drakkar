@@ -12,8 +12,8 @@
 //! Toutes les étiquettes et catégories produites sont définies dans [`legend`]
 //! (légende autonome).
 
+use crate::parser::axml::{self, Element};
 use anyhow::{anyhow, Context, Result};
-use axmldecoder::{Element, Node};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
@@ -376,26 +376,26 @@ const BIND_PERMISSIONS: &[(&str, EntryTrigger)] = &[
 // Point d'entrée du module
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Anomalie signalant que le rapport vient du décodeur AXML de repli. Définie
+/// dans [`legend`].
+const ANOMALY_TOLERANT_AXML: &str =
+    "manifest décodé par le repli AXML tolérant — inventaire potentiellement partiel";
+
 /// Parse le `AndroidManifest.xml` d'un APK et produit le rapport complet.
 pub fn extract(apk_path: &Path) -> Result<ManifestReport> {
     let raw = read_manifest_bytes(apk_path)?;
-    let doc = axmldecoder::parse(&raw).map_err(|e| anyhow!("décodage AXML: {e}"))?;
-    // `get_root()` renvoie `&Option<Node>` : `.as_ref()` pour obtenir
-    // `Option<&Node>` sans déposséder le document.
-    let root = doc
-        .get_root()
-        .as_ref()
-        .ok_or_else(|| anyhow!("manifest sans racine"))?;
-    let Node::Element(root) = root else {
-        return Err(anyhow!("racine du manifest n'est pas un élément"));
-    };
-    if root.get_tag() != "manifest" {
+    let decoded = axml::decode(&raw).map_err(|e| anyhow!("décodage AXML: {e}"))?;
+    if decoded.root.get_tag() != "manifest" {
         return Err(anyhow!(
             "racine inattendue: <{}> au lieu de <manifest>",
-            root.get_tag()
+            decoded.root.get_tag()
         ));
     }
-    Ok(build(root))
+    let mut report = build(&decoded.root);
+    if decoded.tolerant {
+        report.anomalies.push(ANOMALY_TOLERANT_AXML.into());
+    }
+    Ok(report)
 }
 
 /// Extrait les octets de l'entrée `AndroidManifest.xml` de l'archive APK.
@@ -437,49 +437,49 @@ fn read_manifest_bytes(apk_path: &Path) -> Result<Vec<u8>> {
 
 fn build(root: &Element) -> ManifestReport {
     let mut r = ManifestReport {
-        package: attr(root, "package").unwrap_or_default(),
-        version_code: attr(root, "versionCode"),
-        version_name: attr(root, "versionName"),
-        install_location: attr(root, "installLocation"),
-        shared_user_id: attr(root, "sharedUserId"),
+        package: root.attr("package").unwrap_or_default(),
+        version_code: root.attr("versionCode"),
+        version_name: root.attr("versionName"),
+        install_location: root.attr("installLocation"),
+        shared_user_id: root.attr("sharedUserId"),
         ..Default::default()
     };
-    r.sdk.compile_sdk = attr_u32(root, "compileSdkVersion");
-    r.sdk.compile_sdk_codename = attr(root, "compileSdkVersionCodename");
-    r.sdk.platform_build_version_code = attr(root, "platformBuildVersionCode");
-    r.sdk.platform_build_version_name = attr(root, "platformBuildVersionName");
+    r.sdk.compile_sdk = root.attr_u32("compileSdkVersion");
+    r.sdk.compile_sdk_codename = root.attr("compileSdkVersionCodename");
+    r.sdk.platform_build_version_code = root.attr("platformBuildVersionCode");
+    r.sdk.platform_build_version_name = root.attr("platformBuildVersionName");
 
     let pkg = r.package.clone();
 
     for child in child_elements(root) {
         match child.get_tag() {
             "uses-sdk" => {
-                r.sdk.min_sdk = attr_u32(child, "minSdkVersion");
-                r.sdk.target_sdk = attr_u32(child, "targetSdkVersion");
-                r.sdk.max_sdk = attr_u32(child, "maxSdkVersion");
+                r.sdk.min_sdk = child.attr_u32("minSdkVersion");
+                r.sdk.target_sdk = child.attr_u32("targetSdkVersion");
+                r.sdk.max_sdk = child.attr_u32("maxSdkVersion");
             }
             "uses-permission" | "uses-permission-sdk-23" => {
-                if let Some(name) = attr(child, "name") {
+                if let Some(name) = child.attr("name") {
                     r.uses_permissions.push(UsesPermission {
                         name,
                         sdk23_only: child.get_tag() == "uses-permission-sdk-23",
-                        max_sdk_version: attr_u32(child, "maxSdkVersion"),
+                        max_sdk_version: child.attr_u32("maxSdkVersion"),
                     });
                 }
             }
             "permission" => {
-                if let Some(name) = attr(child, "name") {
+                if let Some(name) = child.attr("name") {
                     r.declared_permissions.push(DeclaredPermission {
                         name,
-                        protection_level: attr(child, "protectionLevel"),
-                        group: attr(child, "permissionGroup"),
+                        protection_level: child.attr("protectionLevel"),
+                        group: child.attr("permissionGroup"),
                     });
                 }
             }
             "uses-feature" => r.uses_features.push(UsesFeature {
-                name: attr(child, "name"),
-                required: attr_bool(child, "required"),
-                gl_es_version: attr(child, "glEsVersion"),
+                name: child.attr("name"),
+                required: child.attr_bool("required"),
+                gl_es_version: child.attr("glEsVersion"),
             }),
             "queries" => collect_queries(child, &mut r.queries),
             "application" => parse_application(child, &pkg, &mut r),
@@ -497,12 +497,12 @@ fn collect_queries(elem: &Element, out: &mut Vec<String>) {
     for child in child_elements(elem) {
         match child.get_tag() {
             "package" => {
-                if let Some(n) = attr(child, "name") {
+                if let Some(n) = child.attr("name") {
                     out.push(format!("package:{n}"));
                 }
             }
             "provider" => {
-                if let Some(a) = attr(child, "authorities") {
+                if let Some(a) = child.attr("authorities") {
                     out.push(format!("provider:{a}"));
                 }
             }
@@ -520,18 +520,18 @@ fn collect_queries(elem: &Element, out: &mut Vec<String>) {
 
 fn parse_application(app: &Element, pkg: &str, r: &mut ManifestReport) {
     r.application = ApplicationInfo {
-        name: attr(app, "name").map(|n| resolve_fqcn(&n, pkg)),
-        app_component_factory: attr(app, "appComponentFactory").map(|n| resolve_fqcn(&n, pkg)),
-        allow_backup: attr_bool(app, "allowBackup"),
-        debuggable: attr_bool(app, "debuggable"),
-        uses_cleartext_traffic: attr_bool(app, "usesCleartextTraffic"),
-        network_security_config: attr(app, "networkSecurityConfig"),
-        extract_native_libs: attr_bool(app, "extractNativeLibs"),
-        has_code: attr_bool(app, "hasCode"),
-        persistent: attr_bool(app, "persistent"),
-        large_heap: attr_bool(app, "largeHeap"),
-        process: attr(app, "process"),
-        task_affinity: attr(app, "taskAffinity"),
+        name: app.attr("name").map(|n| resolve_fqcn(&n, pkg)),
+        app_component_factory: app.attr("appComponentFactory").map(|n| resolve_fqcn(&n, pkg)),
+        allow_backup: app.attr_bool("allowBackup"),
+        debuggable: app.attr_bool("debuggable"),
+        uses_cleartext_traffic: app.attr_bool("usesCleartextTraffic"),
+        network_security_config: app.attr("networkSecurityConfig"),
+        extract_native_libs: app.attr_bool("extractNativeLibs"),
+        has_code: app.attr_bool("hasCode"),
+        persistent: app.attr_bool("persistent"),
+        large_heap: app.attr_bool("largeHeap"),
+        process: app.attr("process"),
+        task_affinity: app.attr("taskAffinity"),
         uses_libraries: Vec::new(),
         meta_data: Vec::new(),
     };
@@ -568,7 +568,7 @@ fn parse_application(app: &Element, pkg: &str, r: &mut ManifestReport) {
                 }
             }
             "uses-library" => {
-                if let Some(n) = attr(child, "name") {
+                if let Some(n) = child.attr("name") {
                     r.application.uses_libraries.push(n);
                 }
             }
@@ -583,7 +583,7 @@ fn parse_component(
     pkg: &str,
     min_sdk: u32,
 ) -> Component {
-    let raw_name = attr(elem, "name").unwrap_or_default();
+    let raw_name = elem.attr("name").unwrap_or_default();
     let name = resolve_fqcn(&raw_name, pkg);
     let descriptor = to_descriptor(&name);
 
@@ -601,7 +601,7 @@ fn parse_component(
         }
     }
 
-    let exported_declared = attr_bool(elem, "exported");
+    let exported_declared = elem.attr_bool("exported");
     // Règles de défaut Android (cf. legend) :
     //  - provider : exporté par défaut si minSdkVersion < 17 ;
     //  - autres   : exporté par défaut si au moins un <intent-filter> est présent.
@@ -616,13 +616,13 @@ fn parse_component(
         descriptor,
         exported_declared,
         exported_effective,
-        enabled: attr_bool(elem, "enabled"),
-        permission: attr(elem, "permission"),
-        process: attr(elem, "process"),
-        direct_boot_aware: attr_bool(elem, "directBootAware"),
-        authorities: attr(elem, "authorities"),
-        grant_uri_permissions: attr_bool(elem, "grantUriPermissions"),
-        target_activity: attr(elem, "targetActivity").map(|n| resolve_fqcn(&n, pkg)),
+        enabled: elem.attr_bool("enabled"),
+        permission: elem.attr("permission"),
+        process: elem.attr("process"),
+        direct_boot_aware: elem.attr_bool("directBootAware"),
+        authorities: elem.attr("authorities"),
+        grant_uri_permissions: elem.attr_bool("grantUriPermissions"),
+        target_activity: elem.attr("targetActivity").map(|n| resolve_fqcn(&n, pkg)),
         intent_filters,
         meta_data,
     }
@@ -630,29 +630,29 @@ fn parse_component(
 
 fn parse_intent_filter(elem: &Element) -> IntentFilter {
     let mut f = IntentFilter {
-        priority: attr(elem, "priority").and_then(|p| p.parse::<i64>().ok()),
+        priority: elem.attr("priority").and_then(|p| p.parse::<i64>().ok()),
         ..Default::default()
     };
     for child in child_elements(elem) {
         match child.get_tag() {
             "action" => {
-                if let Some(n) = attr(child, "name") {
+                if let Some(n) = child.attr("name") {
                     f.actions.push(n);
                 }
             }
             "category" => {
-                if let Some(n) = attr(child, "name") {
+                if let Some(n) = child.attr("name") {
                     f.categories.push(n);
                 }
             }
             "data" => f.data.push(IntentData {
-                scheme: attr(child, "scheme"),
-                host: attr(child, "host"),
-                port: attr(child, "port"),
-                path: attr(child, "path"),
-                path_prefix: attr(child, "pathPrefix"),
-                path_pattern: attr(child, "pathPattern"),
-                mime_type: attr(child, "mimeType"),
+                scheme: child.attr("scheme"),
+                host: child.attr("host"),
+                port: child.attr("port"),
+                path: child.attr("path"),
+                path_prefix: child.attr("pathPrefix"),
+                path_pattern: child.attr("pathPattern"),
+                mime_type: child.attr("mimeType"),
             }),
             _ => {}
         }
@@ -661,11 +661,11 @@ fn parse_intent_filter(elem: &Element) -> IntentFilter {
 }
 
 fn parse_meta_data(elem: &Element) -> Option<MetaData> {
-    let name = attr(elem, "name")?;
+    let name = elem.attr("name")?;
     Some(MetaData {
         name,
-        value: attr(elem, "value"),
-        resource: attr(elem, "resource"),
+        value: elem.attr("value"),
+        resource: elem.attr("resource"),
     })
 }
 
@@ -860,56 +860,19 @@ fn derive_anomalies(r: &ManifestReport) -> Vec<String> {
 // Helpers AXML
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Itère les enfants `Element` d'un élément (ignore le texte).
 fn child_elements(elem: &Element) -> impl Iterator<Item = &Element> {
-    elem.get_children().iter().filter_map(|n| match n {
-        Node::Element(e) => Some(e),
-        _ => None,
-    })
+    elem.get_children().iter()
 }
 
 /// Collecte récursivement les `android:name` des éléments portant `tag`.
 fn collect_tag_names(elem: &Element, tag: &str, out: &mut Vec<String>) {
     for child in child_elements(elem) {
         if child.get_tag() == tag {
-            if let Some(n) = attr(child, "name") {
+            if let Some(n) = child.attr("name") {
                 out.push(n);
             }
         }
         collect_tag_names(child, tag, out);
-    }
-}
-
-/// Récupère un attribut par nom exact ou par suffixe (gère le préfixe `android:`).
-fn attr(elem: &Element, key: &str) -> Option<String> {
-    let attrs = elem.get_attributes();
-    if let Some(v) = attrs.get(key) {
-        return Some(v.clone());
-    }
-    attrs
-        .iter()
-        .find(|(k, _)| k.split(':').last() == Some(key))
-        .map(|(_, v)| v.clone())
-}
-
-/// Attribut interprété en booléen. AXML encode `true` par `0xffffffff`.
-fn attr_bool(elem: &Element, key: &str) -> Option<bool> {
-    let v = attr(elem, key)?;
-    match v.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "0xffffffff" | "-1" => Some(true),
-        "false" | "0" | "0x0" => Some(false),
-        _ => None,
-    }
-}
-
-/// Attribut interprété en entier non signé (décimal ou hexadécimal `0x…`).
-fn attr_u32(elem: &Element, key: &str) -> Option<u32> {
-    let v = attr(elem, key)?;
-    let v = v.trim();
-    if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
-        u32::from_str_radix(hex, 16).ok()
-    } else {
-        v.parse::<u32>().ok()
     }
 }
 
@@ -964,6 +927,13 @@ pub fn legend() -> String {
     s.push_str("  deeplink               action.VIEW + <data scheme=…> — invocable par URL\n");
     s.push_str("  exported-provider      ContentProvider exporté — surface IPC de données\n");
     s.push_str("  exported-no-permission composant exporté sans android:permission\n");
+    s.push_str("\n  Provenance du décodage (anomalies) :\n");
+    s.push_str("  « repli AXML tolérant » : axmldecoder a refusé le manifest (chunk de type\n");
+    s.push_str("                        inconnu, offset de string pool hors bornes) et le\n");
+    s.push_str("                        décodeur tolérant a pris le relais. Les champs\n");
+    s.push_str("                        illisibles sont absents plutôt que faux, mais\n");
+    s.push_str("                        l'inventaire peut être incomplet — un composant\n");
+    s.push_str("                        manquant n'est pas un composant absent.\n");
     s
 }
 
