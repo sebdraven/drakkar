@@ -33,6 +33,11 @@ APK
 - **`manifest.rs`** : décode le manifest binaire (AXML) → package, permissions,
   services (dont le marqueur `accessibility`), intent-actions, composants
   déclarés.
+- **`axml.rs`** : décodeur AXML. Chemin nominal `axmldecoder`, repli tolérant
+  quand celui-ci refuse le manifest ou panique — chunk de type inconnu ignoré,
+  string pool borné, éléments non refermés rattachés. Même motif qu'`apkzip`
+  pour le ZIP : le repli ne s'active jamais sur un APK sain. Les rapports
+  `--manifest` issus du repli le signalent dans `anomalies`.
 - Les symboles des bibliothèques natives (`.so`) sont extraits pour les règles
   `native-symbol`.
 
