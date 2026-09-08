@@ -319,8 +319,9 @@ pub fn run_inventory(input_dir: &Path, what: Inventory, opts: &BulkOptions) -> R
             return;
         }
 
-        // Même protection que `run` : `axmldecoder` peut paniquer sur un AXML
-        // malformé, fréquent sur les échantillons trafiqués.
+        // Même protection que `run` : `parser::axml` rattrape le panic
+        // d'`axmldecoder`, mais les autres inventaires n'ont pas leur propre
+        // filet.
         let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<String> {
             match what {
                 Inventory::Manifest => {
