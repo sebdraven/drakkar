@@ -173,12 +173,15 @@ pub fn collect_apks(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
     Ok(apks)
 }
 
-/// Reconnaît un APK à son contenu, en deux étapes de coût croissant :
+/// Reconnaît un APK à son contenu, en trois étapes de coût croissant :
 ///
 ///  1. signature zip `PK\x03\x04` sur les 4 premiers octets — élimine d'emblée
 ///     les DEX, ELF, images et autres résidus qui traînent dans un corpus ;
 ///  2. présence d'une entrée `AndroidManifest.xml` — ce qui distingue un APK
-///     d'un JAR, d'un ZIP quelconque ou d'un document Office.
+///     d'un JAR, d'un ZIP quelconque ou d'un document Office ;
+///  3. si le crate `zip` refuse l'archive, même recherche via le lecteur
+///     tolérant : les archives trafiquées sont précisément celles qu'il sait
+///     lire, et les rejeter ici priverait `extract_apk` de son repli.
 ///
 /// L'extension n'entre jamais en compte : `.apk` ne garantit rien et son absence
 /// n'exclut rien.
@@ -194,8 +197,14 @@ fn is_apk(p: &Path) -> bool {
     }
 
     // Lecture du central directory uniquement : le contenu n'est pas décompressé.
-    match zip::ZipArchive::new(f) {
-        Ok(mut zip) => zip.by_name("AndroidManifest.xml").is_ok(),
+    if let Ok(mut zip) = zip::ZipArchive::new(f) {
+        if zip.by_name("AndroidManifest.xml").is_ok() {
+            return true;
+        }
+    }
+
+    match parser::apkzip::TolerantZip::open(p) {
+        Ok(zip) => zip.entries().iter().any(|e| e.name == "AndroidManifest.xml"),
         Err(_) => false,
     }
 }
