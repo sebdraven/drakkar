@@ -334,10 +334,58 @@ pub fn scan_apk_bytes(apk: &[u8]) -> Result<NativeArchSummary> {
 
 /// Scanne un APK sur disque. Ne lit que les en-têtes ELF — l'APK n'est pas
 /// chargé en entier, aucun `.so` n'est extrait.
+///
+/// Repli sur le lecteur tolérant si le crate `zip` refuse l'archive ou l'une de
+/// ses entrées : sur un APK trafiqué, une seule entrée chiffrée en apparence
+/// faisait échouer tout le scan.
 pub fn scan_apk_file(path: &Path) -> Result<NativeArchSummary> {
     let file = std::fs::File::open(path).with_context(|| format!("ouverture {}", path.display()))?;
-    let mut archive = zip::ZipArchive::new(file).context("lecture APK (zip)")?;
-    scan_archive(&mut archive)
+    let nominal = zip::ZipArchive::new(file)
+        .context("lecture APK (zip)")
+        .and_then(|mut archive| scan_archive(&mut archive));
+
+    match nominal {
+        Ok(summary) => Ok(summary),
+        Err(e) => {
+            tracing::warn!(
+                apk = %path.display(),
+                error = %e,
+                "scan natif en échec par le crate zip, repli sur le lecteur tolérant"
+            );
+            scan_apk_tolerant(path)
+        }
+    }
+}
+
+/// Repli via le lecteur ZIP tolérant. Une entrée illisible devient une anomalie
+/// au lieu de faire échouer le scan entier — un `.so` perdu vaut mieux qu'un
+/// échantillon perdu.
+fn scan_apk_tolerant(path: &Path) -> Result<NativeArchSummary> {
+    let zip = super::apkzip::TolerantZip::open(path)?;
+    let mut libs = Vec::new();
+    let mut anomalies = Vec::new();
+
+    for (i, entry) in zip.entries().iter().enumerate() {
+        let name = &entry.name;
+        if !name.starts_with("lib/") || !name.ends_with(".so") {
+            continue;
+        }
+        let bytes = match zip.read(i) {
+            Ok(b) => b,
+            Err(e) => {
+                anomalies.push(format!("{name}: entrée illisible ({e})"));
+                continue;
+            }
+        };
+        let n = bytes.len().min(ELF_HEADER_PROBE);
+        match classify(name, &bytes[..n]) {
+            Some(Ok(lib)) => libs.push(lib),
+            Some(Err(reason)) => anomalies.push(reason),
+            None => {}
+        }
+    }
+
+    Ok(NativeArchSummary::build(libs, anomalies))
 }
 
 fn scan_archive<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<NativeArchSummary> {
