@@ -6,8 +6,11 @@
 //!
 //! Certaines familles trafiquent la structure ZIP pour casser les outils sans
 //! gêner l'installation par Android. Quand le crate `zip` refuse l'archive, on
-//! bascule sur `apkzip`, un lecteur tolérant calqué sur le chargeur d'APK.
+//! bascule sur `apkzip`, un lecteur tolérant calqué sur le chargeur d'APK. Le
+//! même motif vaut pour le manifest binaire : `axml` prend le relais quand
+//! `axmldecoder` refuse ou panique.
 pub mod apkzip;
+pub mod axml;
 pub mod cert;
 pub mod dating;
 pub mod dex;
