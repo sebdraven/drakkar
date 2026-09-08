@@ -8,10 +8,20 @@ use std::path::Path;
 
 pub fn extract(apk_path: &Path, features: &mut ApkFeatures) -> Result<()> {
     let raw = read_manifest_bytes(apk_path)?;
-    let doc: XmlDocument = match axmldecoder::parse(&raw) {
-        Ok(d) => d,
-        Err(e) => {
+    // axmldecoder indexe le string pool sans borner ses offsets : sur un AXML
+    // trafiqué il panique au lieu de rendre une erreur.
+    let parsed = std::panic::catch_unwind(|| axmldecoder::parse(&raw));
+    let doc: XmlDocument = match parsed {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, "AXML parse failed — manifest features vides");
+            return Ok(());
+        }
+        Err(_) => {
+            tracing::warn!(
+                apk = %apk_path.display(),
+                "AXML parse panic — manifest features vides"
+            );
             return Ok(());
         }
     };
@@ -33,16 +43,38 @@ pub fn extract(apk_path: &Path, features: &mut ApkFeatures) -> Result<()> {
 }
 
 /// Extrait les octets de l'entrée AndroidManifest.xml de l'archive APK.
+///
+/// Même repli que `parser::extract_apk` : le crate `zip` ne contrôle le drapeau
+/// de chiffrement et la méthode de compression qu'à la lecture de l'entrée, pas
+/// à l'ouverture de l'archive. Sur les APK trafiqués, l'ouverture passe et c'est
+/// `by_name` ou `read_to_end` qui échoue.
 fn read_manifest_bytes(apk_path: &Path) -> Result<Vec<u8>> {
     let file = std::fs::File::open(apk_path)
         .with_context(|| format!("open {}", apk_path.display()))?;
-    let mut zip = zip::ZipArchive::new(file).context("read apk as zip")?;
-    let mut entry = zip
-        .by_name("AndroidManifest.xml")
-        .context("AndroidManifest.xml not found in APK")?;
-    let mut buf = Vec::with_capacity(entry.size() as usize);
-    entry.read_to_end(&mut buf)?;
-    Ok(buf)
+
+    let nominal = (|| -> Result<Vec<u8>> {
+        let mut zip = zip::ZipArchive::new(file).context("read apk as zip")?;
+        let mut entry = zip
+            .by_name("AndroidManifest.xml")
+            .context("AndroidManifest.xml not found in APK")?;
+        let mut buf = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut buf)?;
+        Ok(buf)
+    })();
+
+    match nominal {
+        Ok(buf) => Ok(buf),
+        Err(e) => {
+            tracing::warn!(
+                apk = %apk_path.display(),
+                error = %e,
+                "manifest illisible par le crate zip, repli sur le lecteur tolérant"
+            );
+            super::apkzip::TolerantZip::open(apk_path)?
+                .read_by_name("AndroidManifest.xml")
+                .context("AndroidManifest.xml illisible, y compris par le lecteur tolérant")
+        }
+    }
 }
 
 /// Parcours récursif de l'arbre XML pour collecter les features.
