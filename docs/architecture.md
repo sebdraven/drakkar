@@ -38,6 +38,18 @@ APK
   string pool borné, éléments non refermés rattachés. Même motif qu'`apkzip`
   pour le ZIP : le repli ne s'active jamais sur un APK sain. Les rapports
   `--manifest` issus du repli le signalent dans `anomalies`.
+- **`assets.rs`** : inventaire (`--list-assets`) et export (`--extract-assets`)
+  des entrées `assets/` — taille déclarée/réelle, méthode de compression
+  déclarée, SHA-256 complet, type reniflé sur les octets de tête, entropie de
+  Shannon. Même repli qu'ailleurs : lecteur `apkzip` quand le crate `zip` refuse
+  l'archive, sans quoi les APK trafiqués ressortiraient avec un `assets/` vide.
+  Produit une empreinte d'ensemble (SHA-256 de la liste triée `chemin\tsha256`)
+  qui sert d'axe de regroupement, absente — et non vide — quand l'APK n'a aucun
+  asset. Ne déballe pas récursivement : un asset qui est lui-même un ZIP, un APK
+  ou un DEX est typé et écrit tel quel. Le `sha256` porte sur le contenu
+  **décompressé** — seule forme requêtable sur VT/MalwareBazaar/Koodous, et seule
+  forme stable quand le lecteur tolérant essaie deflate puis stored. Filtrage par
+  ensemble de hashes connus (`--assets-hash*`), sans effet sur l'empreinte.
 - Les symboles des bibliothèques natives (`.so`) sont extraits pour les règles
   `native-symbol`.
 

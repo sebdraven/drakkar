@@ -10,6 +10,7 @@
 //! même motif vaut pour le manifest binaire : `axml` prend le relais quand
 //! `axmldecoder` refuse ou panique.
 pub mod apkzip;
+pub mod assets;
 pub mod axml;
 pub mod cert;
 pub mod dating;
