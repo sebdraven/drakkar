@@ -1034,11 +1034,12 @@ fn print_and_dump_extract(
         std::fs::write(&dest, &l.bytes)
             .with_context(|| format!("écriture {}", dest.display()))?;
         println!(
-            "  {:<38} {:<8} {:<7} {:>9} o  -> {}{}",
+            "  {:<38} {:<8} {:<7} {:>9} o  {}  -> {}{}",
             l.entry,
             l.arch.machine.label(),
             bits,
             l.bytes.len(),
+            l.sha256,
             flat,
             flag
         );
