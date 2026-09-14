@@ -12,11 +12,30 @@
 //! où qu'il soit, et l'ABI réelle est dérivée de l'en-tête ELF quand le chemin
 //! ne la porte pas (cas `assets/`).
 //!
+//! # Sémantique du SHA-256
+//!
+//! Le `sha256` d'une lib porte sur le **contenu DÉCOMPRESSÉ** du `.so`, jamais
+//! sur les octets stockés dans l'archive. Même sémantique que dans
+//! [`super::assets`], et pour les deux mêmes raisons, aucune cosmétique :
+//!
+//! * c'est la seule forme requêtable — VirusTotal, MalwareBazaar et Koodous
+//!   indexent le fichier déballé ; un hash d'octets compressés ne se croise avec
+//!   rien ;
+//! * « les octets stockés » n'est même pas une notion stable dès qu'un lecteur
+//!   tolérant entre en jeu : sur une archive trafiquée la méthode déclarée est
+//!   fausse et le lecteur essaie deflate puis stored, donc la même lib donnerait
+//!   deux hashes selon le chemin de lecture emprunté. Le contenu déballé, lui,
+//!   est identique par les deux lecteurs.
+//!
+//! Corollaire : une lib `stored` et le même contenu `deflate` ont le même
+//! `sha256`. Il n'est jamais tronqué, jamais réduit à un préfixe.
+//!
 //! Toutes les étiquettes produites sont définies dans [`legend`] (légende
 //! autonome).
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::io::{Read, Seek};
 use std::path::Path;
 
@@ -39,6 +58,10 @@ pub struct ExtractedLib {
     /// Architecture lue dans l'en-tête ELF — source de vérité, y compris quand
     /// le chemin ne porte pas d'ABI.
     pub arch: ElfArch,
+    /// SHA-256 COMPLET du contenu DÉCOMPRESSÉ du `.so` (64 caractères, jamais
+    /// tronqué) — jamais des octets stockés dans l'archive, qui ne se croisent
+    /// avec aucune base publique.
+    pub sha256: String,
     /// Octets complets du `.so`, en mémoire. Exclu de la sérialisation (binaire,
     /// potentiellement volumineux).
     #[serde(skip)]
@@ -128,6 +151,10 @@ fn extract_archive<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<N
             }
         };
 
+        // Après le filtre ELF : seules les libs retenues sont hachées, les
+        // entrées écartées vers `skipped_non_elf` restent de simples chemins.
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+
         let parts: Vec<&str> = name.split('/').collect();
         let file = parts.last().copied().unwrap_or(name.as_str()).to_string();
 
@@ -150,6 +177,7 @@ fn extract_archive<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<N
             source,
             declared_abi,
             arch,
+            sha256,
             bytes,
         });
     }
@@ -170,6 +198,11 @@ source           Dossier porteur : \"lib\" = rangement NDK lib/<abi>/ ; sinon 1e
 declared_abi     ABI lue du répertoire lib/<abi>/ ; None si le .so est hors lib/.
 arch             Architecture réelle lue dans l'en-tête ELF (machine + bits + boutisme) —
                  source de vérité, y compris quand le chemin ne porte pas d'ABI.
+sha256           SHA-256 COMPLET (64 caractères hexadécimaux) du contenu DÉCOMPRESSÉ du .so —
+                 JAMAIS des octets stockés dans l'archive. C'est la seule forme requêtable sur
+                 VirusTotal, MalwareBazaar ou Koodous ; un hash d'octets compressés ne se croise
+                 avec rien. Et « les octets stockés » n'est pas une notion stable dès qu'un
+                 lecteur tolérant entre en jeu. Jamais tronqué, jamais un préfixe.
 bytes            Octets complets du .so, en mémoire (jamais écrits sur disque).
 skipped_non_elf  Entrées en .so qui ne sont pas des ELF (ressources, .so chiffré non déballé…).
 out_of_lib()     Vrai si la lib est rangée hors lib/<abi>/ (packers : assets/libjiagu*.so)."
@@ -234,6 +267,9 @@ mod tests {
         assert_eq!(libx.arch.machine, Machine::Aarch64);
         assert_eq!(libx.arch.bits, Bits::B64);
         assert!(!libx.bytes.is_empty());
+        assert_eq!(libx.sha256.len(), 64);
+        assert!(libx.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(libx.sha256, format!("{:x}", Sha256::digest(elf(2, 183))));
 
         // hors lib/ (packer) : arch dérivée de l'ELF, pas du chemin
         let jg = ex
@@ -246,6 +282,9 @@ mod tests {
         assert_eq!(jg.declared_abi, None);
         assert_eq!(jg.arch.machine, Machine::Arm);
         assert_eq!(jg.arch.bits, Bits::B32);
+        assert_eq!(jg.sha256.len(), 64);
+        assert!(jg.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(jg.sha256, format!("{:x}", Sha256::digest(elf(1, 40))));
 
         // fausse .so ignorée
         assert_eq!(ex.skipped_non_elf, vec!["assets/config.so".to_string()]);
