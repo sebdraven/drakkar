@@ -100,6 +100,83 @@ struct Cli {
     #[arg(long)]
     list_entries: bool,
 
+    /// Inventaire des entrées `assets/` de l'APK, puis sort. RIEN n'est écrit.
+    /// Sortie TSV : chemin, taille compressée, taille décompressée, méthode
+    /// déclarée, SHA-256 complet, type reniflé sur les octets de tête, entropie.
+    /// Passe par le lecteur tolérant (src/parser/apkzip.rs) quand le crate `zip`
+    /// refuse l'archive — sans quoi les APK trafiqués du corpus ressortiraient
+    /// sans assets. Single ou bulk (--bulk DIR).
+    #[arg(long)]
+    list_assets: bool,
+
+    /// Extrait les entrées `assets/` vers DIR : les fichiers, en reproduisant
+    /// l'arborescence de l'archive, plus un `assets.json` (SHA-256 de l'APK, une
+    /// entrée par asset avec les mêmes champs que --list-assets + le chemin
+    /// réellement écrit). Un asset qui est lui-même un ZIP, un APK ou un DEX est
+    /// typé et écrit TEL QUEL — pas de déballage récursif. En bulk, un
+    /// sous-répertoire par échantillon + un `assets_index.json` global.
+    #[arg(long, value_name = "DIR", conflicts_with = "list_assets")]
+    extract_assets: Option<PathBuf>,
+
+    /// Empreinte d'ensemble des assets SEULE, puis sort. Rien n'est écrit.
+    /// Sortie TSV : sample, empreinte, statut, assets, non_evalues. L'empreinte
+    /// n'est émise que si elle porte sur la TOTALITÉ des assets ; sinon la
+    /// colonne vaut ABSENTE et `statut` dit pourquoi (aucun-asset, ou incomplet
+    /// avec la cause). --assets-include et --assets-max-size sont acceptés ici —
+    /// c'est le seul moyen d'observer un statut « incomplet » sur un lot — mais
+    /// les filtres par hash sont refusés : l'empreinte ne les honore pas.
+    /// Single ou bulk (--bulk DIR).
+    #[arg(long, conflicts_with_all = ["list_assets", "extract_assets"])]
+    assets_fingerprint: bool,
+
+    /// (--list-assets / --extract-assets / --assets-fingerprint) Ne retient que
+    /// les entrées dont le chemin CONTIENT ce motif. Répétable, insensible à la
+    /// casse.
+    #[arg(long, value_name = "MOTIF", num_args = 1..)]
+    assets_include: Vec<String>,
+
+    /// (--list-assets / --extract-assets / --assets-fingerprint) Plafond en octets sur la taille
+    /// décompressée. Au-delà, l'asset est ignoré et consigné (jamais d'omission
+    /// silencieuse). Contrôlé sur la taille déclarée avant lecture, puis sur la
+    /// taille réelle après — le central directory d'une archive trafiquée ment.
+    #[arg(long, value_name = "N")]
+    assets_max_size: Option<u64>,
+
+    /// (--list-assets / --extract-assets) Ne conserve que les assets dont le
+    /// SHA-256 figure dans l'ensemble. Répétable. Pivot sur une charge connue :
+    /// « quels binaires du corpus portent cet asset ? ». Sortie TSV étroite
+    /// sample / chemin / sha256 ; un échantillon sans correspondance ne produit
+    /// aucune ligne. N'écrit rien, sauf si --extract-assets est aussi passé —
+    /// auquel cas seuls les assets retenus sont écrits.
+    #[arg(long, value_name = "SHA256", num_args = 1..)]
+    assets_hash: Vec<String>,
+
+    /// (--list-assets / --extract-assets) Même chose depuis un fichier : un
+    /// SHA-256 par ligne, `#` en commentaire, casse indifférente.
+    #[arg(long, value_name = "FICHIER")]
+    assets_hash_file: Option<PathBuf>,
+
+    /// (--list-assets / --extract-assets) Sens inverse de --assets-hash : RETIRE
+    /// les assets déjà qualifiés (polices, libs de SDK, ressources tierces
+    /// récurrentes) pour ne laisser que le reliquat. Répétable. Exclusif de
+    /// --assets-hash / --assets-hash-file.
+    #[arg(
+        long,
+        value_name = "SHA256",
+        num_args = 1..,
+        conflicts_with_all = ["assets_hash", "assets_hash_file"]
+    )]
+    assets_hash_exclude: Vec<String>,
+
+    /// (--list-assets / --extract-assets) Même chose depuis un fichier, même
+    /// format que --assets-hash-file.
+    #[arg(
+        long,
+        value_name = "FICHIER",
+        conflicts_with_all = ["assets_hash", "assets_hash_file"]
+    )]
+    assets_hash_exclude_file: Option<PathBuf>,
+
     /// Points d'entrée DYNAMIQUES : classes de composants atteintes autrement
     /// que par une déclaration au manifest — registerReceiver, startActivity,
     /// startService, bindService, new Intent(ctx, X.class), setClass*,
@@ -322,6 +399,25 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Un --assets-* sans mode actif serait ignoré en silence. Sur un filtre par
+    // hash, cela rendrait un inventaire complet en le faisant passer pour le
+    // résultat d'un filtrage : l'absence de correspondance se lirait comme une
+    // correspondance universelle.
+    let assets_mode =
+        cli.list_assets || cli.extract_assets.is_some() || cli.assets_fingerprint;
+    let assets_tuning = !cli.assets_include.is_empty()
+        || cli.assets_max_size.is_some()
+        || !cli.assets_hash.is_empty()
+        || cli.assets_hash_file.is_some()
+        || !cli.assets_hash_exclude.is_empty()
+        || cli.assets_hash_exclude_file.is_some();
+    if assets_tuning && !assets_mode {
+        bail!(
+            "les options --assets-* n'ont d'effet qu'avec --list-assets, \
+             --extract-assets <DIR> ou --assets-fingerprint"
+        );
+    }
 
     // Sortie rapide : audit d'architecture native seul (pas de moteur de règles,
     // pas de catalogue MITRE) — lit uniquement les en-têtes ELF, en mémoire.
@@ -649,6 +745,8 @@ fn main() -> Result<()> {
             println!("{}", parser::cert::legend());
         } else if cli.dating {
             println!("{}", parser::dating::legend());
+        } else if cli.list_assets || cli.extract_assets.is_some() || cli.assets_fingerprint {
+            println!("{}", parser::assets::legend());
         } else if !cli.extract_entry.is_empty() || cli.list_entries {
             println!("{}", parser::entry_extract::legend());
         } else if cli.enrich.is_some() {
@@ -740,6 +838,63 @@ fn main() -> Result<()> {
             }
             _ => bail!("fournis un APK (single) ou --bulk <DIR> (répertoire)"),
         }
+        return Ok(());
+    }
+
+    // Sortie rapide : inventaire / export des entrées assets/. Ni catalogue MITRE
+    // ni moteur de règles — une seule passe sur l'archive. Single ou bulk.
+    if assets_mode {
+        // Les hashes sont validés AVANT toute lecture d'archive : un ensemble de
+        // référence mal formé doit échouer tout de suite, pas au bout du lot.
+        let hash_filter = parser::assets::build_hash_filter(
+            &cli.assets_hash,
+            cli.assets_hash_file.as_deref(),
+            &cli.assets_hash_exclude,
+            cli.assets_hash_exclude_file.as_deref(),
+        )?;
+
+        // Refusés plutôt qu'ignorés : l'empreinte porte sur l'ensemble complet
+        // et n'honore pas ces filtres. Les accepter en silence laisserait croire
+        // qu'elle décrit le sous-ensemble filtré.
+        if cli.assets_fingerprint && hash_filter.is_some() {
+            bail!(
+                "--assets-fingerprint n'honore pas les filtres par hash : l'empreinte \
+                 porte toujours sur la totalité des assets. Retirer --assets-hash* ou \
+                 passer par --list-assets."
+            );
+        }
+        let opts = parser::assets::AssetsOptions {
+            include: cli.assets_include.clone(),
+            max_size: cli.assets_max_size,
+            hash_filter,
+        };
+        let (inputs, rejected, bulk_mode) = match (&cli.apk, &cli.bulk) {
+            (Some(apk), None) => (vec![apk.clone()], Vec::new(), false),
+            (None, Some(dir)) => {
+                let found = bulk::collect_apks(dir, cli.recursive)?;
+                if found.apks.is_empty() && found.rejected.is_empty() {
+                    bail!("aucun APK trouvé dans {}", dir.display());
+                }
+                (found.apks, found.rejected, true)
+            }
+            _ => bail!(
+                "--list-assets / --extract-assets / --assets-fingerprint requiert \
+                 soit un APK (single), soit --bulk <DIR>"
+            ),
+        };
+        let mode = if cli.assets_fingerprint {
+            AssetsOutput::Fingerprint
+        } else {
+            AssetsOutput::Inventory
+        };
+        run_assets(
+            &inputs,
+            &rejected,
+            &opts,
+            cli.extract_assets.as_deref(),
+            bulk_mode,
+            mode,
+        )?;
         return Ok(());
     }
 
@@ -1312,6 +1467,213 @@ fn print_diff_dex(r: &drakkar::parser::diff_dex::DiffReport) {
     }
 
     println!("\n(le détail des classes identiques est dans le JSON ; légende : --diff-dex --legend)");
+}
+
+/// Ce que la passe assets émet sur stdout. Les deux formes sont disjointes :
+/// l'en-tête TSV doit décrire exactement les colonnes produites.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AssetsOutput {
+    /// Inventaire par asset (`--list-assets`, `--extract-assets`).
+    Inventory,
+    /// Empreinte d'ensemble par échantillon (`--assets-fingerprint`).
+    Fingerprint,
+}
+
+/// Inventaire (`--list-assets`) ou export (`--extract-assets`) des assets.
+///
+/// stdout ne porte que le TSV, dont l'en-tête décrit exactement les colonnes
+/// émises ; tout le reste — résumé, empreinte d'ensemble, entrées écartées,
+/// échantillons illisibles — part sur stderr, pour que `| awk` et `> fichier`
+/// restent utilisables.
+fn run_assets(
+    inputs: &[PathBuf],
+    rejected: &[(PathBuf, String)],
+    opts: &drakkar::parser::assets::AssetsOptions,
+    out: Option<&std::path::Path>,
+    bulk_mode: bool,
+    mode: AssetsOutput,
+) -> Result<()> {
+    use drakkar::parser::assets;
+
+    let mut index = assets::BulkIndex::default();
+
+    // Sous filtre par hash, la sortie devient le pivot étroit : seule l'identité
+    // compte quand on cherche qui porte une charge connue. La colonne `sample`
+    // y est toujours présente, c'est l'axe du croisement.
+    let narrow = opts.hash_filter.is_some();
+    let shape = assets::TsvShape {
+        sample: bulk_mode || narrow,
+        written: out.is_some(),
+        narrow,
+    };
+
+    // B4 : une entrée écartée pour la taille n'est jamais hachée, donc jamais
+    // testée. Sans cet avertissement et le compteur final, l'absence de
+    // correspondance se lirait comme l'absence de l'asset.
+    if narrow && opts.max_size.is_some() {
+        eprintln!(
+            "[AVERT] --assets-max-size est actif avec un filtre par hash : les entrées \
+             au-delà du plafond ne sont pas hachées, donc jamais testées. Leur nombre \
+             est récapitulé en fin de passe."
+        );
+    }
+    if narrow && !opts.include.is_empty() {
+        eprintln!(
+            "[AVERT] --assets-include restreint le jeu testé par le filtre par hash : \
+             un asset hors motif ne sera pas signalé absent, il n'aura pas été examiné."
+        );
+    }
+
+    let mut total_not_evaluated = 0usize;
+
+    // Un fichier à signature ZIP dont aucun lecteur n'a tiré de manifest est
+    // nommé, pas écarté en silence : sur un corpus nommé par hachage, une
+    // disparition muette est indiscernable d'une absence.
+    for (path, why) in rejected {
+        eprintln!("[FAIL]  {}  — non reconnu comme APK : {why}", path.display());
+        index.failed.push(assets::FailedSample {
+            sample: stem_of(path),
+            path: path.display().to_string(),
+            reason: format!("non reconnu comme APK : {why}"),
+        });
+    }
+
+    match mode {
+        AssetsOutput::Fingerprint => println!("{}", assets::fingerprint_tsv_header()),
+        AssetsOutput::Inventory => println!("{}", assets::tsv_header(shape)),
+    }
+
+    for apk in inputs {
+        let sample = stem_of(apk);
+
+        // Une archive pourrie peut faire paniquer un décodeur : on isole pour
+        // qu'elle ne tue pas le lot.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assets::collect(apk, opts)
+        }));
+        let mut report = match outcome {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                eprintln!("[FAIL]  {sample} — {e:#}");
+                index.failed.push(assets::FailedSample {
+                    sample,
+                    path: apk.display().to_string(),
+                    reason: format!("{e:#}"),
+                });
+                continue;
+            }
+            Err(_) => {
+                eprintln!("[PANIC] {sample} — inventaire abandonné");
+                index.failed.push(assets::FailedSample {
+                    sample,
+                    path: apk.display().to_string(),
+                    reason: "panique pendant la lecture de l'archive".into(),
+                });
+                continue;
+            }
+        };
+
+        // En bulk, un sous-répertoire par échantillon ; en single, le DIR demandé.
+        let dest = out.map(|d| if bulk_mode { d.join(&sample) } else { d.to_path_buf() });
+        if let Some(dir) = &dest {
+            match assets::write_all(&mut report, dir) {
+                Ok(json) => eprintln!("[JSON]  {sample} — {}", json.display()),
+                Err(e) => {
+                    eprintln!("[FAIL]  {sample} — écriture : {e:#}");
+                    index.failed.push(assets::FailedSample {
+                        sample: sample.clone(),
+                        path: apk.display().to_string(),
+                        reason: format!("écriture : {e:#}"),
+                    });
+                    continue;
+                }
+            }
+        }
+
+        total_not_evaluated += report.not_evaluated;
+
+        match mode {
+            AssetsOutput::Fingerprint => {
+                println!("{}", assets::fingerprint_tsv_row(&sample, &report));
+            }
+            AssetsOutput::Inventory => {
+                for e in &report.entries {
+                    println!(
+                        "{}",
+                        assets::tsv_row(e, shape.sample.then_some(sample.as_str()), shape)
+                    );
+                }
+            }
+        }
+        for sk in &report.skipped {
+            eprintln!("[SKIP]  {sample} — {} : {}", sk.entry, sk.reason);
+        }
+
+        // L'empreinte d'ensemble est l'axe de regroupement. L'absence d'assets
+        // est dite en toutes lettres : sortir l'empreinte de la chaîne vide
+        // ferait un faux cluster de tous les APK sans assets.
+        let fp = match &report.fingerprint {
+            Some(f) => format!("empreinte {f}"),
+            None => format!("PAS D'EMPREINTE ({})", report.fingerprint_status),
+        };
+        eprintln!(
+            "[OK]    {sample} — {} asset(s) retenu(s) sur {} vus ({} entrées, lecteur {}), \
+             {} illisible(s), {} non évaluée(s), {fp}",
+            report.count(),
+            report.assets_seen,
+            report.scanned,
+            report.reader.as_str(),
+            report.skipped.len(),
+            report.not_evaluated
+        );
+
+        index.samples.push(assets::BulkSample {
+            sample,
+            path: apk.display().to_string(),
+            apk_sha256: report.apk_sha256.clone(),
+            reader: report.reader,
+            assets: report.count(),
+            skipped: report.skipped.len(),
+            not_evaluated: report.not_evaluated,
+            fingerprint: report.fingerprint.clone(),
+            fingerprint_status: report.fingerprint_status.clone(),
+            out_dir: dest.map(|d| d.display().to_string()),
+        });
+    }
+
+    // L'index global n'a de sens que là où quelque chose est écrit : --list-assets
+    // n'écrit rien, par construction.
+    if bulk_mode {
+        if let Some(dir) = out {
+            let path = index.write(dir)?;
+            eprintln!("[INDEX] {}", path.display());
+        }
+    }
+
+    if narrow && total_not_evaluated > 0 {
+        eprintln!(
+            "[AVERT] {total_not_evaluated} entrée(s) non évaluée(s) sur l'ensemble du lot : \
+             jamais hachées, donc jamais confrontées au filtre. Une absence de \
+             correspondance ne vaut PAS absence de l'asset — relancer sans \
+             --assets-max-size pour trancher."
+        );
+    }
+
+    eprintln!(
+        "[FIN]   {} échantillon(s) inventorié(s), {} en échec, {} entrée(s) non évaluée(s)",
+        index.samples.len(),
+        index.failed.len(),
+        total_not_evaluated
+    );
+    Ok(())
+}
+
+/// Nom de base d'un échantillon, sans extension. Les corpus nommés par hachage
+/// n'en ont pas, d'où le repli.
+fn stem_of(p: &std::path::Path) -> String {
+    p.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 /// Affiche le résultat d'une extraction ciblée et écrit les entrées dans `dir`.
