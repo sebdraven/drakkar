@@ -1169,9 +1169,9 @@ Filtres :
   --assets-include <MOTIF>   Répétable. SOUS-CHAÎNE sur le chemin d'entrée, insensible à la casse.
   --assets-max-size <N>      Plafond en octets sur la taille décompressée. Contrôlé sur la taille
                              déclarée AVANT lecture, puis sur la taille réelle après. En lecteur
-                             "nominal" il borne aussi la lecture elle-même (une entrée qui
+                             \"nominal\" il borne aussi la lecture elle-même (une entrée qui
                              sous-déclare sa taille ne se déballe pas en RAM avant d'être écartée) ;
-                             en lecteur "tolerant" le contrôle reste postérieur à la lecture, que
+                             en lecteur \"tolerant\" le contrôle reste postérieur à la lecture, que
                              borne alors la limite d'archive en mémoire d'apkzip (512 Mio).
 
 Mode empreinte seule (--assets-fingerprint) :
