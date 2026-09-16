@@ -283,7 +283,7 @@ fn index_field_assignments(dex: &dex::Dex<impl AsRef<[u8]>>) -> FieldAssignments
 /// Remonte au `new-instance` (ou `const-class`) qui alimente `target`, en
 /// traçant les `move-object`. Utilisé par la passe 1, où l'on ne cherche que la
 /// classe concrète d'une valeur assignée.
-fn backtrack_new_instance(
+pub(crate) fn backtrack_new_instance(
     dex: &dex::Dex<impl AsRef<[u8]>>,
     window: &[dex_bytecode::Instruction],
     target: u32,
@@ -539,7 +539,7 @@ fn strategy_for(sink: &str) -> SinkSpec {
 /// Extrait la liste des registres `vN` d'une instruction, dans l'ordre.
 /// Les marqueurs `type@`, `method@`, `string@` ne contiennent pas de `v` suivi
 /// de chiffres, ils ne polluent donc pas l'extraction.
-fn registers(ins: &dex_bytecode::Instruction) -> Vec<u32> {
+pub(crate) fn registers(ins: &dex_bytecode::Instruction) -> Vec<u32> {
     let ops = ins.operands();
     let bytes: Vec<char> = ops.chars().collect();
     let mut out = Vec::new();
@@ -733,7 +733,7 @@ fn literal_of(
 /// Extrait l'entier d'un opérande textuel de la forme `<tag>N`.
 /// dex-bytecode formate les opérandes en texte ; même approche que
 /// `dex::invoke_method_index`, à remplacer si l'API expose l'accès structuré.
-fn operand_index(ins: &dex_bytecode::Instruction, tag: &str) -> Option<u64> {
+pub(crate) fn operand_index(ins: &dex_bytecode::Instruction, tag: &str) -> Option<u64> {
     let ops = ins.operands();
     let pos = ops.find(tag)? + tag.len();
     let digits: String = ops[pos..].chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -764,7 +764,7 @@ fn to_descriptor(dotted: &str) -> String {
 }
 
 /// Code units (u16) -> octets little-endian.
-fn u16_to_le_bytes(insns: &[u16]) -> Vec<u8> {
+pub(crate) fn u16_to_le_bytes(insns: &[u16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(insns.len() * 2);
     for &u in insns {
         out.extend_from_slice(&u.to_le_bytes());
@@ -773,29 +773,17 @@ fn u16_to_le_bytes(insns: &[u16]) -> Vec<u8> {
 }
 
 /// Variante prenant un APK : dézippe les `classes*.dex` dans un tempdir et
-/// agrège le rapport sur l'ensemble des DEX. Self-contained — n'exige aucune
-/// modification de `parse_apk` ni de `ParsedApk`.
+/// agrège le rapport sur l'ensemble des DEX. Passe par
+/// `parser::extract_dex_files` pour hériter du repli `TolerantZip` sur les
+/// archives trafiquées.
 pub fn extract_from_apk(apk: &Path) -> Result<DynEntrypointReport> {
-    use std::io::Read;
-
-    let file = std::fs::File::open(apk).with_context(|| format!("open {}", apk.display()))?;
-    let mut zip = zip::ZipArchive::new(file).context("read apk as zip")?;
     let tmp = tempfile::tempdir().context("create tempdir")?;
+    let dex_files = crate::parser::extract_dex_files(apk, tmp.path())?;
 
     let mut merged = DynEntrypointReport::default();
 
-    for i in 0..zip.len() {
-        let mut entry = zip.by_index(i)?;
-        let name = entry.name().to_string();
-        if !(name.starts_with("classes") && name.ends_with(".dex")) {
-            continue;
-        }
-        let dest = tmp.path().join(name.replace('/', "__"));
-        let mut buf = Vec::with_capacity(entry.size() as usize);
-        entry.read_to_end(&mut buf)?;
-        std::fs::write(&dest, &buf)?;
-
-        let r = extract(&dest).with_context(|| format!("scan {name}"))?;
+    for dex in &dex_files {
+        let r = extract(dex).with_context(|| format!("scan {}", dex.display()))?;
         merged.entrypoints.extend(r.entrypoints);
         merged.unresolved.extend(r.unresolved);
     }
