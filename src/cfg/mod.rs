@@ -35,6 +35,11 @@ pub const ENTRYPOINT_CALLBACKS: &[&str] = &[
     "handleMessage",
 ];
 
+/// Profondeur d'héritage maximale explorée. Une hiérarchie Android réelle
+/// dépasse rarement 10 niveaux ; le plafond n'est là que pour ne pas boucler sur
+/// un DEX trafiqué (cycle d'héritage).
+const MAX_HIERARCHY_DEPTH: usize = 64;
+
 /// Edge = un call site (offset dans le caller).
 #[derive(Debug, Clone)]
 pub struct CallSite {
@@ -44,11 +49,20 @@ pub struct CallSite {
 pub struct CallGraph {
     pub graph: DiGraph<MethodRef, CallSite>,
     index: HashMap<String, NodeIndex>,
+    /// Hiérarchie de classes du DEX (classe -> super-classe immédiate), injectée
+    /// par le parsing. Vide = `entrypoints` retombe sur l'égalité stricte.
+    supers: HashMap<String, String>,
 }
 
 impl CallGraph {
     pub fn new() -> Self {
-        Self { graph: DiGraph::new(), index: HashMap::new() }
+        Self { graph: DiGraph::new(), index: HashMap::new(), supers: HashMap::new() }
+    }
+
+    /// Injecte la hiérarchie de classes relevée au parsing
+    /// (`ApkFeatures::superclasses`). À appeler AVANT `entrypoints`.
+    pub fn set_supers(&mut self, supers: HashMap<String, String>) {
+        self.supers = supers;
     }
 
     fn node(&mut self, m: MethodRef) -> NodeIndex {
@@ -98,11 +112,11 @@ impl CallGraph {
         self.graph.node_indices().any(|n| self.graph[n].api().contains(api))
     }
 
-    /// Renvoie les nœuds entrypoint : méthode dont le nom est un callback framework
-    /// ET dont la classe est un composant déclaré au manifest (ou une sous-classe
-    /// directe — ici on matche par égalité de classe avec les composants).
+    /// Renvoie les nœuds entrypoint : méthode dont le nom est un callback
+    /// framework ET dont la classe appartient à la fermeture des composants
+    /// déclarés (cf. [`CallGraph::component_closure`]).
     pub fn entrypoints(&self, components: &[String]) -> Vec<NodeIndex> {
-        let comp: HashSet<&str> = components.iter().map(String::as_str).collect();
+        let comp = self.component_closure(components);
         self.graph
             .node_indices()
             .filter(|&n| {
@@ -110,6 +124,67 @@ impl CallGraph {
                 ENTRYPOINT_CALLBACKS.contains(&m.name.as_str()) && comp.contains(m.class.as_str())
             })
             .collect()
+    }
+
+    /// Classes qui comptent comme composant, à partir des composants DÉCLARÉS et
+    /// de la hiérarchie relevée au parsing. Trois apports, dans cet ordre :
+    ///
+    /// 1. les déclarées elles-mêmes ;
+    /// 2. leurs SUPER-classes définies dans l'app — `MyService extends
+    ///    BaseService`, manifest déclarant `MyService`, `onCreate` porté par
+    ///    `BaseService` seul : le nœud à marquer racine est
+    ///    `BaseService;->onCreate`, puisque c'est lui que le dispatch virtuel
+    ///    exécute. C'est le cas que l'égalité stricte perdait, et il sous-comptait
+    ///    les racines donc surestimait les orphelins ;
+    /// 3. leurs SOUS-classes transitives — une sous-classe qui redéfinit le
+    ///    callback sans être déclarée (alias, composant instancié dynamiquement).
+    ///    Sur-approximation, bornée par le fait que la chaîne doit atteindre une
+    ///    classe réellement déclarée.
+    ///
+    /// La remontée s'arrête en sortant de l'application : une classe du framework
+    /// n'est pas clé de `supers`, donc `Landroid/app/Service;` n'entre jamais dans
+    /// la fermeture. Sans hiérarchie (DEX non parsé, mode heuristique), la
+    /// fermeture se réduit aux classes déclarées — comportement d'avant.
+    fn component_closure<'a>(&'a self, components: &'a [String]) -> HashSet<&'a str> {
+        let declared: HashSet<&str> = components.iter().map(String::as_str).collect();
+        let mut accepted = declared.clone();
+
+        // (2) vers le haut, tant qu'on reste dans du code de l'application.
+        for &d in &declared {
+            let mut cur = d;
+            while let Some(sup) = self.supers.get(cur) {
+                let sup = sup.as_str();
+                if !self.supers.contains_key(sup) {
+                    break; // super-classe du framework : hors application
+                }
+                if !accepted.insert(sup) {
+                    break; // déjà vue : branche commune, ou cycle d'un DEX trafiqué
+                }
+                cur = sup;
+            }
+        }
+
+        // (3) vers le bas : toute classe dont la chaîne d'ancêtres atteint une
+        // classe DÉCLARÉE (et non simplement acceptée en (2), sinon toutes les
+        // sœurs d'une super-classe commune deviendraient composants).
+        for class in self.supers.keys() {
+            let mut cur = class.as_str();
+            let mut hops = 0;
+            while let Some(sup) = self.supers.get(cur) {
+                let sup = sup.as_str();
+                if declared.contains(sup) {
+                    accepted.insert(class.as_str());
+                    break;
+                }
+                hops += 1;
+                if hops > MAX_HIERARCHY_DEPTH {
+                    break; // garde-fou : chaîne circulaire
+                }
+                cur = sup;
+            }
+        }
+
+        accepted
     }
 
     /// Racines de repli quand aucun composant n'est déclaré (DEX brut sans
@@ -846,7 +921,7 @@ impl Default for CallGraph {
 
 #[cfg(test)]
 mod tests {
-    use super::package_prefix;
+    use super::*;
 
     #[test]
     fn prefix_stops_before_class_name() {
@@ -857,5 +932,35 @@ mod tests {
         // Moins de 3 segments : le nom de classe reste exclu.
         assert_eq!(package_prefix("Lcom/x/Foo$1;"), "Lcom/x");
         assert_eq!(package_prefix("LFoo;"), "LFoo");
+    }
+
+    #[test]
+    fn closure_prend_super_et_sous_classes() {
+        let mut cg = CallGraph::new();
+        cg.set_supers(HashMap::from([
+            ("Lapp/MyService;".to_string(), "Lapp/BaseService;".to_string()),
+            ("Lapp/BaseService;".to_string(), "Landroid/app/Service;".to_string()),
+            ("Lapp/Child;".to_string(), "Lapp/MyService;".to_string()),
+            ("Lapp/Sibling;".to_string(), "Lapp/BaseService;".to_string()),
+        ]));
+        let comp = cg.component_closure(&["Lapp/MyService;".to_string()]);
+
+        assert!(comp.contains("Lapp/MyService;"));
+        // Super-classe définie dans l'app : c'est elle qui porte onCreate.
+        assert!(comp.contains("Lapp/BaseService;"));
+        // Sous-classe transitive du composant déclaré.
+        assert!(comp.contains("Lapp/Child;"));
+        // La remontée s'arrête en sortant de l'application.
+        assert!(!comp.contains("Landroid/app/Service;"));
+        // Une sœur partageant la super-classe n'est pas un composant.
+        assert!(!comp.contains("Lapp/Sibling;"));
+    }
+
+    #[test]
+    fn closure_sans_hierarchie_reste_stricte() {
+        let cg = CallGraph::new();
+        let comp = cg.component_closure(&["Lapp/MyService;".to_string()]);
+        assert_eq!(comp.len(), 1);
+        assert!(comp.contains("Lapp/MyService;"));
     }
 }
