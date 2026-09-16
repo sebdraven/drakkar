@@ -790,11 +790,53 @@ pub fn build_orphan_roots(path: &Path, parsed: &parser::ParsedApk) -> Result<Orp
     Ok(OrphanRoots { mode, base, with_dyn, with_ui, all })
 }
 
+/// Sous-chaînes `class->name` des sinks sondés en colonnes. Vocabulaire aligné
+/// sur `rules/catalog.rs` ; volontairement partielles pour absorber les variantes
+/// (`DexClassLoader;-><init>` matche aussi `InMemoryDexClassLoader` et
+/// `BaseDexClassLoader`).
+const SINK_LOADLIB: &str = "System;->loadLibrary";
+const SINK_INVOKE: &str = "reflect/Method;->invoke";
+const SINK_EXEC: &str = "Runtime;->exec";
+const SINK_DEXLOAD: &str = "DexClassLoader;-><init>";
+const SINK_CRYPTO: &str = "Cipher;->doFinal";
+const SINK_NET: &str = "HttpURLConnection;->connect";
+
+/// Les quatre mesures d'un sink : présent ? atteignable ? à combien de sauts ?
+/// appelé depuis combien de call-sites ? Structure interne — chaque sink est
+/// aplati en colonnes nommées dans `OrphanSample`, le CSV restant plat.
+struct SinkProbe {
+    node: bool,
+    reach: bool,
+    /// Sauts minimaux racine -> sink ; -1 si non atteignable (colonne numérique).
+    depth: i64,
+    fanin: usize,
+}
+
+/// Sonde un sink contre le graphe depuis `roots`.
+///
+/// `reach` est dérivé de `min_depth` et non d'un appel à `reachability` : les
+/// deux décrivent la même atteignabilité dirigée depuis les mêmes racines
+/// (`Some(_)` ⟺ `reachable`), mais `reachability` reconstruit en plus un chemin
+/// de signatures PAR racine — inutile ici, et coûteux quand les racines se
+/// comptent en centaines et qu'on sonde six sinks par échantillon.
+fn probe_sink(cg: &crate::cfg::CallGraph, api: &str, roots: &[NodeIndex]) -> SinkProbe {
+    let depth = cg.min_depth(api, roots);
+    SinkProbe {
+        node: cg.has_api(api),
+        reach: depth.is_some(),
+        depth: depth.map_or(-1, |d| d as i64),
+        fanin: cg.fan_in(api),
+    }
+}
+
 /// Ligne de synthèse d'un échantillon pour l'audit d'orphelins. Les scalaires
 /// alimentent le CSV de corpus ; `report` (îlots complets) n'est sérialisé qu'en
 /// sortie JSON. `loadlib_*` / `invoke_*` sont les deux atteignabilités qu'on
 /// sondait à la main, ici en colonnes : franchissement natif câblé ? dispatch
-/// par réflexion câblé ?
+/// par réflexion câblé ? `*_depth` / `*_fanin` caractérisent COMMENT : à combien
+/// de sauts d'une racine le sink est armé, et combien de call-sites l'appellent
+/// directement. `exec_*` / `dexload_*` / `crypto_*` / `net_*` étendent les mêmes
+/// quatre mesures aux autres capacités sensibles du catalogue.
 #[derive(Serialize)]
 pub struct OrphanSample {
     pub sample: String,
@@ -817,6 +859,28 @@ pub struct OrphanSample {
     pub loadlib_reach: bool,
     pub invoke_node: bool,
     pub invoke_reach: bool,
+    /// Sauts minimaux racine -> sink ; -1 si non atteignable (colonne numérique).
+    pub loadlib_depth: i64,
+    /// Call-sites appelant directement le sink (arêtes entrantes).
+    pub loadlib_fanin: usize,
+    pub invoke_depth: i64,
+    pub invoke_fanin: usize,
+    pub exec_node: bool,
+    pub exec_reach: bool,
+    pub exec_depth: i64,
+    pub exec_fanin: usize,
+    pub dexload_node: bool,
+    pub dexload_reach: bool,
+    pub dexload_depth: i64,
+    pub dexload_fanin: usize,
+    pub crypto_node: bool,
+    pub crypto_reach: bool,
+    pub crypto_depth: i64,
+    pub crypto_fanin: usize,
+    pub net_node: bool,
+    pub net_reach: bool,
+    pub net_depth: i64,
+    pub net_fanin: usize,
     /// Rapport complet (îlots + racines). Skippé en CSV, gardé en JSON.
     pub report: crate::cfg::OrphanReport,
 }
@@ -849,8 +913,12 @@ pub fn orphan_audit_sample(apk: &Path) -> Result<OrphanSample> {
         .map(|i| if i.size > 0 { (100 * i.author_nodes / i.size) as u32 } else { 0 })
         .unwrap_or(0);
 
-    let loadlib = "System;->loadLibrary";
-    let invoke = "reflect/Method;->invoke";
+    let loadlib = probe_sink(cg, SINK_LOADLIB, all);
+    let invoke = probe_sink(cg, SINK_INVOKE, all);
+    let exec = probe_sink(cg, SINK_EXEC, all);
+    let dexload = probe_sink(cg, SINK_DEXLOAD, all);
+    let crypto = probe_sink(cg, SINK_CRYPTO, all);
+    let net = probe_sink(cg, SINK_NET, all);
 
     Ok(OrphanSample {
         sample,
@@ -868,10 +936,30 @@ pub fn orphan_audit_sample(apk: &Path) -> Result<OrphanSample> {
         islands: report.islands.len(),
         biggest_size,
         biggest_author_pct,
-        loadlib_node: cg.has_api(loadlib),
-        loadlib_reach: cg.reachability(loadlib, all).reachable,
-        invoke_node: cg.has_api(invoke),
-        invoke_reach: cg.reachability(invoke, all).reachable,
+        loadlib_node: loadlib.node,
+        loadlib_reach: loadlib.reach,
+        invoke_node: invoke.node,
+        invoke_reach: invoke.reach,
+        loadlib_depth: loadlib.depth,
+        loadlib_fanin: loadlib.fanin,
+        invoke_depth: invoke.depth,
+        invoke_fanin: invoke.fanin,
+        exec_node: exec.node,
+        exec_reach: exec.reach,
+        exec_depth: exec.depth,
+        exec_fanin: exec.fanin,
+        dexload_node: dexload.node,
+        dexload_reach: dexload.reach,
+        dexload_depth: dexload.depth,
+        dexload_fanin: dexload.fanin,
+        crypto_node: crypto.node,
+        crypto_reach: crypto.reach,
+        crypto_depth: crypto.depth,
+        crypto_fanin: crypto.fanin,
+        net_node: net.node,
+        net_reach: net.reach,
+        net_depth: net.depth,
+        net_fanin: net.fanin,
         report,
     })
 }
@@ -974,11 +1062,17 @@ fn orphan_csv(rows: &[OrphanSample]) -> String {
     let mut out = String::from(
         "sample,roots_mode,nodes,roots_manifest,roots_dyn,roots_ui,roots_clinit,\
 reach_manifest,reach_dyn,reach_ui,reach_clinit,orphans,islands,\
-biggest_size,biggest_author_pct,loadlib_node,loadlib_reach,invoke_node,invoke_reach\n",
+biggest_size,biggest_author_pct,loadlib_node,loadlib_reach,invoke_node,invoke_reach,\
+loadlib_depth,loadlib_fanin,invoke_depth,invoke_fanin,\
+exec_node,exec_reach,exec_depth,exec_fanin,\
+dexload_node,dexload_reach,dexload_depth,dexload_fanin,\
+crypto_node,crypto_reach,crypto_depth,crypto_fanin,\
+net_node,net_reach,net_depth,net_fanin\n",
     );
     for s in rows {
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\
+{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             csv_field(&s.sample),
             s.roots_mode.as_str(),
             s.nodes,
@@ -998,6 +1092,26 @@ biggest_size,biggest_author_pct,loadlib_node,loadlib_reach,invoke_node,invoke_re
             s.loadlib_reach,
             s.invoke_node,
             s.invoke_reach,
+            s.loadlib_depth,
+            s.loadlib_fanin,
+            s.invoke_depth,
+            s.invoke_fanin,
+            s.exec_node,
+            s.exec_reach,
+            s.exec_depth,
+            s.exec_fanin,
+            s.dexload_node,
+            s.dexload_reach,
+            s.dexload_depth,
+            s.dexload_fanin,
+            s.crypto_node,
+            s.crypto_reach,
+            s.crypto_depth,
+            s.crypto_fanin,
+            s.net_node,
+            s.net_reach,
+            s.net_depth,
+            s.net_fanin,
         ));
     }
     out
