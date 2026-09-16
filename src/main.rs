@@ -186,6 +186,23 @@ struct Cli {
     #[arg(long)]
     dyn_entrypoints: bool,
 
+    /// Audit d'orphelins : partitionne les méthodes NON atteignables depuis les
+    /// entrypoints en composantes faiblement connexes, et marque celles qui
+    /// contiennent System.loadLibrary. Mesure la saturation des racines à quatre
+    /// étages : manifest -> +dynamiques -> +handlers UI -> +<clinit>. Accepte un
+    /// **APK ou un DEX brut** (reconnu au contenu) : sans manifeste, les racines
+    /// sont heuristiques, ce que reporte `roots_mode`. Single ou bulk (--bulk DIR).
+    #[arg(long)]
+    orphan_audit: bool,
+
+    /// Sonde une API précise (sous-chaîne de `class->name`, ex.
+    /// `System;->loadLibrary` ou `Lorg/c/b;->a`) : dit si c'est un nœud du graphe
+    /// et si elle est atteignable depuis les racines (manifest + dyn + ui +
+    /// <clinit>), chemins à l'appui. Accepte un APK ou un DEX brut (reconnu au
+    /// contenu). Mode single, puis sort.
+    #[arg(long, value_name = "API")]
+    probe: Option<String>,
+
     /// Chaînes littérales du pool DEX. Sans motif : dump complet. Avec un ou
     /// plusieurs motifs (répéter l'option) : ne sort que les chaînes qui les
     /// contiennent, comparaison INSENSIBLE À LA CASSE. Accepte APK ou DEX brut,
@@ -502,6 +519,141 @@ fn main() -> Result<()> {
                 report.classes().len(),
                 report.unresolved.len()
             );
+        }
+        return Ok(());
+    }
+
+    // Sortie rapide : audit d'orphelins. Ne charge pas le catalogue MITRE.
+    // Construit le graphe (parse_apk), puis mesure les méthodes hors R(M) à
+    // trois étages de racines : manifest -> +dynamiques -> +handlers UI. La
+    // courbe de saturation dit ce qui reste vraiment orphelin (le résidu), par
+    // opposition à ce qui n'était qu'une racine non semée.
+    if cli.orphan_audit {
+        // Mode bulk : une ligne CSV (ou JSON) par échantillon = la table de corpus.
+        if let Some(dir) = &cli.bulk {
+            setup_jobs(cli.jobs)?;
+            return bulk::run_orphan_audit(dir, &bulk_options(&cli));
+        }
+        let Some(apk) = &cli.apk else {
+            bail!("--orphan-audit requiert un APK ou un DEX brut (mode single) ou --bulk <DIR>");
+        };
+        check_json_dest(cli.format, cli.json_out.as_deref())?;
+
+        let parsed = parser::parse_any(apk)?;
+        let cg = &parsed.call_graph;
+        let roots = bulk::build_orphan_roots(apk, &parsed)?;
+        let bulk::OrphanRoots { mode, base, with_dyn, with_ui, all } = &roots;
+
+        let report = cg.orphan_audit(all, "loadLibrary");
+
+        if cli.format.wants_json() {
+            // Le rapport seul ne dit pas sous quel régime il a été mesuré : on
+            // l'enveloppe avec le régime et les quatre étages de racines.
+            let payload = serde_json::json!({
+                "roots_mode": mode.as_str(),
+                "roots_manifest": base.len(),
+                "roots_dyn": with_dyn.len(),
+                "roots_ui": with_ui.len(),
+                "roots_clinit": all.len(),
+                "report": report,
+            });
+            emit_json(&payload, cli.json_out.as_deref())?;
+        }
+        if cli.format.wants_text() {
+            let n_manifest = cg.reachable_set(base).len();
+            let n_dyn = cg.reachable_set(with_dyn).len();
+            let n_ui = cg.reachable_set(with_ui).len();
+            println!("== Audit d'orphelins ==\n");
+            println!("Nœuds du graphe        {}", report.total_nodes);
+            println!(
+                "Régime de racines      {}{}",
+                mode.as_str(),
+                match mode {
+                    bulk::RootsMode::Manifest => "",
+                    bulk::RootsMode::Heuristic =>
+                        "  (pas de composant déclaré : tout callback de cycle de vie \
+est racine — ne pas comparer à une mesure `manifest`)",
+                }
+            );
+            // L'étage 1 porte le nom du régime : `manifest=` ou `heuristic=`.
+            let l1 = mode.as_str();
+            println!(
+                "Racines        {l1}={}  +dyn={}  +ui={}  +clinit={}",
+                base.len(),
+                with_dyn.len(),
+                with_ui.len(),
+                all.len()
+            );
+            println!(
+                "Atteignables   {l1}={}  +dyn={}  +ui={}  +clinit={}   (orphelins finaux {})",
+                n_manifest, n_dyn, n_ui, report.reachable, report.orphan
+            );
+            println!(
+                "\nÎlots orphelins : {} (franchissement en tête, puis taille)",
+                report.islands.len()
+            );
+            for isl in report.islands.iter().take(40) {
+                let tag = if isl.touches_crossing { "  ⚠ loadLibrary" } else { "" };
+                let pct = if isl.size > 0 { 100 * isl.author_nodes / isl.size } else { 0 };
+                println!(
+                    "  taille {:>5}  {pct:>3}% auteur  {} racine(s) de degré entrant nul{}",
+                    isl.size,
+                    isl.roots.len(),
+                    tag
+                );
+                if !isl.prefix_histogram.is_empty() {
+                    let top: Vec<String> = isl
+                        .prefix_histogram
+                        .iter()
+                        .take(5)
+                        .map(|(pkg, n)| format!("{pkg} ({n})"))
+                        .collect();
+                    let reste = isl.prefix_histogram.len().saturating_sub(5);
+                    let suite = if reste > 0 { format!("  … +{reste} préfixes") } else { String::new() };
+                    println!("           paquets  {}{}", top.join("   "), suite);
+                }
+                for r in isl.roots.iter().take(5) {
+                    println!("           {r}");
+                }
+                if isl.roots.len() > 5 {
+                    println!("           … +{} autres", isl.roots.len() - 5);
+                }
+            }
+            println!("\n(atteignabilité dirigée ; les orphelins restants après +clinit sont le résidu interprétable)");
+        }
+        return Ok(());
+    }
+
+    // Sortie rapide : sonde d'une API contre le graphe. Même construction de
+    // racines que --orphan-audit, mais on interroge une API précise (est-elle un
+    // nœud ? atteignable ? par quels chemins ?).
+    if let Some(api) = &cli.probe {
+        let Some(apk) = &cli.apk else {
+            bail!("--probe requiert un APK ou un DEX brut (mode single)");
+        };
+        let parsed = parser::parse_any(apk)?;
+        let cg = &parsed.call_graph;
+
+        let roots = bulk::build_orphan_roots(apk, &parsed)?;
+        let eps = &roots.all;
+
+        let is_node = cg.has_api(api);
+        let reach = cg.reachability(api, eps);
+
+        println!("== Sonde : {api} ==\n");
+        println!(
+            "nœud du graphe   {}",
+            if is_node { "oui" } else { "NON (absente du CFG : pas d'arête vers cette API)" }
+        );
+        println!("atteignable      {}", if reach.reachable { "oui" } else { "non" });
+        println!("racines          {} ({})", eps.len(), roots.mode.as_str());
+        if reach.paths.is_empty() {
+            println!("\naucun chemin depuis une racine.");
+        } else {
+            println!("\nchemins ({}) :", reach.paths.len());
+            for (i, p) in reach.paths.iter().take(10).enumerate() {
+                println!("  [{i}] {}", p.join("  ->  "));
+            }
         }
         return Ok(());
     }
