@@ -98,6 +98,11 @@ pub enum Provenance {
     /// la classe de l'appelant. Exact — motif classique d'un receiver doté d'une
     /// méthode `start()` qui fait `context.registerReceiver(this, filter)`.
     ThisSelf,
+    /// ⚠️ `android:onClick="foo"` dans un layout : le lien n'existe pas dans le
+    /// bytecode. La classe est celle qui DÉCLARE une méthode `foo(View)` — sans
+    /// resources.arsc on ne sait pas quelle Activity gonfle quel layout, donc
+    /// toutes les déclarantes sont retenues (cf. `ui_callbacks`).
+    XmlOnClick,
 }
 
 impl Provenance {
@@ -109,6 +114,7 @@ impl Provenance {
             Self::FieldType => "field~",
             Self::FieldAssign => "field=",
             Self::ThisSelf => "this",
+            Self::XmlOnClick => "xml",
         }
     }
 }
@@ -225,7 +231,7 @@ pub type FieldAssignments = HashMap<u64, Option<String>>;
 ///
 /// Coût : une seconde passe de décodage sur tout le DEX. Assumé — c'est le seul
 /// moyen d'obtenir la classe concrète d'un receiver détenu en champ.
-fn index_field_assignments(dex: &dex::Dex<impl AsRef<[u8]>>) -> FieldAssignments {
+pub(crate) fn index_field_assignments(dex: &dex::Dex<impl AsRef<[u8]>>) -> FieldAssignments {
     let mut map: FieldAssignments = HashMap::new();
 
     for class in dex.classes() {
@@ -562,7 +568,7 @@ pub(crate) fn registers(ins: &dex_bytecode::Instruction) -> Vec<u32> {
 
 /// Registre de destination d'une instruction d'écriture : le premier `vN`.
 /// ⚠️ N'a de sens QUE si `writes_register(ins)` est vrai.
-fn dest_register(ins: &dex_bytecode::Instruction) -> Option<u32> {
+pub(crate) fn dest_register(ins: &dex_bytecode::Instruction) -> Option<u32> {
     registers(ins).first().copied()
 }
 
@@ -577,7 +583,7 @@ fn dest_register(ins: &dex_bytecode::Instruction) -> Option<u32> {
 /// immédiatement le `new-instance` recherché.
 ///
 /// Liste en négatif : plus courte et plus sûre que d'énumérer tout ce qui écrit.
-fn writes_register(ins: &dex_bytecode::Instruction) -> bool {
+pub(crate) fn writes_register(ins: &dex_bytecode::Instruction) -> bool {
     let m = ins.mnemonic();
     !(m.starts_with("invoke-")
         || m.starts_with("iput")
