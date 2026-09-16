@@ -248,6 +248,45 @@ impl CallGraph {
         visited
     }
 
+    /// Profondeur minimale racine -> sink : nombre de sauts d'appel du point
+    /// d'entrée le plus proche jusqu'au premier nœud matchant `api`. BFS par
+    /// niveaux multi-source (même parcours que `reachable_set`, la distance en
+    /// plus). None si le sink n'est pas atteignable depuis `roots`.
+    /// Une capacité armée à 2 sauts d'un `onReceive` n'a pas la même intention
+    /// qu'une enfouie à 15 sauts.
+    pub fn min_depth(&self, api: &str, roots: &[NodeIndex]) -> Option<usize> {
+        let mut visited: HashSet<NodeIndex> = HashSet::new();
+        let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::new();
+        for &r in roots {
+            if visited.insert(r) {
+                queue.push_back((r, 0));
+            }
+        }
+        while let Some((cur, d)) = queue.pop_front() {
+            if self.graph[cur].api().contains(api) {
+                return Some(d);
+            }
+            for nb in self.graph.neighbors_directed(cur, Direction::Outgoing) {
+                if visited.insert(nb) {
+                    queue.push_back((nb, d + 1));
+                }
+            }
+        }
+        None
+    }
+
+    /// Fan-in call-site d'un sink : nombre total d'arêtes ENTRANTES sur
+    /// l'ensemble des nœuds matchant `api`, soit le nombre de call-sites qui
+    /// l'appellent DIRECTEMENT. À ne pas confondre avec le nombre de chemins de
+    /// `reachability`, qui compte les racines atteignant l'API (transitivement).
+    pub fn fan_in(&self, api: &str) -> usize {
+        self.graph
+            .node_indices()
+            .filter(|&n| self.graph[n].api().contains(api))
+            .map(|n| self.graph.edges_directed(n, Direction::Incoming).count())
+            .sum()
+    }
+
     /// Résout des racines `(classe, méthode)` en nœuds du graphe. Les nœuds sont
     /// keyés sur `api()` en interne ; on matche ici sur les champs `class`/`name`
     /// pour ne pas dépendre du format d'`api()`. Sert à réinjecter les handlers UI
