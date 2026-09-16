@@ -8,22 +8,26 @@
 //! listener, donc son handler (`Lcom/x/Foo$1;->onClick`), à réinjecter comme
 //! racine avant `CallGraph::orphan_audit`.
 //!
-//! Deux motifs couverts, via les primitives de `dyn_entrypoints` :
+//! Quatre motifs couverts, via les primitives de `dyn_entrypoints` :
 //!   - listener anonyme `setOnClickListener(new OnClickListener(){…})`
 //!     -> `new-instance Foo$1`, résolu par `backtrack_new_instance` ;
-//!   - `this` : l'Activity implémente le listener et se passe elle-même.
+//!   - `this` : l'Activity implémente le listener et se passe elle-même ;
+//!   - listener détenu en CHAMP (`iget-object`/`sget-object`) -> classe concrète
+//!     assignée au champ ailleurs dans le DEX, via `index_field_assignments` ;
+//!   - `android:onClick="foo"` déclaré en XML de ressources — le lien n'est pas
+//!     dans le bytecode du tout (cf. `xml_on_click_names`).
 //!
-//! Trous nommés, PAS couverts ici :
-//!   - listener détenu en champ (`iget-object`) -> à brancher sur
-//!     `index_field_assignments` (comme le fait `dyn_entrypoints`) ;
-//!   - `android:onClick="foo"` en res/layout/*.xml -> lecteur `axml` +
-//!     resources.arsc ; le lien n'est pas dans le bytecode du tout.
+//! Trou restant : un listener reçu en PARAMÈTRE. Il faudrait remonter aux
+//! appelants (interprocédural), hors de portée de ce scan intra-méthode.
 
 use crate::model::MethodRef;
+use crate::parser::axml::Element;
 use crate::parser::dyn_entrypoints::{
-    backtrack_new_instance, operand_index, registers, u16_to_le_bytes, Provenance,
+    backtrack_new_instance, dest_register, index_field_assignments, operand_index, registers,
+    u16_to_le_bytes, writes_register, FieldAssignments, Provenance,
 };
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Setters de listener -> handler que le framework rappellera. Tous sont des
@@ -74,11 +78,27 @@ impl UiHandlerReport {
 }
 
 /// Scanne un DEX brut (déjà déballé) et renvoie les handlers UI résolus.
+///
+/// Sans archive il n'y a pas de layout : le volet `android:onClick` est
+/// silencieusement vide. C'est `extract_from_apk` qui l'alimente.
 pub fn extract(path: &Path) -> Result<UiHandlerReport> {
+    extract_with_layouts(path, &HashSet::new())
+}
+
+/// Variante interne : `xml_on_click` porte les noms de handlers cités par les
+/// layouts de l'APK d'origine. Une méthode du DEX qui porte l'un de ces noms
+/// ET la signature exigée par Android (`(Landroid/view/View;)V`) est retenue.
+fn extract_with_layouts(path: &Path, xml_on_click: &HashSet<String>) -> Result<UiHandlerReport> {
     let dex = dex::DexReader::from_file(path)
         .with_context(|| format!("open dex {}", path.display()))?;
 
     let mut report = UiHandlerReport::default();
+
+    // Passe 1 : classe CONCRÈTE assignée à chaque champ — c'est elle qui donne
+    // le listener détenu en champ, dont le type déclaré n'est presque toujours
+    // que l'interface. Seconde passe de décodage sur tout le DEX, même coût
+    // assumé que dans `dyn_entrypoints`.
+    let assignments = index_field_assignments(&dex);
 
     for class in dex.classes() {
         let class = match class {
@@ -88,6 +108,25 @@ pub fn extract(path: &Path) -> Result<UiHandlerReport> {
         let class_name = class.jtype().type_descriptor().to_string();
 
         for method in class.methods() {
+            // Volet XML : le handler n'est appelé par personne dans le bytecode,
+            // il n'y a donc rien à chercher dans son code — la déclaration suffit.
+            let method_name = method.name().to_string();
+            if xml_on_click.contains(&method_name) && takes_view_returns_void(&method) {
+                report.handlers.push(UiHandler {
+                    class: class_name.clone(),
+                    method: method_name.clone(),
+                    via: "android:onClick".into(),
+                    // Pas de call site bytecode : le lien est dans le layout.
+                    caller: MethodRef {
+                        class: class_name.clone(),
+                        name: method_name,
+                        descriptor: String::new(),
+                    },
+                    site: 0,
+                    provenance: Provenance::XmlOnClick,
+                });
+            }
+
             let code = match method.code() {
                 Some(c) => c,
                 None => continue,
@@ -124,7 +163,15 @@ pub fn extract(path: &Path) -> Result<UiHandlerReport> {
                 None
             };
 
-            scan_method(&dex, &instructions, &caller, this_reg, &class_name, &mut report);
+            scan_method(
+                &dex,
+                &instructions,
+                &caller,
+                this_reg,
+                &class_name,
+                &assignments,
+                &mut report,
+            );
         }
     }
 
@@ -138,6 +185,7 @@ fn scan_method(
     caller: &MethodRef,
     this_reg: Option<u32>,
     caller_class: &str,
+    assignments: &FieldAssignments,
     report: &mut UiHandlerReport,
 ) {
     for (i, ins) in instructions.iter().enumerate() {
@@ -177,8 +225,22 @@ fn scan_method(
                 site: ins.offset as u64,
                 provenance: Provenance::ThisSelf,
             });
+            continue;
         }
-        // Sinon : listener détenu en champ ou reçu en paramètre — trou assumé.
+
+        // 3) listener détenu en CHAMP : `iget-object vListener, vThis, field@N`.
+        if let Some((class, provenance)) = backtrack_field(dex, &instructions[..i], target, assignments)
+        {
+            report.handlers.push(UiHandler {
+                class,
+                method: handler.to_string(),
+                via,
+                caller: caller.clone(),
+                site: ins.offset as u64,
+                provenance,
+            });
+        }
+        // Sinon : listener reçu en paramètre — trou assumé (interprocédural).
     }
 }
 
@@ -202,15 +264,187 @@ fn ui_sink(
     None
 }
 
-/// Variante APK : dézippe les `classes*.dex` et agrège, via
-/// `parser::extract_dex_files` (donc avec le repli `TolerantZip`).
+/// Remonte `target` jusqu'au `iget-object`/`sget-object` qui l'a chargé et rend
+/// la classe du listener. Deux qualités, distinguées par la provenance :
+/// classe CONCRÈTE assignée au champ ailleurs dans le DEX (exacte), à défaut
+/// type DÉCLARÉ du champ (borne supérieure).
+///
+/// Le type déclaré n'est retenu que s'il n'est pas du framework : il vaut
+/// `Landroid/view/View$OnClickListener;` dans l'écrasante majorité des cas —
+/// une interface, qui ne désigne aucun corps de méthode et ne reconnecterait
+/// rien dans le graphe.
+fn backtrack_field(
+    dex: &dex::Dex<impl AsRef<[u8]>>,
+    window: &[dex_bytecode::Instruction],
+    target: u32,
+    assignments: &FieldAssignments,
+) -> Option<(String, Provenance)> {
+    use dex::field::FieldId;
+    use dex::jtype::TypeId;
+
+    let mut target = target;
+    for ins in window.iter().rev() {
+        // Traverser tout ce qui n'écrit pas le registre suivi.
+        if !writes_register(ins) || dest_register(ins) != Some(target) {
+            continue;
+        }
+        let m = ins.mnemonic();
+        if m.starts_with("move-object") && !m.starts_with("move-result-object") {
+            if let Some(&src) = registers(ins).get(1) {
+                target = src;
+            }
+            continue;
+        }
+        if m.starts_with("iget-object") || m.starts_with("sget-object") {
+            let idx = operand_index(ins, "field@")?;
+            if let Some(Some(concrete)) = assignments.get(&idx) {
+                return Some((concrete.clone(), Provenance::FieldAssign));
+            }
+            let item = dex.get_field_item(idx as FieldId).ok()?;
+            let declared = dex.get_type(*item.type_idx() as TypeId).ok()?.type_descriptor().to_string();
+            if declared.starts_with("Landroid/") || declared.starts_with("Ljava") {
+                return None;
+            }
+            return Some((declared, Provenance::FieldType));
+        }
+        // Écriture d'une autre nature : la piste s'arrête.
+        return None;
+    }
+    None
+}
+
+/// Signature qu'Android exige d'un handler `android:onClick` : `void foo(View)`.
+/// Sans ce filtre, toute homonyme du DEX serait promue racine.
+fn takes_view_returns_void(method: &dex::method::Method) -> bool {
+    let params = method.params();
+    params.len() == 1
+        && params[0].type_descriptor() == "Landroid/view/View;"
+        && method.return_type().type_descriptor() == "V"
+}
+
+/// Noms de méthodes cités par `android:onClick` dans les XML de ressources
+/// (layouts, menus). Jamais fatal : un APK illisible rend un ensemble vide.
+///
+/// APPROXIMATION ASSUMÉE : on ne résout pas quel layout est gonflé par quelle
+/// Activity (il faudrait suivre `setContentView(R.layout.X)` ET résoudre l'id
+/// via `resources.arsc`). On retient donc le NOM du handler, et la classe est
+/// celle qui déclare une méthode de ce nom et de la bonne signature — toutes
+/// les déclarantes si elles sont plusieurs. Sur-approximation bornée par la
+/// signature, et jamais silencieuse : provenance `xml`.
+fn xml_on_click_names(apk: &Path) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for raw in read_res_xml(apk) {
+        match crate::parser::axml::decode(&raw) {
+            Ok(decoded) => collect_on_click(&decoded.root, &mut names),
+            Err(e) => tracing::debug!(error = %e, "XML de ressource illisible, ignoré"),
+        }
+    }
+    tracing::info!(handlers = names.len(), "android:onClick relevés dans les ressources");
+    names
+}
+
+fn collect_on_click(elem: &Element, out: &mut HashSet<String>) {
+    if let Some(v) = elem.attr("onClick") {
+        let v = v.trim();
+        if looks_like_method_name(v) {
+            out.insert(v.to_string());
+        }
+    }
+    for child in elem.get_children() {
+        collect_on_click(child, out);
+    }
+}
+
+/// Écarte ce qui ne peut pas être un nom de méthode Java — au premier chef les
+/// références de ressources non résolues (`@0x7f0a0001`), qu'`axml` rend telles
+/// quelles faute de `resources.arsc`.
+fn looks_like_method_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+/// Contenu brut des `res/**/*.xml`. Même repli que le manifeste : crate `zip`
+/// d'abord, `apkzip::TolerantZip` dès qu'il refuse quoi que ce soit — c'est à
+/// la lecture d'entrée que le bit de chiffrement trafiqué frappe.
+fn read_res_xml(apk: &Path) -> Vec<Vec<u8>> {
+    use std::io::Read;
+
+    let nominal = (|| -> Result<Vec<Vec<u8>>> {
+        let file = std::fs::File::open(apk)?;
+        let mut zip = zip::ZipArchive::new(file)?;
+        let mut out = Vec::new();
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i)?;
+            if !is_res_xml(entry.name()) {
+                continue;
+            }
+            let mut buf = Vec::with_capacity(entry.size() as usize);
+            entry.read_to_end(&mut buf)?;
+            out.push(buf);
+        }
+        Ok(out)
+    })();
+
+    match nominal {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                apk = %apk.display(),
+                error = %e,
+                "res/*.xml refusés par le crate zip, repli sur le lecteur tolérant"
+            );
+            read_res_xml_tolerant(apk)
+        }
+    }
+}
+
+fn read_res_xml_tolerant(apk: &Path) -> Vec<Vec<u8>> {
+    let zip = match crate::parser::apkzip::TolerantZip::open(apk) {
+        Ok(z) => z,
+        Err(e) => {
+            tracing::warn!(
+                apk = %apk.display(),
+                error = %e,
+                "lecteur tolérant en échec, volet android:onClick abandonné"
+            );
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for (i, entry) in zip.entries().iter().enumerate() {
+        if !is_res_xml(&entry.name) {
+            continue;
+        }
+        match zip.read(i) {
+            Ok(b) => out.push(b),
+            Err(e) => tracing::debug!(entry = %entry.name, error = %e, "entrée illisible, ignorée"),
+        }
+    }
+    out
+}
+
+fn is_res_xml(name: &str) -> bool {
+    name.starts_with("res/") && name.ends_with(".xml")
+}
+
+/// Variante APK : relève les `android:onClick` des ressources, puis dézippe les
+/// `classes*.dex` via `parser::extract_dex_files` (donc avec le repli
+/// `TolerantZip`) et agrège.
 pub fn extract_from_apk(apk: &Path) -> Result<UiHandlerReport> {
+    // Relevé des layouts d'abord : les noms alimentent le scan de chaque DEX.
+    let xml_on_click = xml_on_click_names(apk);
+
     let tmp = tempfile::tempdir().context("create tempdir")?;
     let dex_files = crate::parser::extract_dex_files(apk, tmp.path())?;
     let mut merged = UiHandlerReport::default();
 
     for dex in &dex_files {
-        let r = extract(dex).with_context(|| format!("scan {}", dex.display()))?;
+        let r = extract_with_layouts(dex, &xml_on_click)
+            .with_context(|| format!("scan {}", dex.display()))?;
         merged.handlers.extend(r.handlers);
     }
 
@@ -231,6 +465,17 @@ pub fn extract_any(path: &Path) -> Result<UiHandlerReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn method_name_filter() {
+        assert!(looks_like_method_name("onClickBouton"));
+        assert!(looks_like_method_name("_handler$1"));
+        // Référence de ressource non résolue, faute de resources.arsc.
+        assert!(!looks_like_method_name("@0x7f0a0001"));
+        assert!(!looks_like_method_name(""));
+        assert!(!looks_like_method_name("com.x.Foo"));
+        assert!(!looks_like_method_name("2foo"));
+    }
 
     #[test]
     fn roots_dedup() {
