@@ -8,6 +8,7 @@
 
 use crate::parser;
 use crate::rules::Engine;
+use petgraph::graph::NodeIndex;
 use anyhow::Result;
 use rayon::prelude::*;
 use serde::Serialize;
@@ -173,13 +174,31 @@ pub struct Collected {
 /// nommés par hash n'en ont pas, et un `.apk` peut être n'importe quoi. Voir
 /// [`recognize`].
 pub fn collect_apks(dir: &Path, recursive: bool) -> Result<Collected> {
+    collect_with(dir, recursive, false)
+}
+
+/// Variante pour l'audit d'orphelins : accepte AUSSI les **DEX bruts** déballés
+/// (`classes_unpacked.dex`, dumps mémoire), reconnus au contenu. Les archives
+/// zip sans AndroidManifest.xml restent rejetées avec leur raison, comme dans
+/// [`collect_apks`] — c'est le seul cas où une entrée est comptée en échec.
+pub fn collect_orphan_inputs(dir: &Path, recursive: bool) -> Result<Collected> {
+    collect_with(dir, recursive, true)
+}
+
+fn collect_with(dir: &Path, recursive: bool, keep_raw_dex: bool) -> Result<Collected> {
+    use crate::parser::dyn_entrypoints::{sniff, InputKind};
+
     let mut apks = Vec::new();
     let mut rejected = Vec::new();
 
     let mut consider = |p: PathBuf| match recognize(&p) {
         Recognition::Apk => apks.push(p),
         Recognition::ZipWithoutManifest(why) => rejected.push((p, why)),
-        Recognition::NotZip => {}
+        Recognition::NotZip => {
+            if keep_raw_dex && sniff(&p) == Some(InputKind::Dex) {
+                apks.push(p);
+            }
+        }
     };
 
     if recursive {
@@ -690,4 +709,296 @@ fn csv_field(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+// ───────────────── Audit d'orphelins en lot ─────────────────
+
+/// Régime sous lequel les racines ont été construites. À reporter avec CHAQUE
+/// mesure : un taux d'orphelins obtenu sous `heuristic` ne se compare pas à un
+/// taux obtenu sous `manifest`, la sur-approximation des racines n'étant pas la
+/// même.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RootsMode {
+    /// Composants déclarés au manifeste × callbacks de cycle de vie.
+    Manifest,
+    /// Aucun composant exploitable — DEX brut déballé, ou APK dont le manifeste
+    /// n'a rien donné : tout callback de cycle de vie du graphe devient racine.
+    Heuristic,
+}
+
+impl RootsMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RootsMode::Manifest => "manifest",
+            RootsMode::Heuristic => "heuristic",
+        }
+    }
+}
+
+/// Les quatre étages CUMULATIFS de racines de l'audit d'orphelins. La courbe
+/// `base -> with_dyn -> with_ui -> all` est la mesure de saturation : ce qu'un
+/// étage rattrape n'était pas orphelin, juste non semé.
+pub struct OrphanRoots {
+    pub mode: RootsMode,
+    pub base: Vec<NodeIndex>,
+    pub with_dyn: Vec<NodeIndex>,
+    pub with_ui: Vec<NodeIndex>,
+    pub all: Vec<NodeIndex>,
+}
+
+/// Construit les racines de l'audit pour un APK **ou** un DEX brut — source de
+/// vérité unique pour le mode single et le mode bulk.
+///
+/// `path` sert aux passes qui relisent le binaire (dyn, ui) ; elles routent
+/// elles-mêmes sur le contenu via `extract_any`. Le régime est déduit de la
+/// présence de composants dans `parsed.features` : un DEX brut n'a pas de
+/// manifeste, donc pas de composant, donc pas de racine à l'étage 1 — d'où le
+/// repli heuristique.
+pub fn build_orphan_roots(path: &Path, parsed: &parser::ParsedApk) -> Result<OrphanRoots> {
+    let cg = &parsed.call_graph;
+
+    // Étage 1 : composants du manifeste, ou repli heuristique.
+    let (mode, base) = if parsed.features.components.is_empty() {
+        (RootsMode::Heuristic, cg.heuristic_entrypoints())
+    } else {
+        (RootsMode::Manifest, cg.entrypoints(&parsed.features.components))
+    };
+
+    // Étage 2 : + classes atteintes dynamiquement (registerReceiver, Intent…).
+    // Sous le régime heuristique l'étage est neutre par construction (les nœuds
+    // qu'il désignerait sont déjà tous racines) : la colonne le montrera.
+    let dyn_classes = parser::dyn_entrypoints::extract_any(path)?.classes();
+    let mut with_dyn = base.clone();
+    with_dyn.extend(cg.entrypoints(&dyn_classes));
+    with_dyn.sort();
+    with_dyn.dedup();
+
+    // Étage 3 : + handlers UI (onClick & cie) résolus en nœuds.
+    let ui_roots = parser::ui_callbacks::extract_any(path)?.roots();
+    let mut with_ui = with_dyn.clone();
+    with_ui.extend(cg.nodes_for(&ui_roots));
+    with_ui.sort();
+    with_ui.dedup();
+
+    // Étage 4 : + <clinit> (initialiseurs statiques : racines implicites).
+    let mut all = with_ui.clone();
+    all.extend(cg.clinit_nodes());
+    all.sort();
+    all.dedup();
+
+    Ok(OrphanRoots { mode, base, with_dyn, with_ui, all })
+}
+
+/// Ligne de synthèse d'un échantillon pour l'audit d'orphelins. Les scalaires
+/// alimentent le CSV de corpus ; `report` (îlots complets) n'est sérialisé qu'en
+/// sortie JSON. `loadlib_*` / `invoke_*` sont les deux atteignabilités qu'on
+/// sondait à la main, ici en colonnes : franchissement natif câblé ? dispatch
+/// par réflexion câblé ?
+#[derive(Serialize)]
+pub struct OrphanSample {
+    pub sample: String,
+    /// Régime de construction des racines — conditionne la comparabilité.
+    pub roots_mode: RootsMode,
+    pub nodes: usize,
+    pub roots_manifest: usize,
+    pub roots_dyn: usize,
+    pub roots_ui: usize,
+    pub roots_clinit: usize,
+    pub reach_manifest: usize,
+    pub reach_dyn: usize,
+    pub reach_ui: usize,
+    pub reach_clinit: usize,
+    pub orphans: usize,
+    pub islands: usize,
+    pub biggest_size: usize,
+    pub biggest_author_pct: u32,
+    pub loadlib_node: bool,
+    pub loadlib_reach: bool,
+    pub invoke_node: bool,
+    pub invoke_reach: bool,
+    /// Rapport complet (îlots + racines). Skippé en CSV, gardé en JSON.
+    pub report: crate::cfg::OrphanReport,
+}
+
+/// Calcule l'audit d'orphelins d'UN échantillon — APK ou DEX brut, reconnu au
+/// contenu. Racines à quatre étages (cf. [`build_orphan_roots`]) plus les deux
+/// sondes d'atteignabilité.
+pub fn orphan_audit_sample(apk: &Path) -> Result<OrphanSample> {
+    let sample = apk
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".into());
+
+    let parsed = parser::parse_any(apk)?;
+    let cg = &parsed.call_graph;
+    let roots = build_orphan_roots(apk, &parsed)?;
+    let OrphanRoots { mode, base, with_dyn, with_ui, all } = &roots;
+
+    let report = cg.orphan_audit(all, "loadLibrary");
+
+    let reach_manifest = cg.reachable_set(base).len();
+    let reach_dyn = cg.reachable_set(with_dyn).len();
+    let reach_ui = cg.reachable_set(with_ui).len();
+
+    // Les îlots sont triés (franchissement puis taille) : le plus gros n'est pas
+    // forcément le premier, on le prend explicitement.
+    let biggest = report.islands.iter().max_by_key(|i| i.size);
+    let biggest_size = biggest.map(|i| i.size).unwrap_or(0);
+    let biggest_author_pct = biggest
+        .map(|i| if i.size > 0 { (100 * i.author_nodes / i.size) as u32 } else { 0 })
+        .unwrap_or(0);
+
+    let loadlib = "System;->loadLibrary";
+    let invoke = "reflect/Method;->invoke";
+
+    Ok(OrphanSample {
+        sample,
+        roots_mode: *mode,
+        nodes: report.total_nodes,
+        roots_manifest: base.len(),
+        roots_dyn: with_dyn.len(),
+        roots_ui: with_ui.len(),
+        roots_clinit: all.len(),
+        reach_manifest,
+        reach_dyn,
+        reach_ui,
+        reach_clinit: report.reachable,
+        orphans: report.orphan,
+        islands: report.islands.len(),
+        biggest_size,
+        biggest_author_pct,
+        loadlib_node: cg.has_api(loadlib),
+        loadlib_reach: cg.reachability(loadlib, all).reachable,
+        invoke_node: cg.has_api(invoke),
+        invoke_reach: cg.reachability(invoke, all).reachable,
+        report,
+    })
+}
+
+/// Audit d'orphelins sur tout un répertoire, en parallèle : une ligne CSV par
+/// échantillon (ou un tableau JSON en `--format json`). C'est la table de corpus.
+pub fn run_orphan_audit(input_dir: &Path, opts: &BulkOptions) -> Result<()> {
+    let to_stdout = opts.out_dir.as_os_str() == "-";
+    if !to_stdout {
+        std::fs::create_dir_all(&opts.out_dir)?;
+    }
+
+    let found = collect_orphan_inputs(input_dir, opts.recursive)?;
+    let apks = found.apks;
+    if apks.is_empty() && found.rejected.is_empty() {
+        anyhow::bail!("aucun APK ni DEX brut trouvé dans {}", input_dir.display());
+    }
+    tracing::info!(
+        count = apks.len(),
+        rejected = found.rejected.len(),
+        out = %opts.out_dir.display(),
+        "bulk orphan-audit: démarrage"
+    );
+
+    let ok = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(found.rejected.len());
+    for (path, why) in &found.rejected {
+        eprintln!("[FAIL]  {}  — non reconnu comme APK : {why}", path.display());
+    }
+
+    let rows: Mutex<Vec<OrphanSample>> = Mutex::new(Vec::new());
+
+    apks.par_iter().for_each(|apk| {
+        let outcome = catch_unwind(AssertUnwindSafe(|| orphan_audit_sample(apk)));
+        match outcome {
+            Ok(Ok(s)) => {
+                ok.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[OK]    {}  — {}/{} orphelins (roots={}, loadlib_reach={}, invoke_reach={})",
+                    apk.display(),
+                    s.orphans,
+                    s.nodes,
+                    s.roots_mode.as_str(),
+                    s.loadlib_reach,
+                    s.invoke_reach
+                );
+                match rows.lock() {
+                    Ok(mut v) => v.push(s),
+                    Err(p) => p.into_inner().push(s),
+                }
+            }
+            Ok(Err(e)) => {
+                failed.fetch_add(1, Ordering::Relaxed);
+                eprintln!("[FAIL]  {}  — {e:#}", apk.display());
+            }
+            Err(_) => {
+                failed.fetch_add(1, Ordering::Relaxed);
+                eprintln!("[PANIC] {}  — audit abandonné", apk.display());
+            }
+        }
+    });
+
+    eprintln!(
+        "\n[*] bulk orphan-audit terminé — OK: {}  FAIL: {}",
+        ok.load(Ordering::Relaxed),
+        failed.load(Ordering::Relaxed),
+    );
+
+    let mut rows = rows.into_inner().unwrap_or_else(|p| p.into_inner());
+    rows.sort_by(|a, b| a.sample.cmp(&b.sample));
+
+    let rendered = if opts.format == BulkFormat::Csv {
+        orphan_csv(&rows)
+    } else {
+        serde_json::to_string_pretty(&rows)?
+    };
+
+    if to_stdout {
+        print!("{rendered}");
+    } else {
+        let name = if opts.format == BulkFormat::Csv {
+            "orphan_audit.csv"
+        } else {
+            "orphan_audit.json"
+        };
+        let path = opts.out_dir.join(name);
+        std::fs::write(&path, rendered)
+            .map_err(|e| anyhow::anyhow!("écriture {} : {e}", path.display()))?;
+        eprintln!("[*] écrit dans {}", path.display());
+    }
+
+    Ok(())
+}
+
+/// CSV de l'audit d'orphelins : une ligne par échantillon, scalaires seuls (le
+/// détail des îlots reste dans le JSON). C'est la table à charger dans pandas.
+/// `roots_mode` dit sous quel régime la ligne a été mesurée : ne comparer que
+/// des lignes de même régime (cf. [`RootsMode`]).
+fn orphan_csv(rows: &[OrphanSample]) -> String {
+    let mut out = String::from(
+        "sample,roots_mode,nodes,roots_manifest,roots_dyn,roots_ui,roots_clinit,\
+reach_manifest,reach_dyn,reach_ui,reach_clinit,orphans,islands,\
+biggest_size,biggest_author_pct,loadlib_node,loadlib_reach,invoke_node,invoke_reach\n",
+    );
+    for s in rows {
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            csv_field(&s.sample),
+            s.roots_mode.as_str(),
+            s.nodes,
+            s.roots_manifest,
+            s.roots_dyn,
+            s.roots_ui,
+            s.roots_clinit,
+            s.reach_manifest,
+            s.reach_dyn,
+            s.reach_ui,
+            s.reach_clinit,
+            s.orphans,
+            s.islands,
+            s.biggest_size,
+            s.biggest_author_pct,
+            s.loadlib_node,
+            s.loadlib_reach,
+            s.invoke_node,
+            s.invoke_reach,
+        ));
+    }
+    out
 }

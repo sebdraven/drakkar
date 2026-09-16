@@ -94,3 +94,4 @@ Thumbs.db
 !.env.example
 *.pem
 *.key
+out_orphans/
