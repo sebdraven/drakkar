@@ -65,6 +65,10 @@ pub fn parse_apk(path: &Path) -> Result<ParsedApk> {
         }
     }
 
+    // La hiérarchie de classes n'existe qu'une fois tous les DEX lus : un
+    // multidex peut porter la super-classe dans un autre fichier que la sous-classe.
+    call_graph.set_supers(features.superclasses.clone());
+
     // ELF natifs : symboles des .so.
     for so_path in &entries.so_files {
         elf::extract(so_path, &mut features)
@@ -102,6 +106,7 @@ pub fn parse_dex(path: &Path) -> Result<ParsedApk> {
     for e in edges {
         call_graph.add_call(e.caller, e.callee, e.site);
     }
+    call_graph.set_supers(features.superclasses.clone());
 
     Ok(ParsedApk { features, call_graph })
 }
