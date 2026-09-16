@@ -40,6 +40,17 @@ pub fn extract(path: &Path, features: &mut ApkFeatures) -> Result<Vec<CallEdge>>
         };
         let class_name = class.jtype().type_descriptor().to_string();
 
+        // Hiérarchie : `super_class()` rend un ClassId, qui indexe les TypeId
+        // (mêmes alias d'entier) — d'où le `get_type` direct. Absent pour
+        // `Ljava/lang/Object;` seulement.
+        if let Some(sup) = class.super_class() {
+            if let Ok(t) = dex.get_type(sup) {
+                features
+                    .superclasses
+                    .insert(class_name.clone(), t.type_descriptor().to_string());
+            }
+        }
+
         for method in class.methods() {
             let caller = MethodRef {
                 class: class_name.clone(),
@@ -87,6 +98,7 @@ pub fn extract(path: &Path, features: &mut ApkFeatures) -> Result<Vec<CallEdge>>
         edges = edges.len(),
         methods = features.methods.len(),
         strings = features.strings.len(),
+        classes = features.superclasses.len(),
         "DEX extracted"
     );
     Ok(edges)
