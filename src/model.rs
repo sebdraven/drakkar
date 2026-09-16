@@ -1,5 +1,6 @@
 //! Modèle commun : features statiques extraites de l'APK.
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Référence de méthode au format smali-like : Lcom/foo/Bar;->baz(I)V
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -46,4 +47,10 @@ pub struct ApkFeatures {
     /// Sert à valider les entrypoints du CFG (un callback ne compte que si sa
     /// classe est un composant réellement déclaré).
     pub components: Vec<String>,
+    /// Hiérarchie de classes du DEX : descripteur -> super-classe immédiate.
+    /// Seules les classes DÉFINIES dans le DEX sont clés ; une chaîne s'arrête
+    /// donc d'elle-même en sortant de l'application (`Landroid/app/Service;`).
+    /// Relevée par `parser::dex::extract`, consommée par `CallGraph::entrypoints`
+    /// pour rattacher les composants à leurs super-classes et sous-classes.
+    pub superclasses: HashMap<String, String>,
 }
