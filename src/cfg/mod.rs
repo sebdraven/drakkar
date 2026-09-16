@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Callbacks de cycle de vie / framework qui servent de points d'entrée Android.
 /// Le framework les invoque ; ils ne sont pas appelés explicitement dans le code.
-const ENTRYPOINT_CALLBACKS: &[&str] = &[
+pub const ENTRYPOINT_CALLBACKS: &[&str] = &[
     // Composants
     "onCreate",
     "onStart",
@@ -112,6 +112,23 @@ impl CallGraph {
             .collect()
     }
 
+    /// Racines de repli quand aucun composant n'est déclaré (DEX brut sans
+    /// manifeste) : TOUT nœud dont le nom est un callback framework, quelle que
+    /// soit sa classe.
+    ///
+    /// Sur-approximation assumée — un `run` de SDK tiers ou une déclaration de
+    /// callee non définie dans le DEX (`Landroid/os/Handler;->handleMessage`)
+    /// deviennent racines. Elle est appliquée à l'identique sur tous les
+    /// échantillons mesurés sous ce régime, donc les taux d'orphelins restent
+    /// comparables entre eux ; ils ne le sont PAS avec ceux du régime manifest,
+    /// d'où la colonne `roots_mode` qui accompagne chaque mesure.
+    pub fn heuristic_entrypoints(&self) -> Vec<NodeIndex> {
+        self.graph
+            .node_indices()
+            .filter(|&n| ENTRYPOINT_CALLBACKS.contains(&self.graph[n].name.as_str()))
+            .collect()
+    }
+
     /// Cherche si une API (sous-chaîne de `class->name`) est atteignable depuis au
     /// moins un entrypoint validé par le manifest. Renvoie le statut + les chemins
     /// trouvés (un par entrypoint atteignant l'API), chaque chemin étant la liste
@@ -134,6 +151,124 @@ impl CallGraph {
             }
         }
         Reachability { reachable: !paths.is_empty(), paths }
+    }
+
+    /// Clôture dirigée R(M) : nœuds atteignables depuis au moins un entrypoint.
+    /// BFS avant multi-source. Le complément = les orphelins.
+    pub fn reachable_set(&self, entrypoints: &[NodeIndex]) -> HashSet<NodeIndex> {
+        let mut visited: HashSet<NodeIndex> = HashSet::new();
+        let mut queue: VecDeque<NodeIndex> = VecDeque::new();
+        for &e in entrypoints {
+            if visited.insert(e) {
+                queue.push_back(e);
+            }
+        }
+        while let Some(cur) = queue.pop_front() {
+            for nb in self.graph.neighbors_directed(cur, Direction::Outgoing) {
+                if visited.insert(nb) {
+                    queue.push_back(nb);
+                }
+            }
+        }
+        visited
+    }
+
+    /// Résout des racines `(classe, méthode)` en nœuds du graphe. Les nœuds sont
+    /// keyés sur `api()` en interne ; on matche ici sur les champs `class`/`name`
+    /// pour ne pas dépendre du format d'`api()`. Sert à réinjecter les handlers UI
+    /// (`ui_callbacks`) comme racines supplémentaires avant `orphan_audit`.
+    pub fn nodes_for(&self, roots: &[(String, String)]) -> Vec<NodeIndex> {
+        let want: HashSet<(&str, &str)> =
+            roots.iter().map(|(c, m)| (c.as_str(), m.as_str())).collect();
+        self.graph
+            .node_indices()
+            .filter(|&n| {
+                let m = &self.graph[n];
+                want.contains(&(m.class.as_str(), m.name.as_str()))
+            })
+            .collect()
+    }
+
+    /// Nœuds `<clinit>` : initialiseurs statiques, exécutés par le runtime au
+    /// chargement de leur classe — donc des racines implicites, jamais appelées
+    /// par le code. À unir aux entrypoints avant `orphan_audit`, sinon toute la
+    /// sous-arborescence d'init ressort orpheline en un bloc.
+    pub fn clinit_nodes(&self) -> Vec<NodeIndex> {
+        self.graph
+            .node_indices()
+            .filter(|&n| self.graph[n].name == "<clinit>")
+            .collect()
+    }
+
+    /// Partitionne les nœuds hors R(M) en composantes faiblement connexes.
+    /// Décision d'orphelinage = atteignabilité DIRIGÉE ; la WCC ne sert qu'à
+    /// grouper/décrire. `crossing_api` (sous-chaîne, ex. "loadLibrary") marque
+    /// les îlots contenant le franchissement — vide pour ne rien marquer.
+    pub fn orphan_audit(&self, entrypoints: &[NodeIndex], crossing_api: &str) -> OrphanReport {
+        let reachable = self.reachable_set(entrypoints);
+        let labels = self.wcc_labels();
+
+        let mut by_wcc: HashMap<usize, Vec<NodeIndex>> = HashMap::new();
+        for n in self.graph.node_indices() {
+            if !reachable.contains(&n) {
+                by_wcc.entry(labels[n.index()]).or_default().push(n);
+            }
+        }
+
+        let mut islands: Vec<OrphanIsland> = Vec::new();
+        for nodes in by_wcc.into_values() {
+            let mut roots: Vec<String> = Vec::new();
+            let mut author_nodes = 0usize;
+            let mut touches = false;
+            let mut by_prefix: HashMap<&str, usize> = HashMap::new();
+            for &n in &nodes {
+                let m = &self.graph[n];
+                *by_prefix.entry(package_prefix(&m.class)).or_insert(0) += 1;
+                if !is_allowlisted_pkg(&m.class) {
+                    author_nodes += 1;
+                }
+                if !crossing_api.is_empty() && m.api().contains(crossing_api) {
+                    touches = true;
+                }
+                // Degré entrant nul = aucun appelant dans tout le graphe = racine
+                // implicite (callback semé par le framework, pas par le code).
+                if self
+                    .graph
+                    .neighbors_directed(n, Direction::Incoming)
+                    .next()
+                    .is_none()
+                {
+                    roots.push(m.signature());
+                }
+            }
+            roots.sort();
+            // Comptage décroissant, nom croissant à égalité (ordre stable).
+            let mut prefix_histogram: Vec<(String, usize)> = by_prefix
+                .into_iter()
+                .map(|(p, c)| (p.to_string(), c))
+                .collect();
+            prefix_histogram.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            islands.push(OrphanIsland {
+                size: nodes.len(),
+                author_nodes,
+                touches_crossing: touches,
+                prefix_histogram,
+                roots,
+            });
+        }
+        islands.sort_by(|a, b| {
+            b.touches_crossing
+                .cmp(&a.touches_crossing)
+                .then(b.size.cmp(&a.size))
+        });
+
+        let orphan = self.graph.node_count() - reachable.len();
+        OrphanReport {
+            total_nodes: self.graph.node_count(),
+            reachable: reachable.len(),
+            orphan,
+            islands,
+        }
     }
 
     /// Co-atteignabilité : existe-t-il un nœud « pivot » d'où partent deux chemins
@@ -513,6 +648,34 @@ pub struct Reachability {
     pub paths: Vec<Vec<String>>,
 }
 
+/// Résultat d'`orphan_audit` : nœuds hors R(M), groupés en composantes.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OrphanReport {
+    pub total_nodes: usize,
+    pub reachable: usize,
+    pub orphan: usize,
+    pub islands: Vec<OrphanIsland>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OrphanIsland {
+    pub size: usize,
+    /// Nombre de nœuds hors SDK tiers catalogué (code d'auteur probable). La
+    /// PROPORTION author_nodes/size distingue un vrai îlot d'auteur d'un îlot
+    /// tiers pollué par quelques nœuds — un OU booléen basculait tout un
+    /// méga-îlot en « auteur » dès un seul nœud non catalogué.
+    pub author_nodes: usize,
+    /// Contient le franchissement recherché (ex. System.loadLibrary).
+    pub touches_crossing: bool,
+    /// De quoi l'îlot est FAIT : ses nœuds comptés par préfixe de package,
+    /// comptage décroissant. Sur un méga-îlot de plusieurs milliers de nœuds,
+    /// ni la taille ni la liste des racines ne disent s'il s'agit du code
+    /// d'auteur, d'un SDK non catalogué ou d'un mélange — cette distribution si.
+    pub prefix_histogram: Vec<(String, usize)>,
+    /// Nœuds de degré entrant nul — les racines implicites de l'îlot.
+    pub roots: Vec<String>,
+}
+
 /// Contraintes de qualification du pivot pour `reaches_both`. Les trois sont
 /// combinables ; leurs valeurs proviennent de la règle (feature `co-reachable`).
 #[derive(Debug, Clone)]
@@ -599,6 +762,8 @@ const BENIGN_SDK_PREFIXES: &[&str] = &[
     "Lcom/google/android/exoplayer2/",
     "Lcom/google/firebase/",
     "Landroidx/",
+    "Landroid/support/",
+    "Lhelper/sqlite/",
     "Lcom/ironsource/",
     "Lcom/unity3d/",
     "Lokhttp3/",
@@ -612,6 +777,26 @@ const BENIGN_SDK_PREFIXES: &[&str] = &[
 
 fn is_allowlisted_pkg(class: &str) -> bool {
     BENIGN_SDK_PREFIXES.iter().any(|p| class.starts_with(p))
+}
+
+/// Préfixe de package d'un descripteur Dalvik : au plus les 3 premiers
+/// segments, nom de classe exclu — `Lorg/xmlpush/v3/PushService;` ->
+/// `Lorg/xmlpush/v3`, `Lcom/x/Foo$1;` -> `Lcom/x`. Une classe sans package
+/// (`LFoo;`) est son propre préfixe.
+///
+/// Granularité volontairement grossière : on cherche à nommer les gros blocs
+/// d'un îlot, pas à cataloguer ses paquets feuille.
+fn package_prefix(class: &str) -> &str {
+    let trimmed = class.strip_suffix(';').unwrap_or(class);
+    let mut end = 0;
+    for (i, _) in trimmed.match_indices('/').take(3) {
+        end = i;
+    }
+    if end == 0 {
+        trimmed
+    } else {
+        &trimmed[..end]
+    }
 }
 
 /// Nœuds appartenant à la WCC `wid` (selon la labellisation `wcc_labels`).
@@ -656,5 +841,21 @@ fn xorshift64(state: &mut u64) -> u64 {
 impl Default for CallGraph {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::package_prefix;
+
+    #[test]
+    fn prefix_stops_before_class_name() {
+        assert_eq!(package_prefix("Lorg/xmlpush/v3/PushService;"), "Lorg/xmlpush/v3");
+        assert_eq!(package_prefix("Lhelper/sqlite/database/DbHelper;"), "Lhelper/sqlite/database");
+        // Au-delà de 3 segments, on tronque.
+        assert_eq!(package_prefix("Lcom/google/android/gms/ads/Foo;"), "Lcom/google/android");
+        // Moins de 3 segments : le nom de classe reste exclu.
+        assert_eq!(package_prefix("Lcom/x/Foo$1;"), "Lcom/x");
+        assert_eq!(package_prefix("LFoo;"), "LFoo");
     }
 }
