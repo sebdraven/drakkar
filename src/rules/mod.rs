@@ -38,6 +38,14 @@ pub struct Evidence {
     /// calibration de seuil en post-traitement.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
+    /// Pour les preuves API : sauts min entrypoint -> API (-1 si non atteignable).
+    /// None pour les preuves non-API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<i64>,
+    /// Pour les preuves API : nombre de call-sites appelant directement l'API.
+    /// None pour les preuves non-API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fanin: Option<usize>,
     /// Chemins entrypoint -> ... -> API (vide si non atteignable ou non-API).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<Vec<String>>,
@@ -46,11 +54,27 @@ pub struct Evidence {
 impl Evidence {
     /// Preuve non-API (permission, string, service…) : pas de reachability.
     fn simple(kind: &str, value: String) -> Self {
-        Evidence { kind: kind.into(), value, reachable: None, score: None, paths: Vec::new() }
+        Evidence {
+            kind: kind.into(),
+            value,
+            reachable: None,
+            score: None,
+            depth: None,
+            fanin: None,
+            paths: Vec::new(),
+        }
     }
     /// Preuve API : reachability calculée ultérieurement (enrich_reachability).
     fn api(value: String) -> Self {
-        Evidence { kind: "api".into(), value, reachable: None, score: None, paths: Vec::new() }
+        Evidence {
+            kind: "api".into(),
+            value,
+            reachable: None,
+            score: None,
+            depth: None,
+            fanin: None,
+            paths: Vec::new(),
+        }
     }
 }
 
@@ -102,6 +126,11 @@ impl Engine {
                         let reach = cg.reachability(&e.value, &entrypoints);
                         e.reachable = Some(reach.reachable);
                         e.paths = reach.paths;
+                        // Profondeur min racine->API (-1 si non atteignable) et fan-in
+                        // call-site : à combien de sauts et depuis combien d'appels.
+                        e.depth =
+                            Some(cg.min_depth(&e.value, &entrypoints).map_or(-1, |d| d as i64));
+                        e.fanin = Some(cg.fan_in(&e.value));
                     }
                 }
                 out.push(Match {
@@ -186,6 +215,8 @@ fn eval(
                         None => format!("{first} + {second}"),
                     },
                     reachable: Some(true),
+                    depth: None,
+                    fanin: None,
                     score: None,
                     paths: vec![cr.path_first, cr.path_second]
                         .into_iter()
@@ -230,6 +261,8 @@ fn eval(
                         ),
                     },
                     reachable: Some(true),
+                    depth: None,
+                    fanin: None,
                     score: Some(intim.score),
                     paths: vec![intim.path_first, intim.path_second]
                         .into_iter()
