@@ -29,6 +29,7 @@ pub mod manifest;
 pub mod manifest_info;
 pub mod native_arch;
 pub mod native_extract;
+pub mod reflection_inputs;
 pub mod resource_xref;
 pub mod ui_callbacks;
 
