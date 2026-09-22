@@ -31,7 +31,9 @@
 //! # Limites assumées
 //!
 //! - pas de `resources.arsc` : une valeur qui référence une ressource sort sous
-//!   sa forme numérique (`@0x7f0a0001`), jamais résolue ;
+//!   sa forme numérique (`@0x7f0a0001`), jamais résolue. Depuis
+//!   [`super::arsc`], l'identifiant peut être résolu à la main
+//!   (`--resource-id`), mais le décodage du manifeste ne fait pas la jointure ;
 //! - le CDATA est écarté, aucun consommateur ne le lit ;
 //! - la profondeur d'imbrication est plafonnée à [`MAX_DEPTH`] : au-delà, le
 //!   sous-arbre est écarté ;
@@ -448,13 +450,16 @@ fn typed_value(data_type: u8, data: u32, pool: &StringPool) -> String {
 /// Pool de chaînes borné : tout accès hors limites rend `None` au lieu de
 /// paniquer. `None` couvre aussi bien l'index absent que la chaîne dont l'offset
 /// ou la longueur sortait du pool.
+///
+/// Partagé avec [`super::arsc`] : `resources.arsc` porte exactement le même
+/// chunk `RES_STRING_POOL_TYPE`, aux mêmes offsets et au même drapeau UTF-8.
 #[derive(Default)]
-struct StringPool {
+pub(crate) struct StringPool {
     strings: Vec<Option<String>>,
 }
 
 impl StringPool {
-    fn parse(chunk: &[u8]) -> Self {
+    pub(crate) fn parse(chunk: &[u8]) -> Self {
         let header_size = u16_at(chunk, 2).unwrap_or(0) as usize;
         let declared = u32_at(chunk, 8).unwrap_or(0) as usize;
         let flags = u32_at(chunk, 16).unwrap_or(0);
@@ -501,22 +506,22 @@ impl StringPool {
         Self { strings }
     }
 
-    fn get(&self, index: u32) -> Option<&str> {
+    pub(crate) fn get(&self, index: u32) -> Option<&str> {
         if index == u32::MAX {
             return None;
         }
         self.strings.get(index as usize)?.as_deref()
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.strings.len()
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.strings.is_empty()
     }
 
-    fn unreadable(&self) -> usize {
+    pub(crate) fn unreadable(&self) -> usize {
         self.strings.iter().filter(|s| s.is_none()).count()
     }
 }
