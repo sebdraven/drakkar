@@ -396,8 +396,7 @@ fn is_application_class(descriptor: &str, opts: &DiffOptions) -> bool {
 
 /// Parse un DEX et accumule les ClassPrint des classes applicatives.
 fn collect_from_dex(path: &Path, opts: &DiffOptions, out: &mut Vec<ClassPrint>) -> Result<()> {
-    let dex = dex::DexReader::from_file(path)
-        .with_context(|| format!("open dex {}", path.display()))?;
+    let dex = crate::parser::dex_facade::DexBin::open(path)?;
 
     for class in dex.classes() {
         let class = match class {
@@ -407,20 +406,19 @@ fn collect_from_dex(path: &Path, opts: &DiffOptions, out: &mut Vec<ClassPrint>) 
                 continue;
             }
         };
-        let name = class.jtype().type_descriptor().to_string();
+        let name = class.descriptor.to_string();
         if !is_application_class(&name, opts) {
             continue;
         }
 
         let mut method_seq = Vec::new();
-        for method in class.methods() {
+        for method in &class.methods {
             // Pas de code pour abstract / native : rien à empreindre.
-            let code = match method.code() {
+            let code = match &method.code {
                 Some(c) => c,
                 None => continue,
             };
-            let bytes = u16_to_le_bytes(code.insns());
-            let instructions = match dex_bytecode::decode_all(&bytes, 0) {
+            let instructions = match dex_bytecode::decode_all(code.insns, 0) {
                 Ok(i) => i,
                 Err(e) => {
                     tracing::warn!(class = %name, error = %e, "decode failed");
@@ -507,15 +505,6 @@ fn extract_dexes(apk: &Path, out_dir: &Path) -> Result<Vec<PathBuf>> {
         out.push(dest);
     }
     Ok(out)
-}
-
-/// Code units (u16) → octets little-endian (format attendu par dex-bytecode).
-fn u16_to_le_bytes(insns: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(insns.len() * 2);
-    for &u in insns {
-        out.extend_from_slice(&u.to_le_bytes());
-    }
-    out
 }
 
 /// Légende des mesures (mode `--diff-dex --legend`).

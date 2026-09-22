@@ -17,13 +17,10 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# DEX parsing structurel (stable, crates.io) : classes -> methods -> code_item
-# MIT. Remplacé par dex-parser au commit suivant.
-dex = "0.5"
-
-# DEX parsing structurel, remplaçant de `dex` 0.5. Apache-2.0, compatible en
-# aval avec l'AGPL-3.0-or-later de Drakkar. Le paquet vit dans le
+# DEX parsing structurel : classes -> methods -> code_item. Apache-2.0,
+# compatible en aval avec l'AGPL-3.0-or-later de Drakkar. Le paquet vit dans le
 # sous-répertoire dexparser-rs/ du dépôt, qui n'a pas de Cargo.toml à sa racine.
+# Consommé UNIQUEMENT par parser::dex_facade.
 dex-parser = { git = "https://github.com/androguard/dex-parser" }
 
 # Lecture de l'archive APK (zip) pour extraire classes*.dex et lib/*/*.so

@@ -1,8 +1,9 @@
 //! Parsing APK -> ApkFeatures + CallGraph.
 //!
-//! Un APK est une archive zip : on extrait les `classes*.dex` (parsés par le
-//! crate `dex` + `dex-bytecode`) et les `lib/*/*.so` (parsés par LIEF, derrière
-//! la feature `lief-backend`). Le manifest binaire est traité par `manifest`.
+//! Un APK est une archive zip : on extrait les `classes*.dex` (parsés via
+//! `dex_facade` + `dex-bytecode`) et les `lib/*/*.so` (parsés par LIEF,
+//! derrière la feature `lief-backend`). Le manifest binaire est traité par
+//! `manifest`.
 //!
 //! Certaines familles trafiquent la structure ZIP pour casser les outils sans
 //! gêner l'installation par Android. Quand le crate `zip` refuse l'archive, on
@@ -16,6 +17,7 @@ pub mod axml;
 pub mod cert;
 pub mod dating;
 pub mod dex;
+pub mod dex_facade;
 pub mod dex_strings;
 pub mod diff_dex;
 pub mod diff_explain;

@@ -152,7 +152,7 @@ fn load(path: &Path, opts: &MatrixOptions) -> Result<Sample> {
     let mut methods = 0usize;
 
     for dp in &dex_paths {
-        let dex = match dex::DexReader::from_file(dp) {
+        let dex = match crate::parser::dex_facade::DexBin::open(dp) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(sample = %name, error = %e, "dex illisible, ignoré");
@@ -161,18 +161,14 @@ fn load(path: &Path, opts: &MatrixOptions) -> Result<Sample> {
         };
         for class in dex.classes() {
             let Ok(class) = class else { continue };
-            let descriptor = normalize(
-                &class.jtype().type_descriptor().to_string(),
-                &opts.normalize,
-            );
+            let descriptor = normalize(class.descriptor, &opts.normalize);
             if !is_application_class(&descriptor) {
                 continue;
             }
             classes += 1;
-            for method in class.methods() {
-                let Some(code) = method.code() else { continue };
-                let bytes = u16_to_le_bytes(code.insns());
-                let Ok(instructions) = dex_bytecode::decode_all(&bytes, 0) else {
+            for method in &class.methods {
+                let Some(code) = &method.code else { continue };
+                let Ok(instructions) = dex_bytecode::decode_all(code.insns, 0) else {
                     continue;
                 };
                 let mut h = DefaultHasher::new();
@@ -395,14 +391,6 @@ fn collect_dex_paths(input: &Path) -> Result<(Vec<PathBuf>, Option<tempfile::Tem
         return Ok((paths, Some(tmp)));
     }
     bail!("{} n'est ni un DEX ni un APK", input.display())
-}
-
-fn u16_to_le_bytes(insns: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(insns.len() * 2);
-    for &u in insns {
-        out.extend_from_slice(&u.to_le_bytes());
-    }
-    out
 }
 
 // ── Rendu ────────────────────────────────────────────────────────────────────

@@ -2,15 +2,13 @@
 //!
 //! POURQUOI UN PARSEUR MAISON
 //! --------------------------
-//! Le crate `dex` n'expose pas d'itérateur documenté sur `string_ids`, et le
-//! format est trivial. Le faire à la main a deux avantages concrets :
-//!
-//!   1. **Aucun pari sur une API** — le reste du module `parser` a déjà payé le
-//!      prix de suppositions non vérifiées.
-//!   2. **Ça marche sur un DEX ABÎMÉ.** Les dumps mémoire Frida des échantillons
-//!      packés (SecNeo) ont souvent un en-tête reconstruit à la main et des
-//!      sections tronquées ; un parseur complet refuse de les ouvrir, celui-ci
-//!      lit ce qu'il peut et signale le reste.
+//! **Ça marche sur un DEX ABÎMÉ.** Les dumps mémoire Frida des échantillons
+//! packés (SecNeo) ont souvent un en-tête reconstruit à la main et des sections
+//! tronquées. `dex_facade` s'appuie sur `DexFile::parse`, qui matérialise d'un
+//! coup `string_ids`, `type_ids`, `proto_ids`, `field_ids` et `method_ids` et
+//! rend `Err` sur la première table qui déborde : le fichier entier est perdu.
+//! Celui-ci lit entrée par entrée, rend ce qu'il peut et compte le reste dans
+//! `unreadable`.
 //!
 //! FORMAT
 //! ------

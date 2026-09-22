@@ -733,8 +733,7 @@ fn load(input: &Path, opts: &ExplainOptions) -> Result<(Vec<ClassRich>, Option<t
 }
 
 fn collect_from_dex(path: &Path, opts: &ExplainOptions, out: &mut Vec<ClassRich>) -> Result<()> {
-    let dex = dex::DexReader::from_file(path)
-        .with_context(|| format!("open dex {}", path.display()))?;
+    let dex = crate::parser::dex_facade::DexBin::open(path)?;
 
     for class in dex.classes() {
         let class = match class {
@@ -744,17 +743,16 @@ fn collect_from_dex(path: &Path, opts: &ExplainOptions, out: &mut Vec<ClassRich>
                 continue;
             }
         };
-        let raw = class.jtype().type_descriptor().to_string();
+        let raw = class.descriptor.to_string();
         if !included(&raw, &opts.include_prefixes) {
             continue;
         }
 
         let mut methods = Vec::new();
-        for method in class.methods() {
-            let Some(code) = method.code() else { continue };
+        for method in &class.methods {
+            let Some(code) = &method.code else { continue };
 
-            let bytes = u16_to_le_bytes(code.insns());
-            let instructions = match dex_bytecode::decode_all(&bytes, 0) {
+            let instructions = match dex_bytecode::decode_all(code.insns, 0) {
                 Ok(i) => i,
                 Err(e) => {
                     tracing::warn!(class = %raw, error = %e, "decode failed");
@@ -782,7 +780,7 @@ fn collect_from_dex(path: &Path, opts: &ExplainOptions, out: &mut Vec<ClassRich>
                 .collect();
 
             methods.push(MethodRich {
-                name: method.name().to_string(),
+                name: method.name.to_string(),
                 fingerprint,
                 slots,
             });
@@ -863,14 +861,6 @@ fn collect_dex_paths(input: &Path) -> Result<(Vec<PathBuf>, Option<tempfile::Tem
         input.display(),
         &magic[0..4]
     )
-}
-
-fn u16_to_le_bytes(insns: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(insns.len() * 2);
-    for &u in insns {
-        out.extend_from_slice(&u.to_le_bytes());
-    }
-    out
 }
 
 // ── Rendu ────────────────────────────────────────────────────────────────────
