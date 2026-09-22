@@ -10,6 +10,7 @@
 //! même motif vaut pour le manifest binaire : `axml` prend le relais quand
 //! `axmldecoder` refuse ou panique.
 pub mod apkzip;
+pub mod arsc;
 pub mod assets;
 pub mod axml;
 pub mod cert;
@@ -28,6 +29,7 @@ pub mod manifest;
 pub mod manifest_info;
 pub mod native_arch;
 pub mod native_extract;
+pub mod resource_xref;
 pub mod ui_callbacks;
 
 use crate::cfg::CallGraph;
