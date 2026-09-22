@@ -210,6 +210,44 @@ struct Cli {
     #[arg(long, value_name = "MOTIF", num_args = 0..)]
     strings: Option<Vec<String>>,
 
+    /// Résout un NOM de ressource (la clé de `R.<type>.<nom>`) en type,
+    /// identifiant et valeur, en lisant `resources.arsc`. Répétable. Un même nom
+    /// peut exister dans plusieurs types : toutes les correspondances sortent.
+    /// Sortie TSV : sample, type, nom, id en hexadécimal, valeur. Single ou bulk
+    /// (--bulk DIR), --format json disponible.
+    #[arg(long, value_name = "NOM")]
+    resource: Vec<String>,
+
+    /// Résout un IDENTIFIANT de ressource en type, nom et valeur. Trois formes
+    /// acceptées : 0x7f110228, 7f110228, 2131886120 — une suite de chiffres est
+    /// lue en décimal puis en hexadécimal, et la lecture qui résout est retenue.
+    /// Répétable. Même sortie que --resource. Single ou bulk.
+    #[arg(long, value_name = "ID")]
+    resource_id: Vec<String>,
+
+    /// Dump de la table des ressources, nom vers valeur. Sans argument : tout.
+    /// Avec un ou plusieurs types (répéter l'option) : seulement ceux-là
+    /// (string, layout, drawable, id…). Sortie TSV : sample, type, nom, id en
+    /// hexadécimal, valeur. Single ou bulk.
+    #[arg(long, value_name = "TYPE", num_args = 0.., conflicts_with_all = ["resource", "resource_id"])]
+    resources: Option<Vec<String>>,
+
+    /// Jointure DEX -> ressources : balaye les constantes entières des
+    /// classes*.dex dans la plage des packages de la table, ne retient que
+    /// celles qui désignent une entrée RÉELLE, et rend une ligne par usage —
+    /// classe, méthode, offset, id, type, nom, valeur, origine, consommateur.
+    /// Le résumé de fin de passe donne de quoi encadrer le taux de faux
+    /// positifs (--resource-xref --legend). Single ou bulk.
+    #[arg(long, conflicts_with_all = ["resource", "resource_id", "resources"])]
+    resource_xref: bool,
+
+    /// Ressources qu'AUCUNE constante du DEX ne référence. « Orpheline » veut
+    /// dire NON RÉFÉRENCÉE DEPUIS LE CODE, jamais « inutilisée » : une ressource
+    /// citée par un layout, un style ou le manifeste est orpheline ici tout en
+    /// étant parfaitement utilisée. Même sortie TSV que --resources. Single ou bulk.
+    #[arg(long, conflicts_with_all = ["resource", "resource_id", "resources", "resource_xref"])]
+    resource_orphans: bool,
+
     /// Inventaire complet du AndroidManifest.xml (permissions, composants,
     /// intent-filters, points d'entrée dérivés) puis sort. Fonctionne en single
     /// (APK en argument) comme en bulk (--bulk DIR).
@@ -423,6 +461,11 @@ fn main() -> Result<()> {
     // correspondance universelle.
     let assets_mode =
         cli.list_assets || cli.extract_assets.is_some() || cli.assets_fingerprint;
+    let resource_mode = !cli.resource.is_empty()
+        || !cli.resource_id.is_empty()
+        || cli.resources.is_some()
+        || cli.resource_xref
+        || cli.resource_orphans;
     let assets_tuning = !cli.assets_include.is_empty()
         || cli.assets_max_size.is_some()
         || !cli.assets_hash.is_empty()
@@ -730,6 +773,64 @@ est racine — ne pas comparer à une mesure `manifest`)",
                 hits
             );
         }
+        return Ok(());
+    }
+
+    // Sortie rapide : table des ressources (resources.arsc) et jointure vers le
+    // DEX. Ne charge ni catalogue MITRE ni moteur de règles. Une passe sur
+    // l'archive pour la table, une seconde sur les classes*.dex pour la
+    // jointure — cette dernière seulement si elle est demandée.
+    if resource_mode {
+        if cli.legend {
+            println!("{}", parser::arsc::legend());
+            println!("\n{}", parser::resource_xref::legend());
+            return Ok(());
+        }
+        if cli.format == Format::Csv {
+            bail!(
+                "--format csv n'existe pas pour les sorties ressources : la table est \
+                 déjà plate, utiliser text (TSV, par défaut) ou json"
+            );
+        }
+        check_json_dest(cli.format, cli.json_out.as_deref())?;
+
+        let mode = if cli.resource_xref {
+            ResourceOutput::Xref
+        } else if cli.resource_orphans {
+            ResourceOutput::Orphans
+        } else if let Some(types) = &cli.resources {
+            ResourceOutput::Dump(types.clone())
+        } else {
+            ResourceOutput::Lookup {
+                names: cli.resource.clone(),
+                ids: cli.resource_id.clone(),
+            }
+        };
+
+        // Un DEX brut n'a pas d'archive, donc pas de resources.arsc : seuls les
+        // APK sont recevables ici, contrairement à --strings ou --orphan-audit.
+        let (inputs, rejected, bulk_mode) = match (&cli.apk, &cli.bulk) {
+            (Some(apk), None) => (vec![apk.clone()], Vec::new(), false),
+            (None, Some(dir)) => {
+                let found = bulk::collect_apks(dir, cli.recursive)?;
+                if found.apks.is_empty() && found.rejected.is_empty() {
+                    bail!("aucun APK trouvé dans {}", dir.display());
+                }
+                (found.apks, found.rejected, true)
+            }
+            _ => bail!(
+                "les options --resource* requièrent soit un APK (single), soit --bulk <DIR>"
+            ),
+        };
+
+        run_resources(
+            &inputs,
+            &rejected,
+            &mode,
+            bulk_mode,
+            cli.format,
+            cli.json_out.as_deref(),
+        )?;
         return Ok(());
     }
 
@@ -1818,6 +1919,290 @@ fn run_assets(
         index.failed.len(),
         total_not_evaluated
     );
+    Ok(())
+}
+
+/// Ce que la passe ressources émet. Les formes sont disjointes : l'en-tête TSV
+/// doit décrire exactement les colonnes produites.
+enum ResourceOutput {
+    /// `--resource` et/ou `--resource-id` : résolution ciblée.
+    Lookup { names: Vec<String>, ids: Vec<String> },
+    /// `--resources [TYPE…]` : dump, filtrable par type.
+    Dump(Vec<String>),
+    /// `--resource-xref` : une ligne par usage depuis le code.
+    Xref,
+    /// `--resource-orphans` : entrées qu'aucune constante du DEX ne cite.
+    Orphans,
+}
+
+/// Lecture de `resources.arsc`, résolutions et jointure vers le DEX.
+///
+/// stdout ne porte que le TSV (ou le JSON) ; résumés, anomalies de parsing,
+/// correspondances manquantes et échantillons illisibles partent sur stderr,
+/// pour que `| awk` et `> fichier` restent utilisables.
+fn run_resources(
+    inputs: &[PathBuf],
+    rejected: &[(PathBuf, String)],
+    mode: &ResourceOutput,
+    bulk_mode: bool,
+    format: Format,
+    json_out: Option<&std::path::Path>,
+) -> Result<()> {
+    use drakkar::parser::{arsc, resource_xref};
+
+    let needs_xref = matches!(mode, ResourceOutput::Xref | ResourceOutput::Orphans);
+    let mut payloads: Vec<serde_json::Value> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    let mut emitted = 0usize;
+
+    if format.wants_text() {
+        match mode {
+            ResourceOutput::Xref => println!(
+                "sample\tclasse\tmethode\toffset\tid\ttype\tnom\tvaleur\torigine\tconsommateur"
+            ),
+            _ => println!("sample\ttype\tnom\tid\tvaleur"),
+        }
+    }
+
+    // Un fichier à signature ZIP dont aucun lecteur n'a tiré de manifest est
+    // nommé, pas écarté en silence.
+    for (path, why) in rejected {
+        eprintln!("[FAIL]  {}  — non reconnu comme APK : {why}", path.display());
+        failures.push(format!("{} : non reconnu comme APK : {why}", path.display()));
+    }
+
+    for apk in inputs {
+        let sample = stem_of(apk);
+
+        // Une table trafiquée peut faire paniquer un décodeur : on isole pour
+        // qu'un échantillon ne tue pas le lot.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let table = arsc::extract(apk)?;
+            let xref = if needs_xref {
+                Some(resource_xref::scan(apk, &table)?)
+            } else {
+                None
+            };
+            Ok::<_, anyhow::Error>((table, xref))
+        }));
+        let (table, xref) = match outcome {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                eprintln!("[FAIL]  {sample} — {e:#}");
+                failures.push(format!("{sample} : {e:#}"));
+                continue;
+            }
+            Err(_) => {
+                eprintln!("[PANIC] {sample} — lecture des ressources abandonnée");
+                failures.push(format!("{sample} : panique pendant la lecture des ressources"));
+                continue;
+            }
+        };
+
+        for a in &table.anomalies {
+            eprintln!("[NOTE]  {sample} — {a}");
+        }
+        let packages: Vec<String> = table
+            .packages
+            .iter()
+            .map(|p| format!("{:#04x}={}", p.id, if p.name.is_empty() { "?" } else { p.name.as_str() }))
+            .collect();
+
+        if let Some(xref) = &xref {
+            let st = &xref.stats;
+            eprintln!(
+                "[XREF]  {sample} — entiers {} -> candidats {} -> retenus {} | rejetes {} \
+                 ({:.1}% des candidats, {} valeurs distinctes) | sget {} (sur {} champs R \
+                 indexes) | defs_R {} | corrobores {} ({:.1}%) -> faux positifs residuels \
+                 <= {:.1}%",
+                st.integers,
+                st.candidates,
+                st.matched,
+                st.rejected,
+                st.rejection_rate(),
+                st.distinct_rejected,
+                st.via_static_field,
+                st.static_fields_indexed,
+                st.r_class_defs,
+                st.corroborated,
+                st.corroboration_rate(),
+                st.residual_fp_bound()
+            );
+        }
+
+        // Sélection des entrées à émettre, selon le mode.
+        let mut selected: Vec<&arsc::ResourceEntry> = Vec::new();
+        match mode {
+            ResourceOutput::Lookup { names, ids } => {
+                let mut seen = std::collections::HashSet::new();
+                for name in names {
+                    let hits = table.by_name(name);
+                    if hits.is_empty() {
+                        eprintln!("[MISS]  {sample} — nom absent de la table : {name}");
+                    }
+                    for e in hits {
+                        if seen.insert(e.id) {
+                            selected.push(e);
+                        }
+                    }
+                }
+                for spec in ids {
+                    let candidates = arsc::parse_id_candidates(spec);
+                    match candidates.iter().find_map(|id| table.by_id(*id)) {
+                        Some(e) => {
+                            if seen.insert(e.id) {
+                                selected.push(e);
+                            }
+                        }
+                        None => eprintln!(
+                            "[MISS]  {sample} — identifiant absent de la table : {spec} \
+                             (lu comme {})",
+                            candidates
+                                .iter()
+                                .map(|v| format!("{v:#010x}"))
+                                .collect::<Vec<_>>()
+                                .join(" ou ")
+                        ),
+                    }
+                }
+            }
+            ResourceOutput::Dump(types) => {
+                let wanted: Vec<String> = types.iter().map(|t| t.to_lowercase()).collect();
+                selected = table
+                    .entries
+                    .iter()
+                    .filter(|e| {
+                        wanted.is_empty() || wanted.contains(&e.type_name.to_lowercase())
+                    })
+                    .collect();
+                if !wanted.is_empty() && selected.is_empty() {
+                    eprintln!(
+                        "[MISS]  {sample} — aucun type parmi {} ; types presents : {}",
+                        wanted.join(", "),
+                        table.type_names().join(", ")
+                    );
+                }
+            }
+            ResourceOutput::Orphans => {
+                if let Some(x) = &xref {
+                    selected = resource_xref::orphans(&table, x);
+                }
+            }
+            ResourceOutput::Xref => {}
+        }
+
+        if format.wants_text() {
+            match (mode, &xref) {
+                (ResourceOutput::Xref, Some(x)) => {
+                    for u in &x.uses {
+                        println!(
+                            "{}\t{}\t{}\t+{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            sample,
+                            u.class,
+                            u.method,
+                            u.site,
+                            u.id_hex(),
+                            u.type_name,
+                            u.name,
+                            u.value_tsv(),
+                            u.origin.as_str(),
+                            u.consumer.as_deref().unwrap_or("")
+                        );
+                    }
+                }
+                _ => {
+                    for e in &selected {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}",
+                            sample,
+                            e.type_name,
+                            e.name,
+                            e.id_hex(),
+                            e.value_tsv()
+                        );
+                    }
+                }
+            }
+        }
+
+        if format.wants_json() {
+            let mut payload = serde_json::json!({
+                "sample": sample,
+                "path": apk.display().to_string(),
+                "packages": table.packages,
+                "entries_total": table.entries.len(),
+                "global_strings": table.global_strings,
+                "anomalies": table.anomalies,
+            });
+            match (mode, &xref) {
+                (ResourceOutput::Xref, Some(x)) => {
+                    payload["stats"] = serde_json::to_value(&x.stats)?;
+                    payload["uses"] = serde_json::to_value(&x.uses)?;
+                }
+                (ResourceOutput::Orphans, Some(x)) => {
+                    payload["stats"] = serde_json::to_value(&x.stats)?;
+                    payload["orphans"] = serde_json::to_value(&selected)?;
+                }
+                _ => payload["entries"] = serde_json::to_value(&selected)?,
+            }
+            payloads.push(payload);
+        }
+
+        let lines = match (mode, &xref) {
+            (ResourceOutput::Xref, Some(x)) => x.uses.len(),
+            _ => selected.len(),
+        };
+        emitted += lines;
+        eprintln!(
+            "[OK]    {sample} — {lines} ligne(s) sur {} entree(s), package(s) {}, \
+             {} chaine(s) au pool global{}",
+            table.entries.len(),
+            packages.join(" "),
+            table.global_strings,
+            match mode {
+                ResourceOutput::Orphans => format!(
+                    ", soit {:.1}% de la table non referencee depuis le code",
+                    if table.entries.is_empty() {
+                        0.0
+                    } else {
+                        100.0 * lines as f64 / table.entries.len() as f64
+                    }
+                ),
+                _ => String::new(),
+            }
+        );
+    }
+
+    if format.wants_json() {
+        // En single, l'objet seul : `| jq .entries` doit marcher sans indexer
+        // un tableau d'un élément.
+        if bulk_mode {
+            emit_json(&payloads, json_out)?;
+        } else if let Some(p) = payloads.first() {
+            emit_json(p, json_out)?;
+        }
+    }
+
+    if matches!(mode, ResourceOutput::Orphans) {
+        eprintln!(
+            "[AVERT] « orpheline » veut dire NON REFERENCEE DEPUIS LE CODE, pas « inutilisee » : \
+             une ressource citee par un layout, un style, un theme ou le manifeste sort ici. \
+             Voir --resource-orphans --legend pour l'angle mort des APK non minifies."
+        );
+    }
+
+    eprintln!(
+        "[FIN]   {} echantillon(s) candidat(s), {} en echec, {emitted} ligne(s) emise(s)",
+        inputs.len() + rejected.len(),
+        failures.len()
+    );
+
+    // En single, un echec est l'echec de la commande : code de retour non nul.
+    if !bulk_mode {
+        if let Some(why) = failures.first() {
+            bail!("{why}");
+        }
+    }
     Ok(())
 }
 
