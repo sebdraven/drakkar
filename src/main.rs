@@ -186,6 +186,16 @@ struct Cli {
     #[arg(long)]
     dyn_entrypoints: bool,
 
+    /// MESURE (jetable) : d'où vient le NOM des cibles de réflexion ?
+    /// Classe chaque site Method.invoke / Class.forName / getMethod /
+    /// getDeclaredMethod selon la provenance de son registre-nom : const,
+    /// decrypt-const (déchiffreur à argument littéral, donc rejouable),
+    /// runtime, param, indirect, unknown. Le ratio decrypt-const/runtime dit si
+    /// un interpréteur Dalvik de déobfuscation vaut le coup. Accepte un APK ou
+    /// un DEX brut (reconnu au contenu). Single ou bulk (--bulk DIR), TSV, puis sort.
+    #[arg(long)]
+    reflection_inputs: bool,
+
     /// Audit d'orphelins : partitionne les méthodes NON atteignables depuis les
     /// entrypoints en composantes faiblement connexes, et marque celles qui
     /// contiennent System.loadLibrary. Mesure la saturation des racines à quatre
@@ -562,6 +572,53 @@ fn main() -> Result<()> {
                 report.classes().len(),
                 report.unresolved.len()
             );
+        }
+        return Ok(());
+    }
+
+    // Sortie rapide : mesure de provenance des cibles de réflexion. Même routage
+    // APK/DEX que --dyn-entrypoints, même traitement séquentiel (flux TSV).
+    if cli.reflection_inputs {
+        let inputs: Vec<PathBuf> = match (&cli.apk, &cli.bulk) {
+            (Some(apk), None) => vec![apk.clone()],
+            (None, Some(dir)) => {
+                let found = parser::dyn_entrypoints::collect_inputs(dir, cli.recursive)?;
+                if found.is_empty() {
+                    bail!("aucun APK ni DEX trouvé dans {}", dir.display());
+                }
+                found
+            }
+            _ => bail!("--reflection-inputs requiert soit un APK ou un DEX, soit --bulk DIR"),
+        };
+
+        println!("sample\tcategory\tcount");
+        for input in &inputs {
+            let sample = input
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".into());
+
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                parser::reflection_inputs::extract_any(input)
+            }));
+            let report = match outcome {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    eprintln!("[FAIL]  {sample} — {e:#}");
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("[PANIC] {sample} — parsing abandonné");
+                    continue;
+                }
+            };
+
+            // Toutes les catégories, y compris à zéro : les colonnes restent
+            // comparables d'un échantillon à l'autre.
+            for c in parser::reflection_inputs::CATEGORIES {
+                println!("{}\t{}\t{}", sample, c.as_str(), report.count(*c));
+            }
+            eprintln!("[OK]    {sample} — {} sites de réflexion", report.total());
         }
         return Ok(());
     }
