@@ -65,6 +65,8 @@ pub struct DexMethod<'a> {
     /// Descripteurs EXACTS des paramètres déclarés.
     pub params: &'a [String],
     pub return_type: &'a str,
+    /// `ACC_STATIC` du `encoded_method`. Décide s'il y a un `this`.
+    pub is_static: bool,
     /// `None` pour abstract et native.
     pub code: Option<Code<'a>>,
 }
@@ -198,14 +200,19 @@ impl DexBin {
         let mut methods = Vec::new();
         if let Some(data) = self.dex.get_class_data(&class_def)? {
             for enc in data.direct_methods.iter().chain(data.virtual_methods.iter()) {
-                methods.push(self.method_at(enc.method_idx, enc.code_off)?);
+                methods.push(self.method_at(enc.method_idx, enc.access_flags, enc.code_off)?);
             }
         }
 
         Ok(DexClass { descriptor, superclass, methods, class_def })
     }
 
-    fn method_at<'a>(&'a self, method_idx: u32, code_off: u32) -> Result<DexMethod<'a>> {
+    fn method_at<'a>(
+        &'a self,
+        method_idx: u32,
+        access_flags: u32,
+        code_off: u32,
+    ) -> Result<DexMethod<'a>> {
         let m = self.dex.methods.get(method_idx)?;
         let name = self
             .string(m.name_idx)
@@ -227,6 +234,7 @@ impl DexBin {
             name,
             params: proto.map_or(NO_PARAMS, |p| p.params.as_slice()),
             return_type: proto.map_or("", |p| p.return_type.as_str()),
+            is_static: access_flags & ACC_STATIC != 0,
             code,
         })
     }
@@ -257,6 +265,8 @@ impl DexBin {
         Ok(out)
     }
 }
+
+const ACC_STATIC: u32 = 0x8;
 
 const NO_PARAMS: &[String] = &[];
 

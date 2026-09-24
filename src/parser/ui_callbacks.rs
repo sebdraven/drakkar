@@ -25,7 +25,7 @@ use crate::parser::axml::Element;
 use crate::parser::dex_facade::{DexBin, DexMethod};
 use crate::parser::dyn_entrypoints::{
     backtrack_new_instance, dest_register, index_field_assignments, operand_index, registers,
-    writes_register, FieldAssignments, Provenance,
+    this_register, writes_register, FieldAssignments, Provenance,
 };
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -142,25 +142,7 @@ fn extract_with_layouts(path: &Path, xml_on_click: &HashSet<String>) -> Result<U
                 Err(_) => continue,
             };
 
-            // Registre de `this` : en Dalvik les paramètres occupent les
-            // registres hauts `[regs - ins, regs)`, `this` en tête. Si `ins`
-            // dépasse la largeur des paramètres déclarés d'un mot, ce mot est
-            // `this`. (`J`/`D` = deux mots.) Même calcul que `dyn_entrypoints`.
-            let params_width: u32 = method
-                .params
-                .iter()
-                .map(|p| match p.as_str() {
-                    "J" | "D" => 2u32,
-                    _ => 1u32,
-                })
-                .sum();
-            let regs = code.registers_size as u32;
-            let ins_sz = code.ins_size as u32;
-            let this_reg = if ins_sz > params_width && regs >= ins_sz {
-                Some(regs - ins_sz)
-            } else {
-                None
-            };
+            let this_reg = this_register(method.is_static, code.registers_size, code.ins_size);
 
             scan_method(
                 &dex,

@@ -356,29 +356,10 @@ pub fn extract(path: &Path) -> Result<DynEntrypointReport> {
                 }
             };
 
-            // Registre portant `this`, quand la méthode n'est pas statique.
-            //
-            // En Dalvik les paramètres occupent les registres HAUTS :
-            // `[registers_size - ins_size, registers_size)`, et `this` est le
-            // premier d'entre eux. Reste à savoir s'il y en a un : la largeur
-            // des paramètres déclarés suffit — si `ins_size` dépasse cette
-            // largeur d'un mot, c'est qu'un `this` occupe la place manquante.
-            // (`J` et `D` comptent pour deux mots.)
-            let params_width: u32 = method
-                .params
-                .iter()
-                .map(|p| match p.as_str() {
-                    "J" | "D" => 2u32,
-                    _ => 1u32,
-                })
-                .sum();
-            let regs = code.registers_size as u32;
-            let ins = code.ins_size as u32;
-            let this_reg = if ins > params_width && regs >= ins {
-                Some(regs - ins)
-            } else {
-                None
-            };
+            // Registre portant `this`. En Dalvik les paramètres occupent les
+            // registres HAUTS `[registers_size - ins_size, registers_size)` et
+            // `this` est le premier d'entre eux. `ACC_STATIC` dit s'il y en a un.
+            let this_reg = this_register(method.is_static, code.registers_size, code.ins_size);
 
             scan_method(&dex, &instructions, &caller, this_reg, &assignments, &mut report);
         }
@@ -551,6 +532,18 @@ pub(crate) fn registers(ins: &dex_bytecode::Instruction) -> Vec<u32> {
         }
     }
     out
+}
+
+/// Registre portant `this`, ou `None` si la méthode est statique.
+///
+/// Les paramètres occupent les registres hauts `[regs - ins, regs)` et `this`
+/// est le premier. `ins_size == 0` sur une méthode d'instance est malformé :
+/// on refuse plutôt que de rendre un registre hors plage.
+pub(crate) fn this_register(is_static: bool, registers_size: u16, ins_size: u16) -> Option<u32> {
+    if is_static || ins_size == 0 || registers_size < ins_size {
+        return None;
+    }
+    Some((registers_size - ins_size) as u32)
 }
 
 /// Registre de destination d'une instruction d'écriture : le premier `vN`.
@@ -847,6 +840,20 @@ mod tests {
     fn descriptor_conversion() {
         assert_eq!(to_descriptor("com.cocospy.receivers.SMSReceiver"),
                    "Lcom/cocospy/receivers/SMSReceiver;");
+    }
+
+    #[test]
+    fn this_register_suit_acc_static() {
+        // Méthode d'instance `void f(Object)` : regs=4, ins=2 -> this en v2.
+        assert_eq!(this_register(false, 4, 2), Some(2));
+        // Même forme, mais statique : pas de `this`.
+        assert_eq!(this_register(true, 4, 2), None);
+        // `ins_size == 0` sur une méthode d'instance est malformé.
+        assert_eq!(this_register(false, 4, 0), None);
+        // `ins_size > registers_size` est malformé.
+        assert_eq!(this_register(false, 2, 4), None);
+        // Méthode d'instance sans paramètre : regs=1, ins=1 -> this en v0.
+        assert_eq!(this_register(false, 1, 1), Some(0));
     }
 
     #[test]
