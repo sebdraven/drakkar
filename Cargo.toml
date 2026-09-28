@@ -60,10 +60,10 @@ md-5 = "0.10"
 # Décodage bytecode Dalvik (invoke-* + CFG intra-méthode). Repo Androguard,
 # pas encore de release -> dépendance git.
 #
-# ⚠️ Déclaration SANS `branch` : dex-parser déclare le même dépôt sans branche
-# (GitReference::DefaultBranch). Un `branch = "main"` ici donnerait un SourceId
-# distinct, donc DEUX paquets dex-bytecode v0.0.1 dans le graphe, donc deux
-# `Instruction` non interchangeables. Le rev est fixé par [patch], plus bas.
+# ⚠️ Déclaration SANS `branch` ni `rev` : dex-parser déclare le même dépôt sans
+# branche (GitReference::DefaultBranch). Toute autre forme ici donnerait un
+# SourceId distinct, donc DEUX paquets dex-bytecode v0.0.1 dans le graphe, donc
+# deux `Instruction` non interchangeables. Rev épinglé par Cargo.lock.
 dex-bytecode = { git = "https://github.com/androguard/dex-bytecode" }
 
 # LIEF: réservé au parsing ELF natif (lib/*/*.so). Build C++ lourd, activé à la
@@ -77,9 +77,3 @@ lief-backend = ["dep:lief"]
 [[bin]]
 name = "drakkar"
 path = "src/main.rs"
-
-# Rev explicite de dex-bytecode, appliqué à TOUT le graphe (Drakkar et
-# dex-parser). Un `rev` posé sur la dépendance directe créerait un second
-# SourceId et donc une seconde copie du crate.
-[patch."https://github.com/androguard/dex-bytecode"]
-dex-bytecode = { git = "https://github.com/androguard/dex-bytecode", rev = "847090298e79c22b0572fca82b1ee5316d6ee57e" }

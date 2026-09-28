@@ -641,39 +641,32 @@ version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
 dependencies = [
- "proc-macro2 1.0.106",
- "quote 1.0.46",
+ "proc-macro2",
+ "quote",
  "syn 2.0.118",
-]
-
-[[package]]
-name = "dex"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98c9123d2f2d1d92fc5dee7ae4c8286bf893e0ba982a1a0ed2714812ce96039b"
-dependencies = [
- "adler32",
- "bitflags 1.3.2",
- "cesu8",
- "getset",
- "log",
- "lru",
- "memmap",
- "num-derive 0.2.5",
- "num-traits",
- "scroll",
- "scroll_derive",
 ]
 
 [[package]]
 name = "dex-bytecode"
 version = "0.0.1"
-source = "git+https://github.com/androguard/dex-bytecode?branch=main#62392ecb4af3428de684b984588cc72b2e4f51d6"
+source = "git+https://github.com/androguard/dex-bytecode#847090298e79c22b0572fca82b1ee5316d6ee57e"
 dependencies = [
  "clap",
  "colored 2.2.0",
  "log",
  "simple_logger",
+]
+
+[[package]]
+name = "dex-parser"
+version = "0.1.0"
+source = "git+https://github.com/androguard/dex-parser#e4c7cfb5f4eb52fb685abb4cebd4ec1693a1d6ad"
+dependencies = [
+ "clap",
+ "dex-bytecode",
+ "memchr",
+ "sha1",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -714,8 +707,8 @@ version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ac70aa55017e108007fbaf5aa0f54b021c98f92ff8af59d42eda9da96e3dd4f"
 dependencies = [
- "proc-macro2 1.0.106",
- "quote 1.0.46",
+ "proc-macro2",
+ "quote",
  "syn 2.0.118",
 ]
 
@@ -728,8 +721,8 @@ dependencies = [
  "clap",
  "cms",
  "der",
- "dex",
  "dex-bytecode",
+ "dex-parser",
  "dirs",
  "flate2",
  "lief",
@@ -1344,7 +1337,7 @@ dependencies = [
  "cxx",
  "lief-ffi",
  "num-bigint",
- "num-derive 0.4.2",
+ "num-derive",
  "num-traits",
  "tempfile",
 ]
@@ -1358,7 +1351,7 @@ dependencies = [
  "git-version",
  "miette",
  "reqwest",
- "semver 1.0.22",
+ "semver",
  "zip 0.6.6",
 ]
 
