@@ -97,14 +97,59 @@ pub struct FieldItem<'a> {
 /// Un champ statique et sa valeur initiale, quand le DEX en porte une.
 pub struct StaticField {
     pub name: String,
+    /// `None` quand l'`encoded_array` s'arrête avant ce champ.
     pub value: Option<DexValue>,
 }
 
-/// Valeur d'un `encoded_value`. Seul l'entier est distingué : c'est le seul
-/// que le projet lit (identifiants de ressources).
+/// Valeur d'un `encoded_value`, index de pool DÉJÀ résolus.
+///
+/// Les largeurs entières restent distinctes : `--resource-xref` ne retient que
+/// `Int`, et fondre `Long` dedans lui ferait accepter des valeurs qu'il
+/// refusait jusqu'ici.
+///
+/// ⚠️ ANGLE MORT — `MethodType`, `MethodHandle` et `Annotation` sont réduits à
+/// [`DexValue::Opaque`], de même qu'une valeur dont l'index de pool ne se
+/// résout pas. Deux `Opaque` de même nature sont ÉGALES : une divergence entre
+/// elles n'est pas vue. Leurs charges utiles sont des index de pool, qui ne se
+/// comparent pas d'un DEX à l'autre ; les rendre comparables fabriquerait des
+/// faux positifs. Faux négatif choisi contre faux positif.
+#[derive(Clone, Debug, PartialEq)]
 pub enum DexValue {
+    Byte(i8),
+    Short(i16),
+    Char(u16),
     Int(i32),
-    Other,
+    Long(i64),
+    Float(f32),
+    Double(f64),
+    Bool(bool),
+    Null,
+    Str(String),
+    Type(String),
+    /// `Lowner;->nom:Ltype;`
+    Field(String),
+    /// `Lowner;->nom:Ltype;`
+    Enum(String),
+    /// `Lowner;->nom`
+    Method(String),
+    Array(Vec<DexValue>),
+    Opaque(&'static str),
+}
+
+impl DexValue {
+    /// Applique les substitutions aux composantes textuelles, récursivement
+    /// dans les tableaux. Les nombres ne sont pas touchés.
+    pub fn normalized(&self, subs: &[(String, String)]) -> Self {
+        match self {
+            Self::Str(s) => Self::Str(subst(s, subs)),
+            Self::Type(t) => Self::Type(subst(t, subs)),
+            Self::Field(f) => Self::Field(subst(f, subs)),
+            Self::Enum(e) => Self::Enum(subst(e, subs)),
+            Self::Method(m) => Self::Method(subst(m, subs)),
+            Self::Array(v) => Self::Array(v.iter().map(|x| x.normalized(subs)).collect()),
+            other => other.clone(),
+        }
+    }
 }
 
 impl DexBin {
@@ -241,29 +286,112 @@ impl DexBin {
 
     /// Champs statiques d'une classe et leur valeur initiale.
     ///
-    /// L'`encoded_array` de `static_values_off` est apparié POSITIONNELLEMENT
-    /// aux `static_fields` du `class_data_item`, et il peut être plus court :
-    /// les champs de queue n'ont alors pas de valeur.
+    /// C'est le SEUL appariement champ ↔ valeur du projet. Il est POSITIONNEL :
+    /// l'`encoded_array` de `static_values_off` suit l'ordre des
+    /// `static_fields` du `class_data_item` et ne porte pas de noms.
+    ///
+    /// ⚠️ Aucun `continue` dans la boucle des noms. Sauter un champ décalerait
+    /// toutes les valeurs suivantes d'un cran : rien ne casserait, les valeurs
+    /// seraient simplement attribuées aux mauvais champs.
     pub fn static_fields(&self, class: &DexClass<'_>) -> Result<Vec<StaticField>> {
         let Some(data) = self.dex.get_class_data(&class.class_def)? else {
             return Ok(Vec::new());
         };
-        let values = self.dex.get_static_values(&class.class_def)?;
 
-        let mut out = Vec::with_capacity(data.static_fields.len());
-        for (i, enc) in data.static_fields.iter().enumerate() {
-            let f = self.dex.fields.get(enc.field_idx)?;
-            let Some(name) = self.string(f.name_idx) else { continue };
-            out.push(StaticField {
-                name: name.to_string(),
-                value: values.get(i).map(|v| match v {
-                    EncodedValue::Int(n) => DexValue::Int(*n),
-                    _ => DexValue::Other,
-                }),
-            });
+        let mut names = Vec::with_capacity(data.static_fields.len());
+        for enc in &data.static_fields {
+            // Un nom illisible garde sa PLACE, avec une chaîne vide : aucun nom
+            // de champ réel n'est vide, donc rien ne s'y appariera par erreur.
+            let name = self
+                .dex
+                .fields
+                .get(enc.field_idx)
+                .ok()
+                .and_then(|f| self.string(f.name_idx))
+                .unwrap_or_default();
+            names.push(name.to_string());
         }
-        Ok(out)
+
+        let values: Vec<DexValue> = self
+            .dex
+            .get_static_values(&class.class_def)?
+            .iter()
+            .map(|v| self.value_of(v))
+            .collect();
+
+        if values.len() > names.len() {
+            tracing::warn!(
+                class = %class.descriptor,
+                fields = names.len(),
+                values = values.len(),
+                "encoded_static_values plus long que la liste des champs : DEX malformé, \
+                 excédent ignoré"
+            );
+        }
+
+        Ok(pair_statics(names, values))
     }
+
+    fn value_of(&self, v: &EncodedValue) -> DexValue {
+        match v {
+            EncodedValue::Byte(n) => DexValue::Byte(*n),
+            EncodedValue::Short(n) => DexValue::Short(*n),
+            EncodedValue::Char(n) => DexValue::Char(*n),
+            EncodedValue::Int(n) => DexValue::Int(*n),
+            EncodedValue::Long(n) => DexValue::Long(*n),
+            EncodedValue::Float(n) => DexValue::Float(*n),
+            EncodedValue::Double(n) => DexValue::Double(*n),
+            EncodedValue::Boolean(b) => DexValue::Bool(*b),
+            EncodedValue::Null => DexValue::Null,
+            EncodedValue::String(i) => self
+                .string(*i)
+                .map_or(DexValue::Opaque("string?"), |s| DexValue::Str(s.to_string())),
+            EncodedValue::Type(i) => self
+                .typ(*i)
+                .map_or(DexValue::Opaque("type?"), |t| DexValue::Type(t.to_string())),
+            EncodedValue::Field(i) => self.field_item(*i).map_or(
+                DexValue::Opaque("field?"),
+                |f| DexValue::Field(format!("{}->{}:{}", f.class, f.name, f.typ)),
+            ),
+            EncodedValue::Enum(i) => self.field_item(*i).map_or(
+                DexValue::Opaque("enum?"),
+                |f| DexValue::Enum(format!("{}->{}:{}", f.class, f.name, f.typ)),
+            ),
+            EncodedValue::Method(i) => self.method_item(*i).map_or(
+                DexValue::Opaque("method?"),
+                |m| DexValue::Method(format!("{}->{}", m.class, m.name)),
+            ),
+            EncodedValue::Array(vs) => {
+                DexValue::Array(vs.iter().map(|x| self.value_of(x)).collect())
+            }
+            EncodedValue::MethodType(_) => DexValue::Opaque("method-type"),
+            EncodedValue::MethodHandle(_) => DexValue::Opaque("method-handle"),
+            EncodedValue::Annotation(_) => DexValue::Opaque("annotation"),
+        }
+    }
+}
+
+/// Appariement positionnel des champs statiques et de l'`encoded_array`.
+///
+/// Le tableau peut s'arrêter avant la fin de la liste des champs : ceux de
+/// queue n'ont alors pas de valeur. Il ne peut pas la dépasser — l'excédent
+/// d'un DEX malformé est ignoré, l'appelant le signale.
+fn pair_statics(names: Vec<String>, values: Vec<DexValue>) -> Vec<StaticField> {
+    let mut values = values.into_iter();
+    names
+        .into_iter()
+        .map(|name| StaticField { name, value: values.next() })
+        .collect()
+}
+
+/// Substitutions textuelles. Volontairement dupliqué de `disasm::normalize` :
+/// la façade est la couche basse, elle ne dépend d'aucun module d'analyse.
+fn subst(s: &str, subs: &[(String, String)]) -> String {
+    let mut out = s.to_string();
+    for (from, to) in subs {
+        out = out.replace(from.as_str(), to.as_str());
+    }
+    out
 }
 
 const ACC_STATIC: u32 = 0x8;
@@ -298,5 +426,66 @@ mod tests {
     #[test]
     fn shorty_vide_sur_methode_sans_parametre() {
         assert_eq!(shorty_params(&[]), "");
+    }
+
+    fn noms(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn pairage_statique_tableau_plus_court_que_les_champs() {
+        // Le cas où une erreur ne se verrait pas : trois champs, une valeur.
+        let out = pair_statics(
+            noms(&["a", "b", "c"]),
+            vec![DexValue::Str("https://i.safespy.com/api/".into())],
+        );
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].name, "a");
+        assert_eq!(
+            out[0].value,
+            Some(DexValue::Str("https://i.safespy.com/api/".into()))
+        );
+        // Les champs de queue n'héritent PAS de la valeur du voisin.
+        assert_eq!(out[1].value, None);
+        assert_eq!(out[2].value, None);
+    }
+
+    #[test]
+    fn pairage_statique_ne_decale_pas_sur_un_nom_illisible() {
+        // Le champ du milieu a un nom vide (illisible) : il garde sa place.
+        let out = pair_statics(
+            noms(&["a", "", "c"]),
+            vec![DexValue::Int(1), DexValue::Int(2), DexValue::Int(3)],
+        );
+        assert_eq!(out[2].name, "c");
+        assert_eq!(out[2].value, Some(DexValue::Int(3)));
+    }
+
+    #[test]
+    fn pairage_statique_ignore_l_excedent() {
+        let out = pair_statics(noms(&["a"]), vec![DexValue::Int(1), DexValue::Int(2)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].value, Some(DexValue::Int(1)));
+    }
+
+    #[test]
+    fn normalisation_recursive_dans_les_tableaux() {
+        // Deux substitutions : les descripteurs portent des `/`, les chaînes de
+        // constantes portent des `.`. Une seule des deux formes ne suffit pas.
+        let subs = vec![
+            ("com/duiyun".to_string(), "com/dy".to_string()),
+            ("com.duiyun".to_string(), "com.dy".to_string()),
+        ];
+        let v = DexValue::Array(vec![
+            DexValue::Str("com.duiyun.account_auth_type".into()),
+            DexValue::Type("Lcom/duiyun/Foo;".into()),
+            DexValue::Int(7),
+        ]);
+        let DexValue::Array(out) = v.normalized(&subs) else {
+            panic!("le tableau doit rester un tableau");
+        };
+        assert_eq!(out[0], DexValue::Str("com.dy.account_auth_type".into()));
+        assert_eq!(out[1], DexValue::Type("Lcom/dy/Foo;".into()));
+        assert_eq!(out[2], DexValue::Int(7));
     }
 }
