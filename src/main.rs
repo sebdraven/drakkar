@@ -1754,6 +1754,18 @@ fn print_diff_dex(r: &drakkar::parser::diff_dex::DiffReport) {
     println!("  only in A    {}", r.only_in_a.len());
     println!("  only in B    {}", r.only_in_b.len());
 
+    println!("\nValeurs de champs statiques (encoded_static_values, hors instructions) :");
+    println!(
+        "  comparées    {}   divergentes {}",
+        r.static_fields_compared, r.static_fields_diverging
+    );
+    if r.static_fields_diverging > 0 {
+        println!("               /!\\ une valeur statique divergente est INVISIBLE aux empreintes");
+        println!("                   d'opcodes : les Jaccard ci-dessus ne la voient pas. Détail :");
+        println!("                   --diff-explain (catégorie valeur-statique) sur le même couple,");
+        println!("                   contre-épreuve : --diff-strings.");
+    }
+
     if !r.near.is_empty() {
         println!("\nClasses proches (Jaccard décroissant) :");
         for p in &r.near {
