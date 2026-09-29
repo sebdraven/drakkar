@@ -708,11 +708,7 @@ est racine — ne pas comparer à une mesure `manifest`)",
                 } else {
                     ""
                 };
-                let pct = if isl.size > 0 {
-                    100 * isl.author_nodes / isl.size
-                } else {
-                    0
-                };
+                let pct = (100 * isl.author_nodes).checked_div(isl.size).unwrap_or(0);
                 println!(
                     "  taille {:>5}  {pct:>3}% auteur  {} racine(s) de degré entrant nul{}",
                     isl.size,
