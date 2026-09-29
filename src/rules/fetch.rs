@@ -99,7 +99,8 @@ fn generate_cache(dir: &Path, refresh: bool) -> Result<()> {
         } else {
             detectability = "out-of-scope";
             features_block =
-                format!("  unsupported: \"Not statically detectable from APK package contents\"");
+                "  unsupported: \"Not statically detectable from APK package contents\""
+                    .to_string();
             oos_count += 1;
         }
 
