@@ -920,7 +920,7 @@ mod tests {
         // SEQUENCE { INTEGER (2048 bits, préfixé 0x00), INTEGER 65537 }
         let mut modulus = vec![0x00u8];
         modulus.push(0xc0); // bit de poids fort à 1 -> 8 bits pleins
-        modulus.extend(std::iter::repeat(0xab).take(255));
+        modulus.extend(std::iter::repeat_n(0xab, 255));
         let mut inner = vec![0x02, 0x82, 0x01, 0x01];
         inner.extend_from_slice(&modulus);
         inner.extend_from_slice(&[0x02, 0x03, 0x01, 0x00, 0x01]);
