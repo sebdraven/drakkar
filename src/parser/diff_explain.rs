@@ -40,6 +40,7 @@
 //!   - une CHAÎNE qui change → contenu, c'est là que se voit un endpoint ;
 //!   - un CHAMP dont seul le nom change, owner et type égaux → remapping, bruit ;
 //!   - une CIBLE DE MÉTHODE ou un TYPE qui change → divergence réelle.
+//!
 //! Sans cette distinction, la réserve sur `Lcom/dy/MyApplication;->a` reste un
 //! problème de lecture. Avec, elle devient une catégorie comptée.
 //!
@@ -836,9 +837,7 @@ fn visible(lines: &[AlignedLine], ctx: usize) -> Vec<usize> {
         if l.is_change() {
             let lo = i.saturating_sub(ctx);
             let hi = (i + ctx + 1).min(lines.len());
-            for k in lo..hi {
-                keep[k] = true;
-            }
+            keep[lo..hi].fill(true);
         }
     }
     keep.iter()
