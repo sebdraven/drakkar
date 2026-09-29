@@ -727,8 +727,8 @@ impl CallGraph {
         while let Some(cur) = queue.pop_front() {
             let d = dist[&cur];
             for prev in self.graph.neighbors_directed(cur, Direction::Incoming) {
-                if !dist.contains_key(&prev) {
-                    dist.insert(prev, d + 1);
+                if let std::collections::hash_map::Entry::Vacant(e) = dist.entry(prev) {
+                    e.insert(d + 1);
                     queue.push_back(prev);
                 }
             }
