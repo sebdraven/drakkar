@@ -56,7 +56,10 @@ pub struct DisasmOptions {
 
 impl Default for DisasmOptions {
     fn default() -> Self {
-        Self { patterns: Vec::new(), normalize: Vec::new() }
+        Self {
+            patterns: Vec::new(),
+            normalize: Vec::new(),
+        }
     }
 }
 
@@ -180,8 +183,7 @@ fn collect_from_dex(path: &Path, opts: &DisasmOptions, out: &mut DisasmReport) -
                     offset: ins.offset as u64,
                     mnemonic: ins.mnemonic().to_string(),
                     operands: normalize(&ins.operands().to_string(), &opts.normalize),
-                    resolved: annotate(&dex, ins)
-                        .map(|s| normalize(&s, &opts.normalize)),
+                    resolved: annotate(&dex, ins).map(|s| normalize(&s, &opts.normalize)),
                 })
                 .collect();
 
@@ -326,7 +328,10 @@ fn annotate(dex: &DexBin, ins: &dex_bytecode::Instruction) -> Option<String> {
 pub fn operand_index(ins: &dex_bytecode::Instruction, tag: &str) -> Option<u64> {
     let ops = ins.operands();
     let pos = ops.find(tag)? + tag.len();
-    let digits: String = ops[pos..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = ops[pos..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     digits.parse().ok()
 }
 
@@ -346,8 +351,8 @@ pub fn escape(s: &str) -> String {
 fn collect_dex_paths(input: &Path) -> Result<(Vec<PathBuf>, Option<tempfile::TempDir>)> {
     let mut magic = [0u8; 8];
     {
-        let mut f = std::fs::File::open(input)
-            .with_context(|| format!("open {}", input.display()))?;
+        let mut f =
+            std::fs::File::open(input).with_context(|| format!("open {}", input.display()))?;
         let n = f.read(&mut magic)?;
         if n < 4 {
             bail!("{} trop court pour être un DEX ou un APK", input.display());
@@ -398,7 +403,10 @@ pub fn render(r: &DisasmReport) -> String {
     for c in &r.classes {
         s.push_str(&format!("== {} ==\n", c.descriptor));
         if c.codeless > 0 {
-            s.push_str(&format!("   ({} méthode(s) sans code : abstraite ou native)\n", c.codeless));
+            s.push_str(&format!(
+                "   ({} méthode(s) sans code : abstraite ou native)\n",
+                c.codeless
+            ));
         }
         for m in &c.methods {
             s.push_str(&format!(
@@ -492,7 +500,10 @@ mod tests {
     #[test]
     fn normalize_applies_in_order() {
         let subs = vec![("com/duiyun".to_string(), "com/dy".to_string())];
-        assert_eq!(normalize("Lcom/duiyun/services/g;", &subs), "Lcom/dy/services/g;");
+        assert_eq!(
+            normalize("Lcom/duiyun/services/g;", &subs),
+            "Lcom/dy/services/g;"
+        );
         assert_eq!(normalize("rien à voir", &subs), "rien à voir");
     }
 

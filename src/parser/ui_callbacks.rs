@@ -210,7 +210,8 @@ fn scan_method(
         }
 
         // 3) listener détenu en CHAMP : `iget-object vListener, vThis, field@N`.
-        if let Some((class, provenance)) = backtrack_field(dex, &instructions[..i], target, assignments)
+        if let Some((class, provenance)) =
+            backtrack_field(dex, &instructions[..i], target, assignments)
         {
             report.handlers.push(UiHandler {
                 class,
@@ -226,10 +227,7 @@ fn scan_method(
 }
 
 /// Si l'invoke cible un setter de listener, renvoie (setter, handler attendu).
-fn ui_sink(
-    dex: &DexBin,
-    ins: &dex_bytecode::Instruction,
-) -> Option<(String, &'static str)> {
+fn ui_sink(dex: &DexBin, ins: &dex_bytecode::Instruction) -> Option<(String, &'static str)> {
     let idx = operand_index(ins, "method@")?;
     let name = dex.method_item(idx as u32)?.name.to_string();
 
@@ -311,7 +309,10 @@ fn xml_on_click_names(apk: &Path) -> HashSet<String> {
             Err(e) => tracing::debug!(error = %e, "XML de ressource illisible, ignoré"),
         }
     }
-    tracing::info!(handlers = names.len(), "android:onClick relevés dans les ressources");
+    tracing::info!(
+        handlers = names.len(),
+        "android:onClick relevés dans les ressources"
+    );
     names
 }
 
@@ -430,7 +431,10 @@ pub fn extract_any(path: &Path) -> Result<UiHandlerReport> {
     match sniff(path) {
         Some(InputKind::Apk) => extract_from_apk(path),
         Some(InputKind::Dex) => extract(path),
-        None => anyhow::bail!("{} n'est ni un APK ni un DEX (reconnu au contenu)", path.display()),
+        None => anyhow::bail!(
+            "{} n'est ni un APK ni un DEX (reconnu au contenu)",
+            path.display()
+        ),
     }
 }
 
@@ -466,6 +470,9 @@ mod tests {
                 provenance: Provenance::NewInstance,
             });
         }
-        assert_eq!(r.roots(), vec![("Lcom/x/Foo$1;".to_string(), "onClick".to_string())]);
+        assert_eq!(
+            r.roots(),
+            vec![("Lcom/x/Foo$1;".to_string(), "onClick".to_string())]
+        );
     }
 }

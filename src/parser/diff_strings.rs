@@ -32,8 +32,8 @@
 //! passer ce module d'illisible à exploitable. Par défaut le bruit structurel
 //! est masqué ; `--strings-noise` le rétablit.
 
-use crate::parser::disasm::normalize;
 use crate::parser::diff_explain::ColorMode;
+use crate::parser::disasm::normalize;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::HashSet;
@@ -142,7 +142,9 @@ fn looks_like_host(s: &str) -> bool {
     // `com.dy.util.a` est un nom de classe, pas un hôte : le premier segment
     // d'un paquet Java est un TLD à l'envers. Heuristique : si le premier
     // segment est un TLD courant, c'est un nom de paquet.
-    const PKG_HEADS: &[&str] = &["com", "org", "net", "io", "android", "androidx", "java", "javax"];
+    const PKG_HEADS: &[&str] = &[
+        "com", "org", "net", "io", "android", "androidx", "java", "javax",
+    ];
     if PKG_HEADS.contains(&parts[0]) {
         return false;
     }
@@ -259,7 +261,11 @@ pub fn run(a: &Path, b: &Path, opts: &StringDiffOptions) -> Result<StringDiffRep
 
     let inter = sa.intersection(&sb).count();
     let union = sa.len() + sb.len() - inter;
-    let jaccard = if union == 0 { 1.0 } else { inter as f64 / union as f64 };
+    let jaccard = if union == 0 {
+        1.0
+    } else {
+        inter as f64 / union as f64
+    };
 
     let mut only_in_a = collect(&sa, &sb, opts);
     let mut only_in_b = collect(&sb, &sa, opts);
@@ -287,14 +293,24 @@ pub fn run(a: &Path, b: &Path, opts: &StringDiffOptions) -> Result<StringDiffRep
         jaccard,
         only_in_a,
         only_in_b,
-        by_kind: kinds.into_iter().map(|(k, n)| (k.label().to_string(), n)).collect(),
+        by_kind: kinds
+            .into_iter()
+            .map(|(k, n)| (k.label().to_string(), n))
+            .collect(),
     })
 }
 
-fn collect(from: &HashSet<String>, other: &HashSet<String>, opts: &StringDiffOptions) -> Vec<StringEntry> {
+fn collect(
+    from: &HashSet<String>,
+    other: &HashSet<String>,
+    opts: &StringDiffOptions,
+) -> Vec<StringEntry> {
     from.difference(other)
         .filter(|s| s.chars().count() >= opts.min_len)
-        .map(|s| StringEntry { kind: classify(s), value: s.clone() })
+        .map(|s| StringEntry {
+            kind: classify(s),
+            value: s.clone(),
+        })
         .filter(|e| !(opts.literals_only && e.kind.is_noise()))
         .collect()
 }
@@ -305,7 +321,10 @@ pub fn render(r: &StringDiffReport, opts: &StringDiffOptions) -> String {
     let c = opts.color.enabled();
     let mut s = String::new();
 
-    s.push_str(&format!("{}\n", paint(c, BOLD, "== Diff des pools de chaînes ==")));
+    s.push_str(&format!(
+        "{}\n",
+        paint(c, BOLD, "== Diff des pools de chaînes ==")
+    ));
     s.push_str(&format!("A  {}\n", r.input_a));
     s.push_str(&format!("B  {}\n\n", r.input_b));
 
@@ -321,19 +340,30 @@ pub fn render(r: &StringDiffReport, opts: &StringDiffOptions) -> String {
             "  {} entrées illisibles : A={} sur {} annoncées, B={} sur {} — DEX abîmé, \
              la comparaison est partielle\n",
             paint(c, YELLOW, "⚠"),
-            r.unreadable_a, r.declared_a, r.unreadable_b, r.declared_b
+            r.unreadable_a,
+            r.declared_a,
+            r.unreadable_b,
+            r.declared_b
         ));
     }
     if opts.literals_only {
         s.push_str(&format!(
             "  {}\n",
-            paint(c, DIM, "(descripteurs et identifiants masqués par --strings-literals)")
+            paint(
+                c,
+                DIM,
+                "(descripteurs et identifiants masqués par --strings-literals)"
+            )
         ));
     }
     if opts.min_len > 0 {
         s.push_str(&format!(
             "  {}\n",
-            paint(c, DIM, &format!("(chaînes de moins de {} caractères ignorées)", opts.min_len))
+            paint(
+                c,
+                DIM,
+                &format!("(chaînes de moins de {} caractères ignorées)", opts.min_len)
+            )
         ));
     }
 
@@ -341,11 +371,7 @@ pub fn render(r: &StringDiffReport, opts: &StringDiffOptions) -> String {
         ("Seulement dans A", &r.only_in_a),
         ("Seulement dans B", &r.only_in_b),
     ] {
-        s.push_str(&format!(
-            "\n{} ({}) :\n",
-            paint(c, BOLD, title),
-            list.len()
-        ));
+        s.push_str(&format!("\n{} ({}) :\n", paint(c, BOLD, title), list.len()));
         if list.is_empty() {
             s.push_str(&format!("  {}\n", paint(c, GREEN, "aucune")));
             continue;
@@ -381,7 +407,10 @@ fn truncate(s: &str, max: usize) -> String {
     if n <= max {
         return s.to_string();
     }
-    format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+    format!(
+        "{}…",
+        s.chars().take(max.saturating_sub(1)).collect::<String>()
+    )
 }
 
 /// Légende (`--diff-strings --legend`).

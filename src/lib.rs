@@ -4,10 +4,10 @@
 //!           -> CFG inter-proc -> matching MITRE (catalogue auto-update STIX)
 //!           -> export NetworkX (pour APKolgomorov).
 
+pub mod bulk;
+pub mod cfg;
+pub mod enrich;
+pub mod export;
 pub mod model;
 pub mod parser;
-pub mod cfg;
 pub mod rules;
-pub mod export;
-pub mod bulk;
-pub mod enrich;

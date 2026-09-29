@@ -78,9 +78,7 @@ impl ColorMode {
             Self::Never => false,
             // Redirigé vers un fichier ou un pipe -> pas d'ANSI, sinon la sortie
             // est illisible et ingrep-able. `NO_COLOR` est respecté (no-color.org).
-            Self::Auto => {
-                std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
-            }
+            Self::Auto => std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
         }
     }
 }
@@ -476,7 +474,10 @@ pub fn run(input_a: &Path, input_b: &Path, opts: &ExplainOptions) -> Result<Expl
     }
     let mut kinds: Vec<(Divergence, usize)> = counts.into_iter().collect();
     kinds.sort_by_key(|(k, _)| *k);
-    report.by_kind = kinds.into_iter().map(|(k, n)| (k.label().to_string(), n)).collect();
+    report.by_kind = kinds
+        .into_iter()
+        .map(|(k, n)| (k.label().to_string(), n))
+        .collect();
 
     Ok(report)
 }
@@ -602,7 +603,10 @@ fn render_static(v: Option<&DexValue>) -> String {
         DexValue::Null => "null".to_string(),
         DexValue::Array(v) => format!(
             "[{}]",
-            v.iter().map(|x| render_static(Some(x))).collect::<Vec<_>>().join(", ")
+            v.iter()
+                .map(|x| render_static(Some(x)))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         DexValue::Opaque(k) => format!("<{k}>"),
     }
@@ -640,7 +644,10 @@ fn truncate(s: &str, max: usize) -> String {
     if n <= max {
         return s.to_string();
     }
-    format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+    format!(
+        "{}…",
+        s.chars().take(max.saturating_sub(1)).collect::<String>()
+    )
 }
 
 // ── Alignement LCS ──────────────────────────────────────────────────
@@ -843,7 +850,10 @@ fn visible(lines: &[AlignedLine], ctx: usize) -> Vec<usize> {
 
 // ── Chargement ───────────────────────────────────────────────────────────────
 
-fn load(input: &Path, opts: &ExplainOptions) -> Result<(Vec<ClassRich>, Option<tempfile::TempDir>)> {
+fn load(
+    input: &Path,
+    opts: &ExplainOptions,
+) -> Result<(Vec<ClassRich>, Option<tempfile::TempDir>)> {
     let (paths, tmp) = collect_dex_paths(input)?;
     let mut out = Vec::new();
     for p in &paths {
@@ -963,10 +973,26 @@ fn included(descriptor: &str, prefixes: &[String]) -> bool {
         return prefixes.iter().any(|p| descriptor.starts_with(p));
     }
     const LIB_PREFIXES: &[&str] = &[
-        "Landroid/", "Landroidx/", "Ljava/", "Ljavax/", "Lkotlin/", "Lkotlinx/",
-        "Ldalvik/", "Lrx/", "Lio/reactivex/", "Lokhttp3/", "Lokio/", "Lretrofit2/",
-        "Lcom/google/", "Lcom/alibaba/", "Lcom/umeng/", "Lorg/apache/", "Lorg/json/",
-        "Lorg/xmlpull/", "Luk/co/chrisjenx/", "Lgov/nist/",
+        "Landroid/",
+        "Landroidx/",
+        "Ljava/",
+        "Ljavax/",
+        "Lkotlin/",
+        "Lkotlinx/",
+        "Ldalvik/",
+        "Lrx/",
+        "Lio/reactivex/",
+        "Lokhttp3/",
+        "Lokio/",
+        "Lretrofit2/",
+        "Lcom/google/",
+        "Lcom/alibaba/",
+        "Lcom/umeng/",
+        "Lorg/apache/",
+        "Lorg/json/",
+        "Lorg/xmlpull/",
+        "Luk/co/chrisjenx/",
+        "Lgov/nist/",
     ];
     !LIB_PREFIXES.iter().any(|p| descriptor.starts_with(p))
 }
@@ -974,8 +1000,8 @@ fn included(descriptor: &str, prefixes: &[String]) -> bool {
 fn collect_dex_paths(input: &Path) -> Result<(Vec<PathBuf>, Option<tempfile::TempDir>)> {
     let mut magic = [0u8; 8];
     {
-        let mut f = std::fs::File::open(input)
-            .with_context(|| format!("open {}", input.display()))?;
+        let mut f =
+            std::fs::File::open(input).with_context(|| format!("open {}", input.display()))?;
         if f.read(&mut magic)? < 4 {
             bail!("{} trop court pour être un DEX ou un APK", input.display());
         }
@@ -1028,7 +1054,11 @@ pub fn render_report(r: &ExplainReport, opts: &ExplainOptions) -> String {
          Champs statiques comparés {}   sans homonyme en face {}\n",
         paint(c, CYAN, &r.classes_paired.to_string()),
         r.paired_by_name,
-        paint(c, if r.paired_by_hash > 0 { YELLOW } else { DIM }, &r.paired_by_hash.to_string()),
+        paint(
+            c,
+            if r.paired_by_hash > 0 { YELLOW } else { DIM },
+            &r.paired_by_hash.to_string()
+        ),
         paint(c, CYAN, &r.methods_compared.to_string()),
         paint(c, GREEN, &r.methods_clean.to_string()),
         paint(c, CYAN, &r.statics_compared.to_string()),
@@ -1038,7 +1068,11 @@ pub fn render_report(r: &ExplainReport, opts: &ExplainOptions) -> String {
     if r.classes_without_code_a > 0 || r.classes_without_code_b > 0 {
         s.push_str(&format!(
             "  {} A={} B={}\n",
-            paint(c, DIM, "dont classes sans méthode à code, retenues pour leurs valeurs statiques :"),
+            paint(
+                c,
+                DIM,
+                "dont classes sans méthode à code, retenues pour leurs valeurs statiques :"
+            ),
             r.classes_without_code_a,
             r.classes_without_code_b,
         ));
@@ -1112,7 +1146,11 @@ pub fn render_report(r: &ExplainReport, opts: &ExplainOptions) -> String {
         ));
         s.push_str(&format!(
             "  {}\n",
-            paint(c, DIM, "= identique   ~ même opcode, opérande différente   - seulement A   + seulement B")
+            paint(
+                c,
+                DIM,
+                "= identique   ~ même opcode, opérande différente   - seulement A   + seulement B"
+            )
         ));
 
         for ac in &r.aligned {
@@ -1142,7 +1180,11 @@ pub fn render_report(r: &ExplainReport, opts: &ExplainOptions) -> String {
                 if m.skipped {
                     s.push_str(&format!(
                         "      {}\n",
-                        paint(c, DIM, "méthode trop longue pour l'alignement (--explain-align-cap)")
+                        paint(
+                            c,
+                            DIM,
+                            "méthode trop longue pour l'alignement (--explain-align-cap)"
+                        )
                     ));
                     continue;
                 }
@@ -1201,7 +1243,10 @@ pub fn render_report(r: &ExplainReport, opts: &ExplainOptions) -> String {
                 }
             }
 
-            for (title, list) in [("méthodes seulement dans A", &ac.only_a), ("méthodes seulement dans B", &ac.only_b)] {
+            for (title, list) in [
+                ("méthodes seulement dans A", &ac.only_a),
+                ("méthodes seulement dans B", &ac.only_b),
+            ] {
                 if !list.is_empty() {
                     s.push_str(&format!("    {} : {}\n", title, list.join(", ")));
                 }
@@ -1234,17 +1279,29 @@ pub fn render_report(r: &ExplainReport, opts: &ExplainOptions) -> String {
     s.push_str(&format!("\n{}\n", paint(c, BOLD, "Verdict :")));
     s.push_str(&format!(
         "  {} divergence(s) d'opérande de fond, {} de renommage ProGuard (bruit).\n",
-        paint(c, if substantive == 0 { GREEN } else { RED }, &substantive.to_string()),
+        paint(
+            c,
+            if substantive == 0 { GREEN } else { RED },
+            &substantive.to_string()
+        ),
         paint(c, DIM, &noise.to_string()),
     ));
     s.push_str(&format!(
         "  {} ligne(s) de divergence STRUCTURELLE sur les classes alignées par LCS.\n",
-        paint(c, if structural == 0 { GREEN } else { RED }, &structural.to_string()),
+        paint(
+            c,
+            if structural == 0 { GREEN } else { RED },
+            &structural.to_string()
+        ),
     ));
     if substantive == 0 && structural == 0 {
         s.push_str(&format!(
             "  {}\n",
-            paint(c, GREEN, "Rien ne distingue les deux binaires au-delà de l'obfuscation.")
+            paint(
+                c,
+                GREEN,
+                "Rien ne distingue les deux binaires au-delà de l'obfuscation."
+            )
         ));
     }
 
@@ -1380,7 +1437,11 @@ mod tests {
 
     #[test]
     fn gravity_ordering_puts_strings_first() {
-        let mut v = vec![Divergence::FieldRename, Divergence::StringValue, Divergence::TypeRef];
+        let mut v = vec![
+            Divergence::FieldRename,
+            Divergence::StringValue,
+            Divergence::TypeRef,
+        ];
         v.sort();
         assert_eq!(v[0], Divergence::StringValue);
         assert_eq!(v[2], Divergence::FieldRename);

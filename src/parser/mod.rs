@@ -91,7 +91,10 @@ pub fn parse_apk(path: &Path) -> Result<ParsedApk> {
         "native arch"
     );
 
-    Ok(ParsedApk { features, call_graph })
+    Ok(ParsedApk {
+        features,
+        call_graph,
+    })
 }
 
 /// Construit features + CFG depuis un **DEX brut** (déjà déballé) : ni
@@ -106,14 +109,17 @@ pub fn parse_dex(path: &Path) -> Result<ParsedApk> {
     let mut features = ApkFeatures::default();
     let mut call_graph = CallGraph::new();
 
-    let edges = dex::extract(path, &mut features)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let edges =
+        dex::extract(path, &mut features).with_context(|| format!("parse {}", path.display()))?;
     for e in edges {
         call_graph.add_call(e.caller, e.callee, e.site);
     }
     call_graph.set_supers(features.superclasses.clone());
 
-    Ok(ParsedApk { features, call_graph })
+    Ok(ParsedApk {
+        features,
+        call_graph,
+    })
 }
 
 /// Route APK vs DEX brut au **contenu** (magic bytes, cf.
@@ -232,12 +238,11 @@ fn extract_apk(apk: &Path, out_dir: &Path, want: Want) -> Result<ApkEntries> {
         }
     }
 
-    tracing::info!(
-        dex = dex_files.len(),
-        so = so_files.len(),
-        "APK extracted"
-    );
-    Ok(ApkEntries { dex_files, so_files })
+    tracing::info!(dex = dex_files.len(), so = so_files.len(), "APK extracted");
+    Ok(ApkEntries {
+        dex_files,
+        so_files,
+    })
 }
 
 /// Repli quand le crate `zip` refuse l'archive : lecteur calqué sur le
@@ -293,5 +298,8 @@ fn extract_apk_tolerant(apk: &Path, out_dir: &Path, want: Want) -> Result<ApkEnt
         so = so_files.len(),
         "APK extracted (lecteur tolérant)"
     );
-    Ok(ApkEntries { dex_files, so_files })
+    Ok(ApkEntries {
+        dex_files,
+        so_files,
+    })
 }

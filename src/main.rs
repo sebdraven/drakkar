@@ -37,7 +37,11 @@ impl Format {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "drakkar", version, about = "MITRE ATT&CK for Mobile detection on APKs")]
+#[command(
+    name = "drakkar",
+    version,
+    about = "MITRE ATT&CK for Mobile detection on APKs"
+)]
 struct Cli {
     /// APK à analyser (mode single). Omettre si --bulk est utilisé.
     apk: Option<PathBuf>,
@@ -458,8 +462,7 @@ fn main() -> Result<()> {
         // CSV, tableaux), pour que `| jq` et `> fichier` restent propres.
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -469,8 +472,7 @@ fn main() -> Result<()> {
     // hash, cela rendrait un inventaire complet en le faisant passer pour le
     // résultat d'un filtrage : l'absence de correspondance se lirait comme une
     // correspondance universelle.
-    let assets_mode =
-        cli.list_assets || cli.extract_assets.is_some() || cli.assets_fingerprint;
+    let assets_mode = cli.list_assets || cli.extract_assets.is_some() || cli.assets_fingerprint;
     let resource_mode = !cli.resource.is_empty()
         || !cli.resource_id.is_empty()
         || cli.resources.is_some()
@@ -562,7 +564,9 @@ fn main() -> Result<()> {
                     u.site,
                     u.caller.api(),
                     u.reason.as_str(),
-                    u.target_reg.map(|r| format!("v{r}")).unwrap_or_else(|| "-".into()),
+                    u.target_reg
+                        .map(|r| format!("v{r}"))
+                        .unwrap_or_else(|| "-".into()),
                     u.blocking_insn.as_deref().unwrap_or("-")
                 );
             }
@@ -642,7 +646,13 @@ fn main() -> Result<()> {
         let parsed = parser::parse_any(apk)?;
         let cg = &parsed.call_graph;
         let roots = bulk::build_orphan_roots(apk, &parsed)?;
-        let bulk::OrphanRoots { mode, base, with_dyn, with_ui, all } = &roots;
+        let bulk::OrphanRoots {
+            mode,
+            base,
+            with_dyn,
+            with_ui,
+            all,
+        } = &roots;
 
         let report = cg.orphan_audit(all, "loadLibrary");
 
@@ -693,8 +703,16 @@ est racine — ne pas comparer à une mesure `manifest`)",
                 report.islands.len()
             );
             for isl in report.islands.iter().take(40) {
-                let tag = if isl.touches_crossing { "  ⚠ loadLibrary" } else { "" };
-                let pct = if isl.size > 0 { 100 * isl.author_nodes / isl.size } else { 0 };
+                let tag = if isl.touches_crossing {
+                    "  ⚠ loadLibrary"
+                } else {
+                    ""
+                };
+                let pct = if isl.size > 0 {
+                    100 * isl.author_nodes / isl.size
+                } else {
+                    0
+                };
                 println!(
                     "  taille {:>5}  {pct:>3}% auteur  {} racine(s) de degré entrant nul{}",
                     isl.size,
@@ -709,7 +727,11 @@ est racine — ne pas comparer à une mesure `manifest`)",
                         .map(|(pkg, n)| format!("{pkg} ({n})"))
                         .collect();
                     let reste = isl.prefix_histogram.len().saturating_sub(5);
-                    let suite = if reste > 0 { format!("  … +{reste} préfixes") } else { String::new() };
+                    let suite = if reste > 0 {
+                        format!("  … +{reste} préfixes")
+                    } else {
+                        String::new()
+                    };
                     println!("           paquets  {}{}", top.join("   "), suite);
                 }
                 for r in isl.roots.iter().take(5) {
@@ -743,9 +765,16 @@ est racine — ne pas comparer à une mesure `manifest`)",
         println!("== Sonde : {api} ==\n");
         println!(
             "nœud du graphe   {}",
-            if is_node { "oui" } else { "NON (absente du CFG : pas d'arête vers cette API)" }
+            if is_node {
+                "oui"
+            } else {
+                "NON (absente du CFG : pas d'arête vers cette API)"
+            }
         );
-        println!("atteignable      {}", if reach.reachable { "oui" } else { "non" });
+        println!(
+            "atteignable      {}",
+            if reach.reachable { "oui" } else { "non" }
+        );
         println!("racines          {} ({})", eps.len(), roots.mode.as_str());
         if reach.paths.is_empty() {
             println!("\naucun chemin depuis une racine.");
@@ -875,9 +904,9 @@ est racine — ne pas comparer à une mesure `manifest`)",
                 }
                 (found.apks, found.rejected, true)
             }
-            _ => bail!(
-                "les options --resource* requièrent soit un APK (single), soit --bulk <DIR>"
-            ),
+            _ => {
+                bail!("les options --resource* requièrent soit un APK (single), soit --bulk <DIR>")
+            }
         };
 
         run_resources(
@@ -1290,9 +1319,19 @@ fn print_native_arch(s: &drakkar::parser::native_arch::NativeArchSummary) {
 
     println!("Libs :");
     for l in &s.libs {
-        let bits = if l.bits == Bits::B64 { "64-bit" } else { "32-bit" };
+        let bits = if l.bits == Bits::B64 {
+            "64-bit"
+        } else {
+            "32-bit"
+        };
         let flag = if l.abi_mismatch { "  ⚠ MISMATCH" } else { "" };
-        println!("  {:<40} {:<8} {}{}", l.entry, l.machine.label(), bits, flag);
+        println!(
+            "  {:<40} {:<8} {}{}",
+            l.entry,
+            l.machine.label(),
+            bits,
+            flag
+        );
     }
 
     println!("\nABIs : {}   (fat: {})", s.abis.join(", "), s.is_fat);
@@ -1331,18 +1370,24 @@ fn print_and_dump_extract(
         return Ok(());
     }
 
-    std::fs::create_dir_all(out_dir)
-        .with_context(|| format!("création {}", out_dir.display()))?;
+    std::fs::create_dir_all(out_dir).with_context(|| format!("création {}", out_dir.display()))?;
 
     println!("Libs extraites ({}) -> {} :", ex.count(), out_dir.display());
     for l in &ex.libs {
-        let bits = if l.arch.bits == Bits::B64 { "64-bit" } else { "32-bit" };
-        let flag = if l.out_of_lib() { "  ⚠ HORS lib/ (packer)" } else { "" };
+        let bits = if l.arch.bits == Bits::B64 {
+            "64-bit"
+        } else {
+            "32-bit"
+        };
+        let flag = if l.out_of_lib() {
+            "  ⚠ HORS lib/ (packer)"
+        } else {
+            ""
+        };
         // nom de sortie aplati : lib/arm64-v8a/foo.so -> lib__arm64-v8a__foo.so
         let flat = l.entry.replace('/', "__");
         let dest = out_dir.join(&flat);
-        std::fs::write(&dest, &l.bytes)
-            .with_context(|| format!("écriture {}", dest.display()))?;
+        std::fs::write(&dest, &l.bytes).with_context(|| format!("écriture {}", dest.display()))?;
         println!(
             "  {:<38} {:<8} {:<7} {:>9} o  {}  -> {}{}",
             l.entry,
@@ -1419,8 +1464,7 @@ fn emit_json<T: serde::Serialize>(report: &T, dest: Option<&std::path::Path>) ->
                         .with_context(|| format!("création {}", parent.display()))?;
                 }
             }
-            std::fs::write(path, json)
-                .with_context(|| format!("écriture {}", path.display()))?;
+            std::fs::write(path, json).with_context(|| format!("écriture {}", path.display()))?;
             eprintln!("JSON écrit dans {}", path.display());
         }
         None => println!("{json}"),
@@ -1466,10 +1510,7 @@ fn print_manifest(r: &drakkar::parser::manifest_info::ManifestReport) {
         opt_bool(r.application.extract_native_libs)
     );
 
-    println!(
-        "\nPermissions requises ({}) :",
-        r.uses_permissions.len()
-    );
+    println!("\nPermissions requises ({}) :", r.uses_permissions.len());
     for p in &r.uses_permissions {
         let mut notes = Vec::new();
         if p.sdk23_only {
@@ -1662,7 +1703,9 @@ fn print_dating(r: &drakkar::parser::dating::DatingReport) {
             "  {:<14} format {}  -> API {}  ({} chaînes)",
             d.entry,
             d.format_version,
-            d.api_floor.map(|a| a.to_string()).unwrap_or_else(|| "?".into()),
+            d.api_floor
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "?".into()),
             d.string_count
         );
     }
@@ -1673,7 +1716,10 @@ fn print_dating(r: &drakkar::parser::dating::DatingReport) {
             .unwrap_or_else(|| "indisponible".into())
     );
 
-    println!("\nHorodatages de l'archive ({} entrées) :", r.archive.entry_count);
+    println!(
+        "\nHorodatages de l'archive ({} entrées) :",
+        r.archive.entry_count
+    );
     println!(
         "  {} -> {}  ({} valeurs distinctes)",
         r.archive.earliest.as_deref().unwrap_or("?"),
@@ -1688,7 +1734,10 @@ fn print_dating(r: &drakkar::parser::dating::DatingReport) {
     }
 
     if !r.library_versions.is_empty() {
-        println!("\nVersions de bibliothèques ({}) :", r.library_versions.len());
+        println!(
+            "\nVersions de bibliothèques ({}) :",
+            r.library_versions.len()
+        );
         for l in &r.library_versions {
             println!("  {:<48} {}", l.module, l.version);
         }
@@ -1704,7 +1753,10 @@ fn print_dating(r: &drakkar::parser::dating::DatingReport) {
     if r.code_dates.is_empty() {
         println!("\nLittéraux de date dans le code : aucun");
     } else {
-        println!("\nLittéraux de date dans le code ({}) :", r.code_dates.len());
+        println!(
+            "\nLittéraux de date dans le code ({}) :",
+            r.code_dates.len()
+        );
         for d in &r.code_dates {
             println!("  {}  ({} occurrence(s))", d.value, d.occurrences);
         }
@@ -1737,7 +1789,10 @@ fn print_diff_dex(r: &drakkar::parser::diff_dex::DiffReport) {
         r.ngram, r.jaccard_ngram
     );
 
-    println!("\nAppariement par classe (seuil proche = {:.2}) :", r.threshold);
+    println!(
+        "\nAppariement par classe (seuil proche = {:.2}) :",
+        r.threshold
+    );
     println!(
         "  identiques   {}   (par nom {}, par empreinte seule {})",
         r.identical_classes, r.identical_by_name, r.identical_by_hash
@@ -1762,7 +1817,9 @@ fn print_diff_dex(r: &drakkar::parser::diff_dex::DiffReport) {
     if r.static_fields_diverging > 0 {
         println!("               /!\\ une valeur statique divergente est INVISIBLE aux empreintes");
         println!("                   d'opcodes : les Jaccard ci-dessus ne la voient pas. Détail :");
-        println!("                   --diff-explain (catégorie valeur-statique) sur le même couple,");
+        println!(
+            "                   --diff-explain (catégorie valeur-statique) sur le même couple,"
+        );
         println!("                   contre-épreuve : --diff-strings.");
     }
 
@@ -1789,7 +1846,9 @@ fn print_diff_dex(r: &drakkar::parser::diff_dex::DiffReport) {
         }
     }
 
-    println!("\n(le détail des classes identiques est dans le JSON ; légende : --diff-dex --legend)");
+    println!(
+        "\n(le détail des classes identiques est dans le JSON ; légende : --diff-dex --legend)"
+    );
 }
 
 /// Ce que la passe assets émet sur stdout. Les deux formes sont disjointes :
@@ -1853,7 +1912,10 @@ fn run_assets(
     // nommé, pas écarté en silence : sur un corpus nommé par hachage, une
     // disparition muette est indiscernable d'une absence.
     for (path, why) in rejected {
-        eprintln!("[FAIL]  {}  — non reconnu comme APK : {why}", path.display());
+        eprintln!(
+            "[FAIL]  {}  — non reconnu comme APK : {why}",
+            path.display()
+        );
         index.failed.push(assets::FailedSample {
             sample: stem_of(path),
             path: path.display().to_string(),
@@ -1871,9 +1933,8 @@ fn run_assets(
 
         // Une archive pourrie peut faire paniquer un décodeur : on isole pour
         // qu'elle ne tue pas le lot.
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            assets::collect(apk, opts)
-        }));
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| assets::collect(apk, opts)));
         let mut report = match outcome {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
@@ -1897,7 +1958,13 @@ fn run_assets(
         };
 
         // En bulk, un sous-répertoire par échantillon ; en single, le DIR demandé.
-        let dest = out.map(|d| if bulk_mode { d.join(&sample) } else { d.to_path_buf() });
+        let dest = out.map(|d| {
+            if bulk_mode {
+                d.join(&sample)
+            } else {
+                d.to_path_buf()
+            }
+        });
         if let Some(dir) = &dest {
             match assets::write_all(&mut report, dir) {
                 Ok(json) => eprintln!("[JSON]  {sample} — {}", json.display()),
@@ -1995,7 +2062,10 @@ fn run_assets(
 /// doit décrire exactement les colonnes produites.
 enum ResourceOutput {
     /// `--resource` et/ou `--resource-id` : résolution ciblée.
-    Lookup { names: Vec<String>, ids: Vec<String> },
+    Lookup {
+        names: Vec<String>,
+        ids: Vec<String>,
+    },
     /// `--resources [TYPE…]` : dump, filtrable par type.
     Dump(Vec<String>),
     /// `--resource-xref` : une ligne par usage depuis le code.
@@ -2036,8 +2106,14 @@ fn run_resources(
     // Un fichier à signature ZIP dont aucun lecteur n'a tiré de manifest est
     // nommé, pas écarté en silence.
     for (path, why) in rejected {
-        eprintln!("[FAIL]  {}  — non reconnu comme APK : {why}", path.display());
-        failures.push(format!("{} : non reconnu comme APK : {why}", path.display()));
+        eprintln!(
+            "[FAIL]  {}  — non reconnu comme APK : {why}",
+            path.display()
+        );
+        failures.push(format!(
+            "{} : non reconnu comme APK : {why}",
+            path.display()
+        ));
     }
 
     for apk in inputs {
@@ -2063,7 +2139,9 @@ fn run_resources(
             }
             Err(_) => {
                 eprintln!("[PANIC] {sample} — lecture des ressources abandonnée");
-                failures.push(format!("{sample} : panique pendant la lecture des ressources"));
+                failures.push(format!(
+                    "{sample} : panique pendant la lecture des ressources"
+                ));
                 continue;
             }
         };
@@ -2074,7 +2152,17 @@ fn run_resources(
         let packages: Vec<String> = table
             .packages
             .iter()
-            .map(|p| format!("{:#04x}={}", p.id, if p.name.is_empty() { "?" } else { p.name.as_str() }))
+            .map(|p| {
+                format!(
+                    "{:#04x}={}",
+                    p.id,
+                    if p.name.is_empty() {
+                        "?"
+                    } else {
+                        p.name.as_str()
+                    }
+                )
+            })
             .collect();
 
         if let Some(xref) = &xref {
@@ -2140,9 +2228,7 @@ fn run_resources(
                 selected = table
                     .entries
                     .iter()
-                    .filter(|e| {
-                        wanted.is_empty() || wanted.contains(&e.type_name.to_lowercase())
-                    })
+                    .filter(|e| wanted.is_empty() || wanted.contains(&e.type_name.to_lowercase()))
                     .collect();
                 if !wanted.is_empty() && selected.is_empty() {
                     eprintln!(
@@ -2294,7 +2380,11 @@ fn print_and_dump_entries(
 ) -> Result<()> {
     println!("== Extraction ciblée ==");
     println!("Motifs   : {}", ex.patterns.join(", "));
-    println!("Entrées  : {} retenue(s) sur {} dans l'archive", ex.count(), ex.scanned);
+    println!(
+        "Entrées  : {} retenue(s) sur {} dans l'archive",
+        ex.count(),
+        ex.scanned
+    );
 
     if ex.is_empty() {
         println!("\nAucune entrée ne correspond. `--list-entries` donne l'arborescence.");

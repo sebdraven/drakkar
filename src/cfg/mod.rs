@@ -56,7 +56,11 @@ pub struct CallGraph {
 
 impl CallGraph {
     pub fn new() -> Self {
-        Self { graph: DiGraph::new(), index: HashMap::new(), supers: HashMap::new() }
+        Self {
+            graph: DiGraph::new(),
+            index: HashMap::new(),
+            supers: HashMap::new(),
+        }
     }
 
     /// Injecte la hiérarchie de classes relevée au parsing
@@ -109,7 +113,9 @@ impl CallGraph {
 
     /// Au moins une méthode du graphe matche `api` (sous-chaîne).
     pub fn has_api(&self, api: &str) -> bool {
-        self.graph.node_indices().any(|n| self.graph[n].api().contains(api))
+        self.graph
+            .node_indices()
+            .any(|n| self.graph[n].api().contains(api))
     }
 
     /// Renvoie les nœuds entrypoint : méthode dont le nom est un callback
@@ -216,7 +222,10 @@ impl CallGraph {
             .filter(|&n| self.graph[n].api().contains(api))
             .collect();
         if targets.is_empty() {
-            return Reachability { reachable: false, paths: Vec::new() };
+            return Reachability {
+                reachable: false,
+                paths: Vec::new(),
+            };
         }
 
         let mut paths = Vec::new();
@@ -225,7 +234,10 @@ impl CallGraph {
                 paths.push(path);
             }
         }
-        Reachability { reachable: !paths.is_empty(), paths }
+        Reachability {
+            reachable: !paths.is_empty(),
+            paths,
+        }
     }
 
     /// Clôture dirigée R(M) : nœuds atteignables depuis au moins un entrypoint.
@@ -292,8 +304,10 @@ impl CallGraph {
     /// pour ne pas dépendre du format d'`api()`. Sert à réinjecter les handlers UI
     /// (`ui_callbacks`) comme racines supplémentaires avant `orphan_audit`.
     pub fn nodes_for(&self, roots: &[(String, String)]) -> Vec<NodeIndex> {
-        let want: HashSet<(&str, &str)> =
-            roots.iter().map(|(c, m)| (c.as_str(), m.as_str())).collect();
+        let want: HashSet<(&str, &str)> = roots
+            .iter()
+            .map(|(c, m)| (c.as_str(), m.as_str()))
+            .collect();
         self.graph
             .node_indices()
             .filter(|&n| {
@@ -741,7 +755,12 @@ impl CallGraph {
                     node = p;
                 }
                 chain.reverse();
-                return Some(chain.into_iter().map(|n| self.graph[n].signature()).collect());
+                return Some(
+                    chain
+                        .into_iter()
+                        .map(|n| self.graph[n].signature())
+                        .collect(),
+                );
             }
             for next in self.graph.neighbors_directed(cur, Direction::Outgoing) {
                 if visited.insert(next) {
@@ -805,7 +824,11 @@ pub struct PivotConstraints {
 impl Default for PivotConstraints {
     fn default() -> Self {
         // Défaut prudent : on exige juste un pivot non-racine.
-        Self { exclude_entrypoints: true, max_dist: None, exclude_allowlisted: false }
+        Self {
+            exclude_entrypoints: true,
+            max_dist: None,
+            exclude_allowlisted: false,
+        }
     }
 }
 
@@ -824,7 +847,12 @@ pub struct CoReach {
 
 impl CoReach {
     fn empty() -> Self {
-        CoReach { reachable: false, pivot: None, path_first: Vec::new(), path_second: Vec::new() }
+        CoReach {
+            reachable: false,
+            pivot: None,
+            path_first: Vec::new(),
+            path_second: Vec::new(),
+        }
     }
 }
 
@@ -964,10 +992,19 @@ mod tests {
 
     #[test]
     fn prefix_stops_before_class_name() {
-        assert_eq!(package_prefix("Lorg/xmlpush/v3/PushService;"), "Lorg/xmlpush/v3");
-        assert_eq!(package_prefix("Lhelper/sqlite/database/DbHelper;"), "Lhelper/sqlite/database");
+        assert_eq!(
+            package_prefix("Lorg/xmlpush/v3/PushService;"),
+            "Lorg/xmlpush/v3"
+        );
+        assert_eq!(
+            package_prefix("Lhelper/sqlite/database/DbHelper;"),
+            "Lhelper/sqlite/database"
+        );
         // Au-delà de 3 segments, on tronque.
-        assert_eq!(package_prefix("Lcom/google/android/gms/ads/Foo;"), "Lcom/google/android");
+        assert_eq!(
+            package_prefix("Lcom/google/android/gms/ads/Foo;"),
+            "Lcom/google/android"
+        );
         // Moins de 3 segments : le nom de classe reste exclu.
         assert_eq!(package_prefix("Lcom/x/Foo$1;"), "Lcom/x");
         assert_eq!(package_prefix("LFoo;"), "LFoo");
@@ -977,8 +1014,14 @@ mod tests {
     fn closure_prend_super_et_sous_classes() {
         let mut cg = CallGraph::new();
         cg.set_supers(HashMap::from([
-            ("Lapp/MyService;".to_string(), "Lapp/BaseService;".to_string()),
-            ("Lapp/BaseService;".to_string(), "Landroid/app/Service;".to_string()),
+            (
+                "Lapp/MyService;".to_string(),
+                "Lapp/BaseService;".to_string(),
+            ),
+            (
+                "Lapp/BaseService;".to_string(),
+                "Landroid/app/Service;".to_string(),
+            ),
             ("Lapp/Child;".to_string(), "Lapp/MyService;".to_string()),
             ("Lapp/Sibling;".to_string(), "Lapp/BaseService;".to_string()),
         ]));

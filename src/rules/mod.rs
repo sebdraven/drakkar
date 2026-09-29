@@ -128,8 +128,10 @@ impl Engine {
                         e.paths = reach.paths;
                         // Profondeur min racine->API (-1 si non atteignable) et fan-in
                         // call-site : à combien de sauts et depuis combien d'appels.
-                        e.depth =
-                            Some(cg.min_depth(&e.value, &entrypoints).map_or(-1, |d| d as i64));
+                        e.depth = Some(
+                            cg.min_depth(&e.value, &entrypoints)
+                                .map_or(-1, |d| d as i64),
+                        );
                         e.fanin = Some(cg.fan_in(&e.value));
                     }
                 }

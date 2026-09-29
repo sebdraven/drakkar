@@ -264,7 +264,10 @@ fn decode_tolerant(data: &[u8]) -> Result<Element> {
             // champ crédible pour retrouver le chunk suivant.
             hsize
         } else {
-            tracing::debug!(offset = off, "taille de chunk inexploitable, parcours interrompu");
+            tracing::debug!(
+                offset = off,
+                "taille de chunk inexploitable, parcours interrompu"
+            );
             break;
         };
         let chunk = &data[off..off + step];
@@ -543,7 +546,10 @@ fn length_u16(d: &[u8], off: usize) -> Option<(usize, usize)> {
         return Some((first as usize, off + 2));
     }
     let second = u16_at(d, off + 2)?;
-    Some(((((first & 0x7fff) as usize) << 16) | second as usize, off + 4))
+    Some((
+        (((first & 0x7fff) as usize) << 16) | second as usize,
+        off + 4,
+    ))
 }
 
 fn decode_utf8(d: &[u8], off: usize) -> Option<String> {

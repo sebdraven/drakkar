@@ -43,11 +43,13 @@ pub fn ensure_cache(refresh: bool) -> Result<PathBuf> {
     let dir = cache_dir()?;
     let populated = dir.is_dir()
         && std::fs::read_dir(&dir)
-            .map(|mut it| it.any(|e| {
-                e.ok()
-                    .map(|e| e.path().extension().and_then(|x| x.to_str()) == Some("yaml"))
-                    .unwrap_or(false)
-            }))
+            .map(|mut it| {
+                it.any(|e| {
+                    e.ok()
+                        .map(|e| e.path().extension().and_then(|x| x.to_str()) == Some("yaml"))
+                        .unwrap_or(false)
+                })
+            })
             .unwrap_or(false);
 
     // Le cache n'est valide que si sa version (hash du catalogue au moment de la
@@ -73,8 +75,7 @@ pub fn ensure_cache(refresh: bool) -> Result<PathBuf> {
     };
     tracing::info!(reason, "regenerating rules cache");
     generate_cache(&dir, refresh)?;
-    std::fs::write(dir.join(".catalog_hash"), current.to_string())
-        .context("write catalog hash")?;
+    std::fs::write(dir.join(".catalog_hash"), current.to_string()).context("write catalog hash")?;
     Ok(dir)
 }
 
@@ -97,16 +98,14 @@ fn generate_cache(dir: &Path, refresh: bool) -> Result<()> {
             static_count += 1;
         } else {
             detectability = "out-of-scope";
-            features_block = format!(
-                "  unsupported: \"Not statically detectable from APK package contents\""
-            );
+            features_block =
+                format!("  unsupported: \"Not statically detectable from APK package contents\"");
             oos_count += 1;
         }
 
         let yaml = render_rule_yaml(t, detectability, &features_block);
         let fname = format!("{}.yaml", t.id.replace('.', "_"));
-        std::fs::write(dir.join(&fname), yaml)
-            .with_context(|| format!("write {fname}"))?;
+        std::fs::write(dir.join(&fname), yaml).with_context(|| format!("write {fname}"))?;
     }
 
     tracing::info!(
@@ -250,7 +249,11 @@ fn extract_android_techniques(bundle: &StixBundle) -> Vec<Technique> {
         out.push(Technique {
             id,
             name: obj.name.clone().unwrap_or_default(),
-            tactics: obj.kill_chain_phases.iter().map(|p| p.phase_name.clone()).collect(),
+            tactics: obj
+                .kill_chain_phases
+                .iter()
+                .map(|p| p.phase_name.clone())
+                .collect(),
             platforms: obj.platforms.clone(),
             url,
         });

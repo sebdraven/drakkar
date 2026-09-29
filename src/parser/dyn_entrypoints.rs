@@ -361,7 +361,14 @@ pub fn extract(path: &Path) -> Result<DynEntrypointReport> {
             // `this` est le premier d'entre eux. `ACC_STATIC` dit s'il y en a un.
             let this_reg = this_register(method.is_static, code.registers_size, code.ins_size);
 
-            scan_method(&dex, &instructions, &caller, this_reg, &assignments, &mut report);
+            scan_method(
+                &dex,
+                &instructions,
+                &caller,
+                this_reg,
+                &assignments,
+                &mut report,
+            );
         }
     }
 
@@ -402,7 +409,15 @@ fn scan_method(
             &instructions[i.saturating_sub(MAX_LOOKBACK)..i]
         };
 
-        match backtrack_literal(dex, window, ins, &spec, assignments, this_reg, &caller.class) {
+        match backtrack_literal(
+            dex,
+            window,
+            ins,
+            &spec,
+            assignments,
+            this_reg,
+            &caller.class,
+        ) {
             Ok((class, provenance)) => report.entrypoints.push(DynEntrypoint {
                 class,
                 via,
@@ -716,7 +731,10 @@ fn literal_of(
 pub(crate) fn operand_index(ins: &dex_bytecode::Instruction, tag: &str) -> Option<u64> {
     let ops = ins.operands();
     let pos = ops.find(tag)? + tag.len();
-    let digits: String = ops[pos..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = ops[pos..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     digits.parse().ok()
 }
 
@@ -727,7 +745,8 @@ fn looks_like_class_name(s: &str) -> bool {
     if !(s.contains('.')
         && !s.contains(' ')
         && !s.contains('/')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '$')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '$')
         && s.split('.').count() >= 2)
     {
         return false;
@@ -814,7 +833,10 @@ pub fn extract_any(path: &Path) -> Result<DynEntrypointReport> {
 pub fn collect_inputs(dir: &Path, recursive: bool) -> Result<Vec<std::path::PathBuf>> {
     let mut out = Vec::new();
     if recursive {
-        for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        for entry in walkdir::WalkDir::new(dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             let p = entry.path();
             if p.is_file() && sniff(p).is_some() {
                 out.push(p.to_path_buf());
@@ -838,8 +860,10 @@ mod tests {
 
     #[test]
     fn descriptor_conversion() {
-        assert_eq!(to_descriptor("com.cocospy.receivers.SMSReceiver"),
-                   "Lcom/cocospy/receivers/SMSReceiver;");
+        assert_eq!(
+            to_descriptor("com.cocospy.receivers.SMSReceiver"),
+            "Lcom/cocospy/receivers/SMSReceiver;"
+        );
     }
 
     #[test]
@@ -860,7 +884,9 @@ mod tests {
     fn class_name_heuristic() {
         assert!(looks_like_class_name("com.cocospy.receivers.SMSReceiver"));
         assert!(!looks_like_class_name("android.intent.action.SCREEN_OFF"));
-        assert!(!looks_like_class_name("android.provider.Telephony.SMS_RECEIVED"));
+        assert!(!looks_like_class_name(
+            "android.provider.Telephony.SMS_RECEIVED"
+        ));
         assert!(!looks_like_class_name("com.cocospy.filldb.finish"));
         assert!(!looks_like_class_name("hello world"));
         assert!(!looks_like_class_name("plugin.apk"));

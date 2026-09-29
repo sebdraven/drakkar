@@ -128,10 +128,26 @@ pub struct MatrixReport {
 // ── Extraction ───────────────────────────────────────────────────────────────
 
 const LIB_PREFIXES: &[&str] = &[
-    "Landroid/", "Landroidx/", "Ljava/", "Ljavax/", "Lkotlin/", "Lkotlinx/",
-    "Ldalvik/", "Lrx/", "Lio/reactivex/", "Lokhttp3/", "Lokio/", "Lretrofit2/",
-    "Lcom/google/", "Lcom/alibaba/", "Lcom/umeng/", "Lorg/apache/", "Lorg/json/",
-    "Lorg/xmlpull/", "Luk/co/chrisjenx/", "Lgov/nist/",
+    "Landroid/",
+    "Landroidx/",
+    "Ljava/",
+    "Ljavax/",
+    "Lkotlin/",
+    "Lkotlinx/",
+    "Ldalvik/",
+    "Lrx/",
+    "Lio/reactivex/",
+    "Lokhttp3/",
+    "Lokio/",
+    "Lretrofit2/",
+    "Lcom/google/",
+    "Lcom/alibaba/",
+    "Lcom/umeng/",
+    "Lorg/apache/",
+    "Lorg/json/",
+    "Lorg/xmlpull/",
+    "Luk/co/chrisjenx/",
+    "Lgov/nist/",
 ];
 
 fn is_application_class(descriptor: &str) -> bool {
@@ -359,8 +375,8 @@ fn collect_dex_paths(input: &Path) -> Result<(Vec<PathBuf>, Option<tempfile::Tem
 
     let mut magic = [0u8; 4];
     {
-        let mut f = std::fs::File::open(input)
-            .with_context(|| format!("open {}", input.display()))?;
+        let mut f =
+            std::fs::File::open(input).with_context(|| format!("open {}", input.display()))?;
         if f.read(&mut magic)? < 4 {
             bail!("{} trop court", input.display());
         }
@@ -399,16 +415,28 @@ pub fn render(r: &MatrixReport, opts: &MatrixOptions) -> String {
     let n = r.samples.len();
     let mut s = String::new();
 
-    s.push_str(&format!("== Matrice de similarité — métrique « {} » ==\n\n", r.metric.label()));
+    s.push_str(&format!(
+        "== Matrice de similarité — métrique « {} » ==\n\n",
+        r.metric.label()
+    ));
     s.push_str(&format!("Répertoire  {}\n", r.dir));
-    s.push_str(&format!("Échantillons {}   paires {}   seuil de groupe {:.2}\n\n", n, r.pairs.len(), r.threshold));
+    s.push_str(&format!(
+        "Échantillons {}   paires {}   seuil de groupe {:.2}\n\n",
+        n,
+        r.pairs.len(),
+        r.threshold
+    ));
 
     // ── Légende des indices ──
     s.push_str("Échantillons :\n");
     for (i, si) in r.samples.iter().enumerate() {
         s.push_str(&format!(
             "  {:>2}  {:<28} {:>5} classes  {:>6} méthodes  {:>6} chaînes\n",
-            i + 1, si.name, si.classes, si.methods, si.strings
+            i + 1,
+            si.name,
+            si.classes,
+            si.methods,
+            si.strings
         ));
     }
 
@@ -453,8 +481,17 @@ pub fn render(r: &MatrixReport, opts: &MatrixOptions) -> String {
     }
 
     // ── Classement des paires ──
-    let shown = if opts.top == 0 { r.pairs.len() } else { opts.top.min(r.pairs.len()) };
-    s.push_str(&format!("\nPaires, {} décroissant ({} sur {}) :\n", r.metric.label(), shown, r.pairs.len()));
+    let shown = if opts.top == 0 {
+        r.pairs.len()
+    } else {
+        opts.top.min(r.pairs.len())
+    };
+    s.push_str(&format!(
+        "\nPaires, {} décroissant ({} sur {}) :\n",
+        r.metric.label(),
+        shown,
+        r.pairs.len()
+    ));
     s.push_str(&format!(
         "  {:<26} {:<26} {:>8} {:>8} {:>10}\n",
         "A", "B", "opcodes", "chaînes", "div. str."
@@ -462,21 +499,30 @@ pub fn render(r: &MatrixReport, opts: &MatrixOptions) -> String {
     for p in r.pairs.iter().take(shown) {
         s.push_str(&format!(
             "  {:<26} {:<26} {:>8.4} {:>8.4} {:>10}\n",
-            truncate(&p.a, 26), truncate(&p.b, 26),
-            p.jaccard_opcodes, p.jaccard_strings, p.divergent_strings
+            truncate(&p.a, 26),
+            truncate(&p.b, 26),
+            p.jaccard_opcodes,
+            p.jaccard_strings,
+            p.divergent_strings
         ));
     }
 
     // ── Groupes ──
     s.push_str(&format!(
         "\nGroupes (lien simple, {} ≥ {:.2}) :\n",
-        r.metric.label(), r.threshold
+        r.metric.label(),
+        r.threshold
     ));
     for (k, g) in r.groups.iter().enumerate() {
         if g.len() == 1 {
             s.push_str(&format!("  [{}] isolé : {}\n", k + 1, g[0]));
         } else {
-            s.push_str(&format!("  [{}] {} membres : {}\n", k + 1, g.len(), g.join(", ")));
+            s.push_str(&format!(
+                "  [{}] {} membres : {}\n",
+                k + 1,
+                g.len(),
+                g.join(", ")
+            ));
         }
     }
 
@@ -494,7 +540,10 @@ fn truncate(s: &str, max: usize) -> String {
     if n <= max {
         return s.to_string();
     }
-    format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+    format!(
+        "{}…",
+        s.chars().take(max.saturating_sub(1)).collect::<String>()
+    )
 }
 
 /// Légende (`--diff-matrix DIR --legend`).

@@ -89,8 +89,7 @@ pub struct TolerantZip {
 impl TolerantZip {
     /// Ouvre un APK depuis le disque.
     pub fn open(path: &Path) -> Result<Self> {
-        let meta = std::fs::metadata(path)
-            .with_context(|| format!("stat {}", path.display()))?;
+        let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
         if meta.len() > MAX_IN_MEMORY {
             bail!(
                 "{} fait {} octets, au-delà de la limite du lecteur tolérant ({} octets)",
@@ -99,8 +98,7 @@ impl TolerantZip {
                 MAX_IN_MEMORY
             );
         }
-        let data = std::fs::read(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let data = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
         Self::from_bytes(data)
     }
 

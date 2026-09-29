@@ -180,7 +180,12 @@ impl DexBin {
             })
             .collect::<Vec<_>>();
 
-        Ok(Self { dex, strings, types, protos })
+        Ok(Self {
+            dex,
+            strings,
+            types,
+            protos,
+        })
     }
 
     /// Chaîne du pool, `None` si l'index est hors bornes ou l'entrée illisible.
@@ -244,12 +249,21 @@ impl DexBin {
 
         let mut methods = Vec::new();
         if let Some(data) = self.dex.get_class_data(&class_def)? {
-            for enc in data.direct_methods.iter().chain(data.virtual_methods.iter()) {
+            for enc in data
+                .direct_methods
+                .iter()
+                .chain(data.virtual_methods.iter())
+            {
                 methods.push(self.method_at(enc.method_idx, enc.access_flags, enc.code_off)?);
             }
         }
 
-        Ok(DexClass { descriptor, superclass, methods, class_def })
+        Ok(DexClass {
+            descriptor,
+            superclass,
+            methods,
+            class_def,
+        })
     }
 
     fn method_at<'a>(
@@ -262,7 +276,10 @@ impl DexBin {
         let name = self
             .string(m.name_idx)
             .with_context(|| format!("method_ids[{method_idx}] : nom illisible"))?;
-        let proto = self.protos.get(m.proto_idx as usize).and_then(|p| p.as_ref());
+        let proto = self
+            .protos
+            .get(m.proto_idx as usize)
+            .and_then(|p| p.as_ref());
 
         let code = if code_off == 0 {
             None
@@ -343,24 +360,23 @@ impl DexBin {
             EncodedValue::Double(n) => DexValue::Double(*n),
             EncodedValue::Boolean(b) => DexValue::Bool(*b),
             EncodedValue::Null => DexValue::Null,
-            EncodedValue::String(i) => self
-                .string(*i)
-                .map_or(DexValue::Opaque("string?"), |s| DexValue::Str(s.to_string())),
+            EncodedValue::String(i) => self.string(*i).map_or(DexValue::Opaque("string?"), |s| {
+                DexValue::Str(s.to_string())
+            }),
             EncodedValue::Type(i) => self
                 .typ(*i)
                 .map_or(DexValue::Opaque("type?"), |t| DexValue::Type(t.to_string())),
-            EncodedValue::Field(i) => self.field_item(*i).map_or(
-                DexValue::Opaque("field?"),
-                |f| DexValue::Field(format!("{}->{}:{}", f.class, f.name, f.typ)),
-            ),
-            EncodedValue::Enum(i) => self.field_item(*i).map_or(
-                DexValue::Opaque("enum?"),
-                |f| DexValue::Enum(format!("{}->{}:{}", f.class, f.name, f.typ)),
-            ),
-            EncodedValue::Method(i) => self.method_item(*i).map_or(
-                DexValue::Opaque("method?"),
-                |m| DexValue::Method(format!("{}->{}", m.class, m.name)),
-            ),
+            EncodedValue::Field(i) => self.field_item(*i).map_or(DexValue::Opaque("field?"), |f| {
+                DexValue::Field(format!("{}->{}:{}", f.class, f.name, f.typ))
+            }),
+            EncodedValue::Enum(i) => self.field_item(*i).map_or(DexValue::Opaque("enum?"), |f| {
+                DexValue::Enum(format!("{}->{}:{}", f.class, f.name, f.typ))
+            }),
+            EncodedValue::Method(i) => self
+                .method_item(*i)
+                .map_or(DexValue::Opaque("method?"), |m| {
+                    DexValue::Method(format!("{}->{}", m.class, m.name))
+                }),
             EncodedValue::Array(vs) => {
                 DexValue::Array(vs.iter().map(|x| self.value_of(x)).collect())
             }
@@ -380,7 +396,10 @@ fn pair_statics(names: Vec<String>, values: Vec<DexValue>) -> Vec<StaticField> {
     let mut values = values.into_iter();
     names
         .into_iter()
-        .map(|name| StaticField { name, value: values.next() })
+        .map(|name| StaticField {
+            name,
+            value: values.next(),
+        })
         .collect()
 }
 

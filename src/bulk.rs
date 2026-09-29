@@ -8,8 +8,8 @@
 
 use crate::parser;
 use crate::rules::Engine;
-use petgraph::graph::NodeIndex;
 use anyhow::Result;
+use petgraph::graph::NodeIndex;
 use rayon::prelude::*;
 use serde::Serialize;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -106,7 +106,10 @@ pub fn run(input_dir: &Path, engine: &Engine, opts: &BulkOptions) -> Result<()> 
     let skipped = AtomicUsize::new(0);
 
     for (path, why) in &found.rejected {
-        eprintln!("[FAIL]  {}  — non reconnu comme APK : {why}", path.display());
+        eprintln!(
+            "[FAIL]  {}  — non reconnu comme APK : {why}",
+            path.display()
+        );
     }
 
     apks.par_iter().for_each(|apk| {
@@ -202,7 +205,10 @@ fn collect_with(dir: &Path, recursive: bool, keep_raw_dex: bool) -> Result<Colle
     };
 
     if recursive {
-        for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        for entry in walkdir::WalkDir::new(dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             let p = entry.path();
             if p.is_file() {
                 consider(p.to_path_buf());
@@ -266,7 +272,11 @@ fn recognize(p: &Path) -> Recognition {
 
     match parser::apkzip::TolerantZip::open(p) {
         Ok(zip) => {
-            if zip.entries().iter().any(|e| e.name == "AndroidManifest.xml") {
+            if zip
+                .entries()
+                .iter()
+                .any(|e| e.name == "AndroidManifest.xml")
+            {
                 Recognition::Apk
             } else {
                 Recognition::ZipWithoutManifest(format!(
@@ -275,9 +285,7 @@ fn recognize(p: &Path) -> Recognition {
                 ))
             }
         }
-        Err(e) => Recognition::ZipWithoutManifest(format!(
-            "{nominal} ; lecteur tolérant : {e:#}"
-        )),
+        Err(e) => Recognition::ZipWithoutManifest(format!("{nominal} ; lecteur tolérant : {e:#}")),
     }
 }
 
@@ -311,7 +319,10 @@ pub fn run_inventory(input_dir: &Path, what: Inventory, opts: &BulkOptions) -> R
     let skipped = AtomicUsize::new(0);
 
     for (path, why) in &found.rejected {
-        eprintln!("[FAIL]  {}  — non reconnu comme APK : {why}", path.display());
+        eprintln!(
+            "[FAIL]  {}  — non reconnu comme APK : {why}",
+            path.display()
+        );
     }
     let csv_mode = opts.format == BulkFormat::Csv;
     // Un rendu groupé (CSV, ou JSON vers stdout) impose d'accumuler les rapports
@@ -762,7 +773,10 @@ pub fn build_orphan_roots(path: &Path, parsed: &parser::ParsedApk) -> Result<Orp
     let (mode, base) = if parsed.features.components.is_empty() {
         (RootsMode::Heuristic, cg.heuristic_entrypoints())
     } else {
-        (RootsMode::Manifest, cg.entrypoints(&parsed.features.components))
+        (
+            RootsMode::Manifest,
+            cg.entrypoints(&parsed.features.components),
+        )
     };
 
     // Étage 2 : + classes atteintes dynamiquement (registerReceiver, Intent…).
@@ -787,7 +801,13 @@ pub fn build_orphan_roots(path: &Path, parsed: &parser::ParsedApk) -> Result<Orp
     all.sort();
     all.dedup();
 
-    Ok(OrphanRoots { mode, base, with_dyn, with_ui, all })
+    Ok(OrphanRoots {
+        mode,
+        base,
+        with_dyn,
+        with_ui,
+        all,
+    })
 }
 
 /// Sous-chaînes `class->name` des sinks sondés en colonnes. Vocabulaire aligné
@@ -897,7 +917,13 @@ pub fn orphan_audit_sample(apk: &Path) -> Result<OrphanSample> {
     let parsed = parser::parse_any(apk)?;
     let cg = &parsed.call_graph;
     let roots = build_orphan_roots(apk, &parsed)?;
-    let OrphanRoots { mode, base, with_dyn, with_ui, all } = &roots;
+    let OrphanRoots {
+        mode,
+        base,
+        with_dyn,
+        with_ui,
+        all,
+    } = &roots;
 
     let report = cg.orphan_audit(all, "loadLibrary");
 
@@ -910,7 +936,13 @@ pub fn orphan_audit_sample(apk: &Path) -> Result<OrphanSample> {
     let biggest = report.islands.iter().max_by_key(|i| i.size);
     let biggest_size = biggest.map(|i| i.size).unwrap_or(0);
     let biggest_author_pct = biggest
-        .map(|i| if i.size > 0 { (100 * i.author_nodes / i.size) as u32 } else { 0 })
+        .map(|i| {
+            if i.size > 0 {
+                (100 * i.author_nodes / i.size) as u32
+            } else {
+                0
+            }
+        })
         .unwrap_or(0);
 
     let loadlib = probe_sink(cg, SINK_LOADLIB, all);
@@ -987,7 +1019,10 @@ pub fn run_orphan_audit(input_dir: &Path, opts: &BulkOptions) -> Result<()> {
     let ok = AtomicUsize::new(0);
     let failed = AtomicUsize::new(found.rejected.len());
     for (path, why) in &found.rejected {
-        eprintln!("[FAIL]  {}  — non reconnu comme APK : {why}", path.display());
+        eprintln!(
+            "[FAIL]  {}  — non reconnu comme APK : {why}",
+            path.display()
+        );
     }
 
     let rows: Mutex<Vec<OrphanSample>> = Mutex::new(Vec::new());

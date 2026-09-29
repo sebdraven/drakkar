@@ -39,8 +39,8 @@ pub fn extract(apk_path: &Path, features: &mut ApkFeatures) -> Result<()> {
 /// à l'ouverture de l'archive. Sur les APK trafiqués, l'ouverture passe et c'est
 /// `by_name` ou `read_to_end` qui échoue.
 fn read_manifest_bytes(apk_path: &Path) -> Result<Vec<u8>> {
-    let file = std::fs::File::open(apk_path)
-        .with_context(|| format!("open {}", apk_path.display()))?;
+    let file =
+        std::fs::File::open(apk_path).with_context(|| format!("open {}", apk_path.display()))?;
 
     let nominal = (|| -> Result<Vec<u8>> {
         let mut zip = zip::ZipArchive::new(file).context("read apk as zip")?;

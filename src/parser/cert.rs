@@ -768,7 +768,9 @@ fn derive_anomalies(r: &SigningReport) -> Vec<String> {
         if c.public_key.algorithm == "RSA" {
             if let Some(bits) = c.public_key.size_bits {
                 if bits < 2048 {
-                    a.push(format!("{who} : clé RSA de {bits} bits — sous le seuil de 2048"));
+                    a.push(format!(
+                        "{who} : clé RSA de {bits} bits — sous le seuil de 2048"
+                    ));
                 }
             }
         }

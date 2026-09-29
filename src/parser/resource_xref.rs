@@ -66,8 +66,8 @@
 //! construction ; le second sort quand même, mais sans corroboration.
 
 use super::arsc::{ResourceEntry, ResourceTable};
-use super::disasm::{resolve, Operand};
 use super::dex_facade::{DexBin, DexValue};
+use super::disasm::{resolve, Operand};
 use super::dyn_entrypoints::{dest_register, registers, writes_register};
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -303,11 +303,7 @@ pub fn scan(apk: &Path, table: &ResourceTable) -> Result<XrefReport> {
     report.stats.matched = report.uses.len() - report.stats.via_static_field;
     report.stats.distinct_rejected = rejected.len();
     report.stats.distinct_ids = report.used.len();
-    report.stats.corroborated = report
-        .uses
-        .iter()
-        .filter(|u| u.consumer.is_some())
-        .count();
+    report.stats.corroborated = report.uses.iter().filter(|u| u.consumer.is_some()).count();
 
     tracing::info!(
         uses = report.uses.len(),
@@ -411,8 +407,8 @@ fn scan_dex(
                 let Some(value) = const_literal(bytes, ins.opcode(), ins.offset as usize) else {
                     continue;
                 };
-                let consumer = dest_register(ins)
-                    .and_then(|reg| find_consumer(&dex, &instructions, i, reg));
+                let consumer =
+                    dest_register(ins).and_then(|reg| find_consumer(&dex, &instructions, i, reg));
                 record(
                     table,
                     report,
@@ -498,15 +494,14 @@ fn record(
 /// Restreinte à la plage des packages de la table : un `static final int`
 /// quelconque n'a rien à faire dans l'index, et sa présence ferait passer pour
 /// une ressource le premier `sget` venu.
-fn index_static_ints(
-    dex: &DexBin,
-    table: &ResourceTable,
-) -> HashMap<(String, String), u32> {
+fn index_static_ints(dex: &DexBin, table: &ResourceTable) -> HashMap<(String, String), u32> {
     let mut out = HashMap::new();
     for class in dex.classes() {
         let Ok(class) = class else { continue };
         // Un class_data illisible saute la classe, il ne tue pas le balayage.
-        let Ok(fields) = dex.static_fields(&class) else { continue };
+        let Ok(fields) = dex.static_fields(&class) else {
+            continue;
+        };
         let owner = class.descriptor.to_string();
         for field in fields {
             let Some(DexValue::Int(v)) = field.value else {

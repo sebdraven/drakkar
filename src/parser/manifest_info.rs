@@ -304,33 +304,90 @@ pub struct Entrypoint {
 /// Actions de broadcast qui réveillent le process sans interaction utilisateur.
 /// Chaque entrée : (action, description courte pour le rapport).
 const AUTOSTART_ACTIONS: &[(&str, &str)] = &[
-    ("android.intent.action.BOOT_COMPLETED", "démarrage de l'appareil"),
-    ("android.intent.action.LOCKED_BOOT_COMPLETED", "démarrage avant déverrouillage"),
-    ("android.intent.action.QUICKBOOT_POWERON", "démarrage rapide (OEM)"),
-    ("com.htc.intent.action.QUICKBOOT_POWERON", "démarrage rapide (HTC)"),
-    ("android.intent.action.MY_PACKAGE_REPLACED", "mise à jour de l'app elle-même"),
-    ("android.intent.action.PACKAGE_REPLACED", "mise à jour d'un paquet tiers"),
-    ("android.intent.action.PACKAGE_ADDED", "installation d'un paquet"),
-    ("android.intent.action.PACKAGE_REMOVED", "désinstallation d'un paquet"),
-    ("android.intent.action.USER_PRESENT", "déverrouillage de l'écran"),
+    (
+        "android.intent.action.BOOT_COMPLETED",
+        "démarrage de l'appareil",
+    ),
+    (
+        "android.intent.action.LOCKED_BOOT_COMPLETED",
+        "démarrage avant déverrouillage",
+    ),
+    (
+        "android.intent.action.QUICKBOOT_POWERON",
+        "démarrage rapide (OEM)",
+    ),
+    (
+        "com.htc.intent.action.QUICKBOOT_POWERON",
+        "démarrage rapide (HTC)",
+    ),
+    (
+        "android.intent.action.MY_PACKAGE_REPLACED",
+        "mise à jour de l'app elle-même",
+    ),
+    (
+        "android.intent.action.PACKAGE_REPLACED",
+        "mise à jour d'un paquet tiers",
+    ),
+    (
+        "android.intent.action.PACKAGE_ADDED",
+        "installation d'un paquet",
+    ),
+    (
+        "android.intent.action.PACKAGE_REMOVED",
+        "désinstallation d'un paquet",
+    ),
+    (
+        "android.intent.action.USER_PRESENT",
+        "déverrouillage de l'écran",
+    ),
     ("android.intent.action.SCREEN_ON", "allumage de l'écran"),
     ("android.intent.action.SCREEN_OFF", "extinction de l'écran"),
-    ("android.intent.action.BOOT_COMPLETED_LEGACY", "démarrage (variante)"),
+    (
+        "android.intent.action.BOOT_COMPLETED_LEGACY",
+        "démarrage (variante)",
+    ),
     ("android.provider.Telephony.SMS_RECEIVED", "réception SMS"),
-    ("android.provider.Telephony.SMS_DELIVER", "SMS livré (app SMS par défaut)"),
-    ("android.provider.Telephony.WAP_PUSH_RECEIVED", "WAP push / MMS"),
-    ("android.intent.action.PHONE_STATE", "changement d'état d'appel"),
+    (
+        "android.provider.Telephony.SMS_DELIVER",
+        "SMS livré (app SMS par défaut)",
+    ),
+    (
+        "android.provider.Telephony.WAP_PUSH_RECEIVED",
+        "WAP push / MMS",
+    ),
+    (
+        "android.intent.action.PHONE_STATE",
+        "changement d'état d'appel",
+    ),
     ("android.intent.action.NEW_OUTGOING_CALL", "appel sortant"),
-    ("android.net.conn.CONNECTIVITY_CHANGE", "changement de connectivité"),
+    (
+        "android.net.conn.CONNECTIVITY_CHANGE",
+        "changement de connectivité",
+    ),
     ("android.net.wifi.STATE_CHANGE", "changement d'état Wi-Fi"),
-    ("android.intent.action.ACTION_POWER_CONNECTED", "branchement secteur"),
-    ("android.intent.action.ACTION_POWER_DISCONNECTED", "débranchement secteur"),
+    (
+        "android.intent.action.ACTION_POWER_CONNECTED",
+        "branchement secteur",
+    ),
+    (
+        "android.intent.action.ACTION_POWER_DISCONNECTED",
+        "débranchement secteur",
+    ),
     ("android.intent.action.BATTERY_LOW", "batterie faible"),
     ("android.intent.action.TIME_SET", "changement d'heure"),
-    ("android.intent.action.TIMEZONE_CHANGED", "changement de fuseau"),
-    ("android.intent.action.MEDIA_MOUNTED", "montage de stockage externe"),
+    (
+        "android.intent.action.TIMEZONE_CHANGED",
+        "changement de fuseau",
+    ),
+    (
+        "android.intent.action.MEDIA_MOUNTED",
+        "montage de stockage externe",
+    ),
     ("android.intent.action.DREAMING_STOPPED", "sortie de veille"),
-    ("android.app.action.DEVICE_ADMIN_ENABLED", "activation admin d'appareil"),
+    (
+        "android.app.action.DEVICE_ADMIN_ENABLED",
+        "activation admin d'appareil",
+    ),
 ];
 
 /// Actions de binding de services système sensibles.
@@ -343,14 +400,8 @@ const BIND_ACTIONS: &[(&str, EntryTrigger)] = &[
         "android.service.notification.NotificationListenerService",
         EntryTrigger::NotificationListener,
     ),
-    (
-        "android.view.InputMethod",
-        EntryTrigger::InputMethod,
-    ),
-    (
-        "android.app.job.JobService",
-        EntryTrigger::ScheduledJob,
-    ),
+    ("android.view.InputMethod", EntryTrigger::InputMethod),
+    ("android.app.job.JobService", EntryTrigger::ScheduledJob),
     (
         "android.service.dreams.DreamService",
         EntryTrigger::ScheduledJob,
@@ -521,7 +572,9 @@ fn collect_queries(elem: &Element, out: &mut Vec<String>) {
 fn parse_application(app: &Element, pkg: &str, r: &mut ManifestReport) {
     r.application = ApplicationInfo {
         name: app.attr("name").map(|n| resolve_fqcn(&n, pkg)),
-        app_component_factory: app.attr("appComponentFactory").map(|n| resolve_fqcn(&n, pkg)),
+        app_component_factory: app
+            .attr("appComponentFactory")
+            .map(|n| resolve_fqcn(&n, pkg)),
         allow_backup: app.attr_bool("allowBackup"),
         debuggable: app.attr_bool("debuggable"),
         uses_cleartext_traffic: app.attr_bool("usesCleartextTraffic"),
@@ -540,28 +593,36 @@ fn parse_application(app: &Element, pkg: &str, r: &mut ManifestReport) {
 
     for child in child_elements(app) {
         match child.get_tag() {
-            "activity" => r
-                .components
-                .activities
-                .push(parse_component(child, ComponentKind::Activity, pkg, min_sdk)),
+            "activity" => r.components.activities.push(parse_component(
+                child,
+                ComponentKind::Activity,
+                pkg,
+                min_sdk,
+            )),
             "activity-alias" => r.components.activity_aliases.push(parse_component(
                 child,
                 ComponentKind::ActivityAlias,
                 pkg,
                 min_sdk,
             )),
-            "service" => r
-                .components
-                .services
-                .push(parse_component(child, ComponentKind::Service, pkg, min_sdk)),
-            "receiver" => r
-                .components
-                .receivers
-                .push(parse_component(child, ComponentKind::Receiver, pkg, min_sdk)),
-            "provider" => r
-                .components
-                .providers
-                .push(parse_component(child, ComponentKind::Provider, pkg, min_sdk)),
+            "service" => r.components.services.push(parse_component(
+                child,
+                ComponentKind::Service,
+                pkg,
+                min_sdk,
+            )),
+            "receiver" => r.components.receivers.push(parse_component(
+                child,
+                ComponentKind::Receiver,
+                pkg,
+                min_sdk,
+            )),
+            "provider" => r.components.providers.push(parse_component(
+                child,
+                ComponentKind::Provider,
+                pkg,
+                min_sdk,
+            )),
             "meta-data" => {
                 if let Some(md) = parse_meta_data(child) {
                     r.application.meta_data.push(md);
@@ -577,12 +638,7 @@ fn parse_application(app: &Element, pkg: &str, r: &mut ManifestReport) {
     }
 }
 
-fn parse_component(
-    elem: &Element,
-    kind: ComponentKind,
-    pkg: &str,
-    min_sdk: u32,
-) -> Component {
+fn parse_component(elem: &Element, kind: ComponentKind, pkg: &str, min_sdk: u32) -> Component {
     let raw_name = elem.attr("name").unwrap_or_default();
     let name = resolve_fqcn(&raw_name, pkg);
     let descriptor = to_descriptor(&name);
@@ -707,10 +763,7 @@ fn derive_entrypoints(r: &ManifestReport) -> Vec<Entrypoint> {
             }
             for a in &f.actions {
                 if let Some((_, desc)) = AUTOSTART_ACTIONS.iter().find(|(act, _)| act == a) {
-                    triggers.push((
-                        EntryTrigger::SystemBroadcast,
-                        format!("{a} ({desc})"),
-                    ));
+                    triggers.push((EntryTrigger::SystemBroadcast, format!("{a} ({desc})")));
                 }
                 if let Some((_, t)) = BIND_ACTIONS.iter().find(|(act, _)| act == a) {
                     triggers.push((*t, a.clone()));
@@ -719,10 +772,7 @@ fn derive_entrypoints(r: &ManifestReport) -> Vec<Entrypoint> {
                     for d in &f.data {
                         if let Some(scheme) = &d.scheme {
                             let host = d.host.clone().unwrap_or_else(|| "*".into());
-                            triggers.push((
-                                EntryTrigger::Deeplink,
-                                format!("{scheme}://{host}"),
-                            ));
+                            triggers.push((EntryTrigger::Deeplink, format!("{scheme}://{host}")));
                         }
                     }
                 }
@@ -799,7 +849,9 @@ fn derive_anomalies(r: &ManifestReport) -> Vec<String> {
         a.push("usesCleartextTraffic=true — trafic HTTP en clair autorisé".into());
     }
     if r.application.has_code == Some(false) {
-        a.push("hasCode=false — le code exécuté n'est pas dans les DEX (packer/stub natif ?)".into());
+        a.push(
+            "hasCode=false — le code exécuté n'est pas dans les DEX (packer/stub natif ?)".into(),
+        );
     }
     if r.application.app_component_factory.is_some() {
         a.push("appComponentFactory présent — hook d'instanciation (packer probable)".into());

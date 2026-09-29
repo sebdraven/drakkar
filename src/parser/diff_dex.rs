@@ -192,20 +192,31 @@ pub fn run(input_a: &Path, input_b: &Path, opts: &DiffOptions) -> Result<DiffRep
     let (a, statics_a, _tmp_a) = load_class_prints(input_a, opts)?;
     let (b, statics_b, _tmp_b) = load_class_prints(input_b, opts)?;
 
-    let (static_fields_compared, static_fields_diverging) =
-        compare_statics(&statics_a, &statics_b);
+    let (static_fields_compared, static_fields_diverging) = compare_statics(&statics_a, &statics_b);
 
     let methods_a: usize = a.iter().map(|c| c.method_seq.len()).sum();
     let methods_b: usize = b.iter().map(|c| c.method_seq.len()).sum();
 
     // ── Global : ensembles d'empreintes de méthodes ──
-    let set_a: HashSet<u64> = a.iter().flat_map(|c| c.method_set.iter().copied()).collect();
-    let set_b: HashSet<u64> = b.iter().flat_map(|c| c.method_set.iter().copied()).collect();
+    let set_a: HashSet<u64> = a
+        .iter()
+        .flat_map(|c| c.method_set.iter().copied())
+        .collect();
+    let set_b: HashSet<u64> = b
+        .iter()
+        .flat_map(|c| c.method_set.iter().copied())
+        .collect();
     let jaccard_methods = jaccard(&set_a, &set_b);
 
     // ── Global : n-grammes de mots-méthodes (ordre de lecture) ──
-    let seq_a: Vec<u64> = a.iter().flat_map(|c| c.method_seq.iter().copied()).collect();
-    let seq_b: Vec<u64> = b.iter().flat_map(|c| c.method_seq.iter().copied()).collect();
+    let seq_a: Vec<u64> = a
+        .iter()
+        .flat_map(|c| c.method_seq.iter().copied())
+        .collect();
+    let seq_b: Vec<u64> = b
+        .iter()
+        .flat_map(|c| c.method_seq.iter().copied())
+        .collect();
     let ngram = opts.ngram.max(1);
     let ng_a = ngrams(&seq_a, ngram);
     let ng_b = ngrams(&seq_b, ngram);
@@ -319,7 +330,11 @@ pub fn run(input_a: &Path, input_b: &Path, opts: &DiffOptions) -> Result<DiffRep
         .map(|(_, c)| c.name.clone())
         .collect();
 
-    near.sort_by(|x, y| y.jaccard.partial_cmp(&x.jaccard).unwrap_or(std::cmp::Ordering::Equal));
+    near.sort_by(|x, y| {
+        y.jaccard
+            .partial_cmp(&x.jaccard)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     Ok(DiffReport {
         input_a: input_a.display().to_string(),
@@ -366,7 +381,9 @@ fn compare_statics(a: &StaticsByClass, b: &StaticsByClass) -> (usize, usize) {
         let index: HashMap<&str, &Option<DexValue>> =
             fields_b.iter().map(|(n, v)| (n.as_str(), v)).collect();
         for (name, va) in fields_a {
-            let Some(vb) = index.get(name.as_str()).copied() else { continue };
+            let Some(vb) = index.get(name.as_str()).copied() else {
+                continue;
+            };
             compared += 1;
             if va != vb {
                 diverging += 1;
@@ -442,16 +459,35 @@ fn load_class_prints(
 fn is_application_class(descriptor: &str, opts: &DiffOptions) -> bool {
     if !opts.include_prefixes.is_empty() {
         // Mode inclusion : uniquement les préfixes fournis.
-        return opts.include_prefixes.iter().any(|p| descriptor.starts_with(p));
+        return opts
+            .include_prefixes
+            .iter()
+            .any(|p| descriptor.starts_with(p));
     }
     // Mode exclusion best-effort : on retire les bibliothèques les plus courantes
     // du corpus. À défaut d'heuristique fiable sur les libs ProGuardées (noms
     // courts a/b/c), préférer --diff-include pour un diff propre.
     const LIB_PREFIXES: &[&str] = &[
-        "Landroid/", "Landroidx/", "Ljava/", "Ljavax/", "Lkotlin/", "Lkotlinx/",
-        "Ldalvik/", "Lrx/", "Lio/reactivex/", "Lokhttp3/", "Lokio/", "Lretrofit2/",
-        "Lcom/google/", "Lcom/alibaba/", "Lcom/umeng/", "Lorg/apache/", "Lorg/json/",
-        "Lorg/xmlpull/", "Luk/co/chrisjenx/", "Lgov/nist/",
+        "Landroid/",
+        "Landroidx/",
+        "Ljava/",
+        "Ljavax/",
+        "Lkotlin/",
+        "Lkotlinx/",
+        "Ldalvik/",
+        "Lrx/",
+        "Lio/reactivex/",
+        "Lokhttp3/",
+        "Lokio/",
+        "Lretrofit2/",
+        "Lcom/google/",
+        "Lcom/alibaba/",
+        "Lcom/umeng/",
+        "Lorg/apache/",
+        "Lorg/json/",
+        "Lorg/xmlpull/",
+        "Luk/co/chrisjenx/",
+        "Lgov/nist/",
     ];
     !LIB_PREFIXES.iter().any(|p| descriptor.starts_with(p))
 }
@@ -492,7 +528,10 @@ fn collect_from_dex(
                         .into_iter()
                         .map(|f| {
                             let v = f.value.map(|x| x.normalized(&opts.normalize));
-                            (crate::parser::disasm::normalize(&f.name, &opts.normalize), v)
+                            (
+                                crate::parser::disasm::normalize(&f.name, &opts.normalize),
+                                v,
+                            )
                         })
                         .collect(),
                 );
@@ -537,7 +576,13 @@ fn collect_from_dex(
             sorted.hash(&mut h);
             h.finish()
         };
-        out.push(ClassPrint { name, key, method_seq, method_set, class_hash });
+        out.push(ClassPrint {
+            name,
+            key,
+            method_seq,
+            method_set,
+            class_hash,
+        });
     }
     Ok(())
 }
@@ -548,8 +593,8 @@ fn collect_from_dex(
 fn collect_dex_paths(input: &Path) -> Result<(Vec<PathBuf>, Option<tempfile::TempDir>)> {
     let mut magic = [0u8; 8];
     {
-        let mut f = std::fs::File::open(input)
-            .with_context(|| format!("open {}", input.display()))?;
+        let mut f =
+            std::fs::File::open(input).with_context(|| format!("open {}", input.display()))?;
         let n = f.read(&mut magic)?;
         if n < 4 {
             bail!("{} trop court pour être un DEX ou un APK", input.display());

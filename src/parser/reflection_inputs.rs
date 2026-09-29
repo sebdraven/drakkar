@@ -266,7 +266,10 @@ pub fn extract(path: &Path) -> Result<ReflectionInputReport> {
 
     let assign = index_field_assignments(&dex);
     let consts = index_const_fields(&dex);
-    let fields = Fields { assign: &assign, consts: &consts };
+    let fields = Fields {
+        assign: &assign,
+        consts: &consts,
+    };
 
     let mut report = ReflectionInputReport::default();
 
@@ -512,10 +515,7 @@ fn arg_registers(ins: &dex_bytecode::Instruction) -> Vec<u32> {
 /// L'invoke cible-t-il un des quatre sinks de réflexion ? Matching sur le
 /// couple (propriétaire, nom) : `invoke` et `forName` sont trop communs pour
 /// être reconnus au nom seul.
-fn reflection_sink(
-    dex: &DexBin,
-    ins: &dex_bytecode::Instruction,
-) -> Option<Sink> {
+fn reflection_sink(dex: &DexBin, ins: &dex_bytecode::Instruction) -> Option<Sink> {
     if !ins.mnemonic().starts_with("invoke-") {
         return None;
     }

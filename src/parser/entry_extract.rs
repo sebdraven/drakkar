@@ -75,8 +75,7 @@ impl ExtractedEntry {
         if self.entry.split(['/', '\\']).any(|c| c == "..") || self.entry.starts_with('/') {
             bail!("chemin d'entrée refusé (traversée) : {}", self.entry);
         }
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("création {}", dir.display()))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("création {}", dir.display()))?;
         let dest = dir.join(self.output_name());
         std::fs::write(&dest, &self.bytes)
             .with_context(|| format!("écriture {}", dest.display()))?;
@@ -220,7 +219,9 @@ pub fn list_entries(path: &Path) -> Result<Vec<String>> {
     let mut archive = zip::ZipArchive::new(file).context("lecture APK (zip)")?;
     let mut names = Vec::with_capacity(archive.len());
     for i in 0..archive.len() {
-        let entry = archive.by_index(i).with_context(|| format!("entrée zip #{i}"))?;
+        let entry = archive
+            .by_index(i)
+            .with_context(|| format!("entrée zip #{i}"))?;
         let name = entry.name().to_string();
         if !name.ends_with('/') {
             names.push(name);
@@ -257,11 +258,7 @@ fn extract_archive<R: Read + Seek>(
             .with_context(|| format!("lecture {name}"))?;
 
         let sha256 = format!("{:x}", Sha256::digest(&bytes));
-        let file = name
-            .rsplit('/')
-            .next()
-            .unwrap_or(name.as_str())
-            .to_string();
+        let file = name.rsplit('/').next().unwrap_or(name.as_str()).to_string();
 
         entries.push(ExtractedEntry {
             entry: name,
@@ -394,8 +391,7 @@ mod tests {
             ("assets/libjiagu.so", b"\x7FELF....".to_vec()),
         ]);
 
-        let ex =
-            extract_matching_bytes(&apk, &["res/raw/*".into(), "assets/*.so".into()]).unwrap();
+        let ex = extract_matching_bytes(&apk, &["res/raw/*".into(), "assets/*.so".into()]).unwrap();
         assert_eq!(ex.count(), 2);
 
         let none = extract_matching_bytes(&apk, &["introuvable".into()]).unwrap();

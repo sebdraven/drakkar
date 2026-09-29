@@ -422,9 +422,11 @@ fn apply(row: &mut EnrichedRow, source: Source, body: &str) {
             row.vt_times_submitted = a["times_submitted"].as_u64();
             let stats = &a["last_analysis_stats"];
             row.vt_malicious = stats["malicious"].as_u64();
-            row.vt_engines = stats
-                .as_object()
-                .map(|o| o.values().filter_map(serde_json::Value::as_u64).sum::<u64>());
+            row.vt_engines = stats.as_object().map(|o| {
+                o.values()
+                    .filter_map(serde_json::Value::as_u64)
+                    .sum::<u64>()
+            });
             row.vt_status = Some("found".into());
         }
         Source::Koodous => {
@@ -553,7 +555,10 @@ mod tests {
             Source::parse_list("vt,koodous").unwrap(),
             vec![Source::VirusTotal, Source::Koodous]
         );
-        assert_eq!(Source::parse_list(" VT ").unwrap(), vec![Source::VirusTotal]);
+        assert_eq!(
+            Source::parse_list(" VT ").unwrap(),
+            vec![Source::VirusTotal]
+        );
         // Doublons elimines.
         assert_eq!(
             Source::parse_list("vt,virustotal").unwrap(),
