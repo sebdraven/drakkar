@@ -468,13 +468,13 @@ pub fn render(r: &MatrixReport, opts: &MatrixOptions) -> String {
         s.push_str(&format!("{:>4}", i + 1));
     }
     s.push('\n');
-    for i in 0..n {
+    for (i, row) in m.iter().enumerate() {
         s.push_str(&format!("  {:>2} ", i + 1));
-        for j in 0..n {
+        for (j, v) in row.iter().enumerate() {
             if i == j {
                 s.push_str("   .");
             } else {
-                s.push_str(&format!("{:>4.0}", m[i][j] * 100.0));
+                s.push_str(&format!("{:>4.0}", v * 100.0));
             }
         }
         s.push('\n');
