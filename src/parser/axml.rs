@@ -326,7 +326,7 @@ fn decode_tolerant(data: &[u8]) -> Result<Element> {
 }
 
 /// Rattache un élément refermé à son parent, ou l'installe comme racine.
-fn close(stack: &mut Vec<Element>, root: &mut Option<Element>, done: Element) {
+fn close(stack: &mut [Element], root: &mut Option<Element>, done: Element) {
     if stack.len() > MAX_DEPTH {
         return;
     }
