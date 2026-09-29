@@ -182,7 +182,7 @@ fn collect_from_dex(path: &Path, opts: &DisasmOptions, out: &mut DisasmReport) -
                 .map(|ins| Insn {
                     offset: ins.offset as u64,
                     mnemonic: ins.mnemonic().to_string(),
-                    operands: normalize(&ins.operands().to_string(), &opts.normalize),
+                    operands: normalize(ins.operands(), &opts.normalize),
                     resolved: annotate(&dex, ins).map(|s| normalize(&s, &opts.normalize)),
                 })
                 .collect();
