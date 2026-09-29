@@ -345,8 +345,10 @@ fn parse_resource_map(chunk: &[u8], hsize: usize) -> Vec<u32> {
         CHUNK_HEADER
     };
     chunk[start..]
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect()
 }
 
@@ -564,8 +566,10 @@ fn decode_utf16(d: &[u8], off: usize) -> Option<String> {
     let end = p.saturating_add(len.saturating_mul(2)).min(d.len());
     let units: Vec<u16> = d
         .get(p..end)?
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     Some(String::from_utf16_lossy(&units))
 }
