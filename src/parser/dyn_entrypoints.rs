@@ -43,6 +43,7 @@
 //!   - `ComponentName` construit à partir de deux `const-string` (partiellement
 //!     couvert : on remonte la string la plus proche) ;
 //!   - réflexion sur nom construit par concaténation.
+//!
 //! Ces cas ressortent en `unresolved` plutôt que d'être silencieusement perdus.
 
 use crate::model::MethodRef;
