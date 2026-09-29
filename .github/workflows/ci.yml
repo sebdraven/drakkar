@@ -1,0 +1,111 @@
+name: ci
+
+on:
+  push:
+    # `branches: ['**']` couvre toutes les branches et AUCUN tag : le push d'un
+    # tag v* est le travail de release.yml, pas une deuxieme passe de ci.
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Toolchain epinglee : deux runs a trois mois d'ecart doivent etre comparables.
+  RUST_VERSION: "1.98.1"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-setup
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          cache-key: fmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    # Le code ne contient aucun `cfg(target_*)` : un seul runner suffit, la
+    # lint ne dirait rien de plus sur l'autre cible.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-setup
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          cache-key: clippy
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.target }})
+    strategy:
+      # Un echec macOS ne doit pas masquer l'etat de Linux, ni l'inverse.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-setup
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          cache-key: test-${{ matrix.target }}
+      - run: cargo test --locked --target ${{ matrix.target }}
+
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-setup
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          cache-key: release-${{ matrix.target }}
+
+      # feature lief-backend non activee : le defaut suffit et evite le build C++.
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: artefact
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Le nom de l'artefact porte un sha court ; le sha complet et les revs
+          # des deux dependances git vivent dans BUILD-INFO.txt.
+          echo "short_sha=${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/drakkar" dist/
+
+      - uses: ./.github/actions/build-info
+        with:
+          dest: dist/BUILD-INFO.txt
+          target: ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: drakkar-${{ matrix.target }}-${{ steps.pack.outputs.short_sha }}
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error
