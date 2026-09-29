@@ -487,13 +487,14 @@ impl CallGraph {
     /// plusieurs sous-systèmes disjoints (code app, chaque SDK…). Agréger les pivots
     /// sur tout le graphe mélangerait « à quel point IronSource couple crypto et
     /// réseau » avec « à quel point l'app le fait ». On isole donc par WCC :
-    ///   - `n`   = pivots communs qualifiés DANS la WCC (fonctions atteignant les
-    ///            deux primitifs), via intersection des ancêtres (2 BFS inversés) ;
-    ///   - `ad`  = longueur moyenne du pont (dist_pivot->a + dist_pivot->b) ;
-    ///   - `eff` = diamètre effectif DIRIGÉ (90e percentile) de la WCC, estimé par
-    ///            multi-sweep échantillonné à budget adaptatif (cf.
-    ///            `effective_diameter_directed`). Rend `ad` comparable entre
-    ///            composantes/APK de tailles différentes.
+    /// - `n`   = pivots communs qualifiés DANS la WCC (fonctions atteignant les
+    ///   deux primitifs), via intersection des ancêtres (2 BFS inversés) ;
+    /// - `ad`  = longueur moyenne du pont (dist_pivot->a + dist_pivot->b) ;
+    /// - `eff` = diamètre effectif DIRIGÉ (90e percentile) de la WCC, estimé par
+    ///   multi-sweep échantillonné à budget adaptatif (cf.
+    ///   `effective_diameter_directed`). Rend `ad` comparable entre
+    ///   composantes/APK de tailles différentes.
+    ///
     /// score brut = n / (ad + 1) ; score normalisé = n / (ad/eff + 1). On retourne
     /// la WCC au score normalisé maximal. Les deux scores + `eff` sont exposés pour
     /// calibration statistique en post-traitement (Mann-Whitney, cf. IntDroid).
