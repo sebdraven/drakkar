@@ -1551,8 +1551,8 @@ fn print_manifest(r: &drakkar::parser::manifest_info::ManifestReport) {
         r.components.providers.len()
     );
     println!(
-        "\n  {:<16} {:<58} {:<9} {}",
-        "TYPE", "CLASSE", "EXPORTED", "PERMISSION"
+        "\n  {:<16} {:<58} {:<9} PERMISSION",
+        "TYPE", "CLASSE", "EXPORTED"
     );
     for c in r.components.iter_all() {
         let exported = match (c.exported_declared, c.exported_effective) {
