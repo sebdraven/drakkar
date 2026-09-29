@@ -700,6 +700,8 @@ mod tests {
         assert!(payload_ints(&b, 0).is_empty());
     }
 
+    // `R` est la classe de ressources d'Android : la minuscule perdrait le sens.
+    #[allow(non_snake_case)]
     #[test]
     fn classes_R_reconnues() {
         assert!(is_r_class("Lcom/parental/control/kidgy/R;"));
