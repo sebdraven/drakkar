@@ -297,7 +297,7 @@ pub fn run(input_a: &Path, input_b: &Path, opts: &DiffOptions) -> Result<DiffRep
                 continue;
             }
             let j = jaccard(&ca.method_set, &cb.method_set);
-            if best.map_or(true, |(_, bj)| j > bj) {
+            if best.is_none_or(|(_, bj)| j > bj) {
                 best = Some((i, j));
             }
         }

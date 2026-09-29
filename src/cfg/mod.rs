@@ -464,7 +464,7 @@ impl CallGraph {
                 continue;
             }
             let score = da + db;
-            if best.map_or(true, |(s, _)| score < s) {
+            if best.is_none_or(|(s, _)| score < s) {
                 best = Some((score, node));
             }
         }
@@ -581,7 +581,7 @@ impl CallGraph {
             let ad = sum_bridge as f64 / n as f64;
             let ad_rel = ad / eff.max(1.0);
             let score_norm = n as f64 / (ad_rel + 1.0);
-            if best.map_or(true, |(s, ..)| score_norm > s) {
+            if best.is_none_or(|(s, ..)| score_norm > s) {
                 best = Some((score_norm, n, ad, eff, pivot));
             }
         }

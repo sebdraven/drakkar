@@ -936,13 +936,7 @@ pub fn orphan_audit_sample(apk: &Path) -> Result<OrphanSample> {
     let biggest = report.islands.iter().max_by_key(|i| i.size);
     let biggest_size = biggest.map(|i| i.size).unwrap_or(0);
     let biggest_author_pct = biggest
-        .map(|i| {
-            if i.size > 0 {
-                (100 * i.author_nodes / i.size) as u32
-            } else {
-                0
-            }
-        })
+        .map(|i| (100 * i.author_nodes).checked_div(i.size).unwrap_or(0) as u32)
         .unwrap_or(0);
 
     let loadlib = probe_sink(cg, SINK_LOADLIB, all);
