@@ -343,6 +343,9 @@ fn single_linkage(sim: &[Vec<f64>], samples: &[Sample], threshold: f64) -> Vec<V
         parent[x]
     }
 
+    // `sim` est un paramètre : rien ne garantit que sa taille vaut `n`. Itérer
+    // dessus au lieu de `0..n` remplacerait un panic par un regroupement faux.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         for j in (i + 1)..n {
             if sim[i][j] >= threshold {
@@ -355,9 +358,9 @@ fn single_linkage(sim: &[Vec<f64>], samples: &[Sample], threshold: f64) -> Vec<V
     }
 
     let mut buckets: std::collections::HashMap<usize, Vec<String>> = Default::default();
-    for i in 0..n {
+    for (i, s) in samples.iter().enumerate() {
         let r = find(&mut parent, i);
-        buckets.entry(r).or_default().push(samples[i].name.clone());
+        buckets.entry(r).or_default().push(s.name.clone());
     }
     let mut groups: Vec<Vec<String>> = buckets.into_values().collect();
     for g in groups.iter_mut() {
