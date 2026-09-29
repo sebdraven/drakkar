@@ -78,7 +78,7 @@ impl Element {
             .or_else(|| {
                 self.attributes
                     .iter()
-                    .find(|(k, _)| k.split(':').last() == Some(key))
+                    .find(|(k, _)| k.split(':').next_back() == Some(key))
             })
             .map(|(_, v)| v.clone())
     }
