@@ -1025,7 +1025,8 @@ mod tests {
             ("Lapp/Child;".to_string(), "Lapp/MyService;".to_string()),
             ("Lapp/Sibling;".to_string(), "Lapp/BaseService;".to_string()),
         ]));
-        let comp = cg.component_closure(&["Lapp/MyService;".to_string()]);
+        let roots = ["Lapp/MyService;".to_string()];
+        let comp = cg.component_closure(&roots);
 
         assert!(comp.contains("Lapp/MyService;"));
         // Super-classe définie dans l'app : c'est elle qui porte onCreate.
@@ -1041,7 +1042,8 @@ mod tests {
     #[test]
     fn closure_sans_hierarchie_reste_stricte() {
         let cg = CallGraph::new();
-        let comp = cg.component_closure(&["Lapp/MyService;".to_string()]);
+        let roots = ["Lapp/MyService;".to_string()];
+        let comp = cg.component_closure(&roots);
         assert_eq!(comp.len(), 1);
         assert!(comp.contains("Lapp/MyService;"));
     }
