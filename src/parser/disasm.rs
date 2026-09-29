@@ -41,6 +41,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Paramètres du désassemblage.
+#[derive(Default)]
 pub struct DisasmOptions {
     /// Motifs de sélection des classes. Comparaison par **sous-chaîne** sur le
     /// descripteur Dalvik, insensible à la casse — `services/g`,
@@ -52,15 +53,6 @@ pub struct DisasmOptions {
     /// namespace diffère (`com/duiyun` ↔ `com/dy`) sans que chaque ligne
     /// diverge pour cette seule raison. N'affecte QUE l'affichage.
     pub normalize: Vec<(String, String)>,
-}
-
-impl Default for DisasmOptions {
-    fn default() -> Self {
-        Self {
-            patterns: Vec::new(),
-            normalize: Vec::new(),
-        }
-    }
 }
 
 /// Une instruction désassemblée.
