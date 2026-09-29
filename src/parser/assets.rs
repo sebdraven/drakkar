@@ -1807,8 +1807,13 @@ mod tests {
     #[test]
     fn keep_and_exclude_are_mutually_exclusive() {
         let h = "a".repeat(64);
-        let err = build_hash_filter(std::slice::from_ref(&h), None, std::slice::from_ref(&h), None)
-            .unwrap_err();
+        let err = build_hash_filter(
+            std::slice::from_ref(&h),
+            None,
+            std::slice::from_ref(&h),
+            None,
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("mutuellement exclusifs"));
 
         assert!(build_hash_filter(&[], None, &[], None).unwrap().is_none());
