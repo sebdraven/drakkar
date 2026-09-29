@@ -502,7 +502,7 @@ mod tests {
 
     #[test]
     fn gravite_met_les_urls_en_tete() {
-        let mut v = vec![StringKind::Descriptor, StringKind::Url, StringKind::Path];
+        let mut v = [StringKind::Descriptor, StringKind::Url, StringKind::Path];
         v.sort();
         assert_eq!(v[0], StringKind::Url);
         assert_eq!(v[2], StringKind::Descriptor);

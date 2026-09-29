@@ -1436,7 +1436,7 @@ mod tests {
 
     #[test]
     fn gravity_ordering_puts_strings_first() {
-        let mut v = vec![
+        let mut v = [
             Divergence::FieldRename,
             Divergence::StringValue,
             Divergence::TypeRef,
