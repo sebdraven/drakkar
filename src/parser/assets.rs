@@ -1694,7 +1694,7 @@ mod tests {
         let kept = collect(
             &apk,
             &AssetsOptions {
-                hash_filter: build_hash_filter(&[ha.clone()], None, &[], None).unwrap(),
+                hash_filter: build_hash_filter(std::slice::from_ref(&ha), None, &[], None).unwrap(),
                 ..Default::default()
             },
         )
@@ -1730,7 +1730,8 @@ mod tests {
             &apk,
             &AssetsOptions {
                 max_size: Some(1024),
-                hash_filter: build_hash_filter(&[other.clone()], None, &[], None).unwrap(),
+                hash_filter: build_hash_filter(std::slice::from_ref(&other), None, &[], None)
+                    .unwrap(),
                 ..Default::default()
             },
         )
@@ -1806,7 +1807,8 @@ mod tests {
     #[test]
     fn keep_and_exclude_are_mutually_exclusive() {
         let h = "a".repeat(64);
-        let err = build_hash_filter(&[h.clone()], None, &[h], None).unwrap_err();
+        let err = build_hash_filter(std::slice::from_ref(&h), None, std::slice::from_ref(&h), None)
+            .unwrap_err();
         assert!(format!("{err:#}").contains("mutuellement exclusifs"));
 
         assert!(build_hash_filter(&[], None, &[], None).unwrap().is_none());
@@ -1971,7 +1973,8 @@ mod tests {
                 "filtre par hash (sans effet sur l'empreinte)",
                 &apk,
                 AssetsOptions {
-                    hash_filter: build_hash_filter(&[ha.clone()], None, &[], None).unwrap(),
+                    hash_filter: build_hash_filter(std::slice::from_ref(&ha), None, &[], None)
+                        .unwrap(),
                     ..Default::default()
                 },
             ),
