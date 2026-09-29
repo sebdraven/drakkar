@@ -168,7 +168,7 @@ fn from_axmldecoder(e: &axmldecoder::Element) -> Element {
 }
 
 thread_local! {
-    static QUIET: Cell<bool> = Cell::new(false);
+    static QUIET: Cell<bool> = const { Cell::new(false) };
 }
 static QUIET_HOOK: Once = Once::new();
 
