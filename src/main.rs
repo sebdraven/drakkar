@@ -494,6 +494,12 @@ fn main() -> Result<()> {
     // Sortie rapide : audit d'architecture native seul (pas de moteur de règles,
     // pas de catalogue MITRE) — lit uniquement les en-têtes ELF, en mémoire.
     if cli.native_arch {
+        reject_format(
+            "--native-arch",
+            cli.format,
+            "cet audit d'en-têtes ELF n'a pas de forme structurée ; pour un inventaire des \
+             binaires natifs, passer par --list-assets (TSV) ou --extract-libs",
+        )?;
         let Some(apk) = &cli.apk else {
             bail!("--native-arch requiert un APK (mode single)");
         };
@@ -506,6 +512,12 @@ fn main() -> Result<()> {
     // MITRE ni le moteur de règles — deux passages sur les classes*.dex.
     // Fonctionne en single (APK en argument) comme en bulk (--bulk DIR).
     if cli.dyn_entrypoints {
+        reject_format(
+            "--dyn-entrypoints",
+            cli.format,
+            "la sortie est un flux TSV à en-tête, fait pour être filtré ou joint en aval ; \
+             pour du JSON sur le graphe d'appel, utiliser --orphan-audit",
+        )?;
         let apks: Vec<PathBuf> = match (&cli.apk, &cli.bulk) {
             (Some(apk), None) => vec![apk.clone()],
             (None, Some(dir)) => {
@@ -583,6 +595,11 @@ fn main() -> Result<()> {
     // Sortie rapide : mesure de provenance des cibles de réflexion. Même routage
     // APK/DEX que --dyn-entrypoints, même traitement séquentiel (flux TSV).
     if cli.reflection_inputs {
+        reject_format(
+            "--reflection-inputs",
+            cli.format,
+            "la sortie est un TSV déjà agrégé (sample, category, count), à joindre en aval",
+        )?;
         let inputs: Vec<PathBuf> = match (&cli.apk, &cli.bulk) {
             (Some(apk), None) => vec![apk.clone()],
             (None, Some(dir)) => {
@@ -746,6 +763,12 @@ est racine — ne pas comparer à une mesure `manifest`)",
     // racines que --orphan-audit, mais on interroge une API précise (est-elle un
     // nœud ? atteignable ? par quels chemins ?).
     if let Some(api) = &cli.probe {
+        reject_format(
+            "--probe",
+            cli.format,
+            "cette sonde rend un verdict et ses chemins en texte ; pour du JSON sur le graphe, \
+             utiliser --orphan-audit --format json",
+        )?;
         let Some(apk) = &cli.apk else {
             bail!("--probe requiert un APK ou un DEX brut (mode single)");
         };
@@ -785,6 +808,12 @@ est racine — ne pas comparer à une mesure `manifest`)",
 
     // Sortie rapide : chaines litterales du pool DEX. Single ou bulk, APK ou DEX.
     if let Some(motifs) = &cli.strings {
+        reject_format(
+            "--strings",
+            cli.format,
+            "le pool est un TSV à en-tête (sample, motif, chaine), à joindre en aval ; pour \
+             comparer deux pools en JSON, utiliser --diff-strings",
+        )?;
         let inputs: Vec<PathBuf> = match (&cli.apk, &cli.bulk) {
             (Some(apk), None) => vec![apk.clone()],
             (None, Some(dir)) => {
@@ -980,12 +1009,17 @@ est racine — ne pas comparer à une mesure `manifest`)",
     if let Some(pair) = &cli.diff_explain {
         use parser::diff_explain::ColorMode;
 
+        if cli.legend {
+            println!("{}", parser::diff_explain::legend());
+            return Ok(());
+        }
         let color = match cli.color.as_str() {
             "auto" => ColorMode::Auto,
             "always" => ColorMode::Always,
             "never" => ColorMode::Never,
             other => bail!("--color attend auto|always|never, reçu {other:?}"),
         };
+        check_json_dest(cli.format, cli.json_out.as_deref())?;
 
         let opts = parser::diff_explain::ExplainOptions {
             include_prefixes: cli.explain_include.clone(),
@@ -995,12 +1029,6 @@ est racine — ne pas comparer à une mesure `manifest`)",
             align_cap: cli.explain_align_cap,
             ..Default::default()
         };
-
-        if cli.legend {
-            println!("{}", parser::diff_explain::legend());
-            return Ok(());
-        }
-        check_json_dest(cli.format, cli.json_out.as_deref())?;
 
         let report = parser::diff_explain::run(&pair[0], &pair[1], &opts)?;
         if cli.format.wants_text() {
@@ -1056,8 +1084,9 @@ est racine — ne pas comparer à une mesure `manifest`)",
         reject_format(
             "--disasm",
             cli.format,
-            "pour une comparaison structurée, utiliser --diff-explain (opérandes résolues) \
-             ou --diff-dex (empreintes d'opcodes), qui ont tous deux --format json",
+            "le désassemblage est du texte, fait pour être lu et diffé tel quel ; pour une \
+             comparaison structurée, utiliser --diff-explain (opérandes résolues) ou \
+             --diff-dex (empreintes d'opcodes), qui ont tous deux --format json",
         )?;
         let Some(input) = &cli.apk else {
             bail!("--disasm requiert un APK ou un DEX en argument (mode single)");
@@ -1186,6 +1215,12 @@ est racine — ne pas comparer à une mesure `manifest`)",
     // Sortie rapide : inventaire / export des entrées assets/. Ni catalogue MITRE
     // ni moteur de règles — une seule passe sur l'archive. Single ou bulk.
     if assets_mode {
+        reject_format(
+            "--list-assets / --extract-assets / --assets-fingerprint",
+            cli.format,
+            "l'inventaire est un TSV à en-tête ; --extract-assets <DIR> écrit déjà un \
+             assets.json structuré, plus un assets_index.json global en bulk",
+        )?;
         // Les hashes sont validés AVANT toute lecture d'archive : un ensemble de
         // référence mal formé doit échouer tout de suite, pas au bout du lot.
         let hash_filter = parser::assets::build_hash_filter(
@@ -1243,6 +1278,12 @@ est racine — ne pas comparer à une mesure `manifest`)",
     // Sortie rapide : extraction des .so natifs (lib/ ET hors-lib, ex. Jiagu
     // assets/libjiagu*.so) vers --out. Pas de moteur de règles ni de catalogue.
     if cli.extract_libs {
+        reject_format(
+            "--extract-libs",
+            cli.format,
+            "les bibliothèques sont écrites dans --out et récapitulées en texte ; il n'existe \
+             pas de forme structurée de ce récapitulatif",
+        )?;
         let Some(apk) = &cli.apk else {
             bail!("--extract-libs requiert un APK (mode single)");
         };
@@ -1253,6 +1294,12 @@ est racine — ne pas comparer à une mesure `manifest`)",
 
     // Sortie rapide : liste des entrées de l'archive. Rien n'est extrait.
     if cli.list_entries {
+        reject_format(
+            "--list-entries",
+            cli.format,
+            "la liste est un chemin par ligne, directement consommable ; pour des tailles, un \
+             SHA-256 et un type reniflé, utiliser --list-assets",
+        )?;
         let Some(apk) = &cli.apk else {
             bail!("--list-entries requiert un APK (mode single)");
         };
@@ -1267,6 +1314,12 @@ est racine — ne pas comparer à une mesure `manifest`)",
     // entier. Cas d'usage : APK de plugin embarqué (res/raw/plugin des
     // conteneurs DroidPlugin), payload d'un packer dans assets/.
     if !cli.extract_entry.is_empty() {
+        reject_format(
+            "--extract-entry",
+            cli.format,
+            "les entrées retenues sont écrites dans --out et récapitulées en texte, avec le \
+             SHA-256 du contenu décompressé",
+        )?;
         let Some(apk) = &cli.apk else {
             bail!("--extract-entry requiert un APK (mode single)");
         };
@@ -1290,6 +1343,7 @@ est racine — ne pas comparer à une mesure `manifest`)",
 
         // ── Mode single : comportement historique inchangé ──
         (Some(apk), None) => {
+            reject_non_json_format(cli.format)?;
             let parsed = parser::parse_apk(apk)?;
             let matches = engine.run(&parsed.features, &parsed.call_graph);
 
@@ -1458,12 +1512,30 @@ fn check_json_dest(format: Format, dest: Option<&std::path::Path>) -> Result<()>
 
 /// Refus explicite de `--format` pour un mode dont la seule sortie est du texte.
 /// Un format accepté puis ignoré produit un `.json` qui n'en est pas un, sans
-/// que rien ne le signale. `instead` dit par quoi passer.
+/// que rien ne le signale. Ce qu'il faut faire à la place dépend du mode, d'où
+/// `instead` : c'est lui qui porte l'information utile.
 fn reject_format(mode: &str, format: Format, instead: &str) -> Result<()> {
     if format != Format::Text {
         bail!(
-            "{mode} n'a pas de sortie JSON : sa sortie est du texte, faite pour être lue et \
-             diffée telle quelle. Retirer --format, ou passer --format text ; {instead}"
+            "{mode} n'a qu'une sortie texte : --format y est sans effet, donc refusé plutôt \
+             qu'ignoré. Retirer --format, ou passer --format text ; {instead}"
+        );
+    }
+    Ok(())
+}
+
+/// Le pipeline par défaut ne sait rendre que du JSON. `--format text` n'est pas
+/// refusé ici : il est indistinguable du défaut global, que clap applique avant
+/// qu'on lise `cli.format`, donc le refuser rejetterait une invocation qui n'a
+/// pas passé `--format` du tout. Seules les valeurs qui ne peuvent pas être ce
+/// défaut sont refusées.
+fn reject_non_json_format(format: Format) -> Result<()> {
+    if matches!(format, Format::Both | Format::Csv) {
+        bail!(
+            "le pipeline par défaut ne rend que du JSON : --format both et \
+             --format csv y sont sans effet, donc refusés plutôt qu'ignorés. \
+             Passer --format json, ou rien ; pour une synthèse CSV d'un lot, \
+             utiliser --bulk <DIR> --format csv"
         );
     }
     Ok(())
@@ -2468,7 +2540,7 @@ mod tests {
         }
     }
 
-    // --- #10 : un mode sans JSON refuse `--format` au lieu de l'ignorer ---
+    // --- #10, #12 : un mode sans JSON refuse `--format` au lieu de l'ignorer ---
 
     #[test]
     fn a_text_only_mode_accepts_only_text() {
@@ -2489,5 +2561,21 @@ mod tests {
         assert!(message.contains("--disasm"), "{message}");
         assert!(message.contains("--format text"), "{message}");
         assert!(message.contains("utiliser --diff-explain"), "{message}");
+    }
+
+    // --- #13 : le pipeline par défaut refuse ce qu'il ne sait pas rendre ---
+
+    #[test]
+    fn the_default_pipeline_refuses_both_and_csv() {
+        assert!(reject_non_json_format(Format::Both).is_err());
+        assert!(reject_non_json_format(Format::Csv).is_err());
+    }
+
+    /// `text` doit passer : il est indistinguable du défaut global, donc le
+    /// refuser rejetterait `drakkar sample.apk`, qui n'a pas passé --format.
+    #[test]
+    fn the_default_pipeline_still_accepts_the_global_default() {
+        assert!(reject_non_json_format(Format::Text).is_ok());
+        assert!(reject_non_json_format(Format::Json).is_ok());
     }
 }
