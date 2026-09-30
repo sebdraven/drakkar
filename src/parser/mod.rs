@@ -10,6 +10,7 @@
 //! bascule sur `apkzip`, un lecteur tolérant calqué sur le chargeur d'APK. Le
 //! même motif vaut pour le manifest binaire : `axml` prend le relais quand
 //! `axmldecoder` refuse ou panique.
+pub mod api_surface;
 pub mod apkzip;
 pub mod arsc;
 pub mod assets;
