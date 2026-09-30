@@ -1009,12 +1009,17 @@ est racine — ne pas comparer à une mesure `manifest`)",
     if let Some(pair) = &cli.diff_explain {
         use parser::diff_explain::ColorMode;
 
+        if cli.legend {
+            println!("{}", parser::diff_explain::legend());
+            return Ok(());
+        }
         let color = match cli.color.as_str() {
             "auto" => ColorMode::Auto,
             "always" => ColorMode::Always,
             "never" => ColorMode::Never,
             other => bail!("--color attend auto|always|never, reçu {other:?}"),
         };
+        check_json_dest(cli.format, cli.json_out.as_deref())?;
 
         let opts = parser::diff_explain::ExplainOptions {
             include_prefixes: cli.explain_include.clone(),
@@ -1024,12 +1029,6 @@ est racine — ne pas comparer à une mesure `manifest`)",
             align_cap: cli.explain_align_cap,
             ..Default::default()
         };
-
-        if cli.legend {
-            println!("{}", parser::diff_explain::legend());
-            return Ok(());
-        }
-        check_json_dest(cli.format, cli.json_out.as_deref())?;
 
         let report = parser::diff_explain::run(&pair[0], &pair[1], &opts)?;
         if cli.format.wants_text() {
