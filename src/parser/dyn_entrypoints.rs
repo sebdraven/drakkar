@@ -867,6 +867,64 @@ mod tests {
         );
     }
 
+    // Les rendus attendus viennent de `dex-bytecode/src/decoder.rs`, bras
+    // `Format::F3rc | F3rmi | F3rms`, `Format::F4rcc` et `Format::F5rc`.
+
+    #[test]
+    fn plage_3rc_est_developpee() {
+        assert_eq!(
+            scan_registers("v3 ... v7, method@42"),
+            vec![3, 7],
+            "le balayage seul ne voit que les bornes"
+        );
+        assert_eq!(
+            registers_of("v3 ... v7, method@42"),
+            vec![3, 4, 5, 6, 7],
+            "l'argument 2 doit être v5, pas v7"
+        );
+    }
+
+    #[test]
+    fn plage_4rcc_a_deux_points_et_non_trois() {
+        assert_eq!(registers_of("v1 .. v4 method@8 proto@3"), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn plage_4rcc_a_un_seul_registre_ne_le_double_pas() {
+        // `4rcc` émet le marqueur même quand les deux bornes sont égales.
+        assert_eq!(registers_of("v5 .. v5 method@8 proto@3"), vec![5]);
+    }
+
+    #[test]
+    fn range_a_un_registre_est_rendu_sans_marqueur() {
+        // `3rc` et `5rc` écrivent `v{lo}, kind` quand le compte vaut 1 : le
+        // balayage y est déjà correct et ne doit rien changer.
+        assert!(!has_range_marker("v5, method@42"));
+        assert_eq!(registers_of("v5, method@42"), vec![5]);
+    }
+
+    #[test]
+    fn borne_haute_decroissante_ne_rend_aucun_registre() {
+        // Compte nul : `nnnn = cccc.saturating_sub(1)` passe sous `cccc`.
+        assert_eq!(registers_of("v5 ... v4, method@42"), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn forme_non_range_est_inchangee() {
+        // Critère d'acceptation du correctif : en l'absence de marqueur, la
+        // sortie est celle du balayage, au bit près.
+        for ops in [
+            "v0, v1, v2, method@17",
+            "v3, string@904",
+            "v2, v0, field@55",
+            "v10, v11",
+            "",
+        ] {
+            assert!(!has_range_marker(ops));
+            assert_eq!(registers_of(ops), scan_registers(ops), "{ops}");
+        }
+    }
+
     #[test]
     fn this_register_suit_acc_static() {
         // Méthode d'instance `void f(Object)` : regs=4, ins=2 -> this en v2.
