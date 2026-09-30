@@ -217,6 +217,16 @@ struct Cli {
     #[arg(long, value_name = "API")]
     probe: Option<String>,
 
+    /// Surface d'API DÉCLARÉE par les annotations : verbe HTTP, gabarit de route
+    /// et noms de paramètres depuis Retrofit (@GET, @POST, @Path, @Query…),
+    /// noms sérialisés depuis Gson (@SerializedName). Lit
+    /// l'annotation_directory_item, aucune instruction : une route construite à
+    /// l'exécution lui est invisible, et une sortie vide veut dire « pas
+    /// Retrofit », pas « pas de route » (--api-surface --legend). Accepte APK ou
+    /// DEX brut, single ou bulk. Sortie TSV, --format json disponible.
+    #[arg(long)]
+    api_surface: bool,
+
     /// Chaînes littérales du pool DEX. Sans motif : dump complet. Avec un ou
     /// plusieurs motifs (répéter l'option) : ne sort que les chaînes qui les
     /// contiennent, comparaison INSENSIBLE À LA CASSE. Accepte APK ou DEX brut,
@@ -802,6 +812,118 @@ est racine — ne pas comparer à une mesure `manifest`)",
             for (i, p) in reach.paths.iter().take(10).enumerate() {
                 println!("  [{i}] {}", p.join("  ->  "));
             }
+        }
+        return Ok(());
+    }
+
+    // Sortie rapide : surface d'API déclarée par les annotations. Ne charge ni
+    // catalogue MITRE ni moteur de règles, et ne décode AUCUNE instruction :
+    // une passe sur les class_def pour lire les annotation_directory_item.
+    if cli.api_surface {
+        if cli.legend {
+            println!("{}", parser::api_surface::legend());
+            return Ok(());
+        }
+        if cli.format == Format::Csv {
+            bail!(
+                "--format csv n'existe pas pour --api-surface : la sortie texte est déjà un TSV \
+                 plat, utiliser text (par défaut) ou json"
+            );
+        }
+        check_json_dest(cli.format, cli.json_out.as_deref())?;
+
+        let inputs: Vec<PathBuf> = match (&cli.apk, &cli.bulk) {
+            (Some(apk), None) => vec![apk.clone()],
+            (None, Some(dir)) => {
+                let found = parser::dyn_entrypoints::collect_inputs(dir, cli.recursive)?;
+                if found.is_empty() {
+                    bail!("aucun APK ni DEX trouvé dans {}", dir.display());
+                }
+                found
+            }
+            _ => bail!("--api-surface requiert soit un APK ou un DEX, soit --bulk DIR"),
+        };
+
+        if cli.format.wants_text() {
+            println!("sample\tniveau\tclasse\tmembre\tcle\tvaleur\tdetail");
+        }
+        let mut reports = Vec::new();
+        for input in &inputs {
+            let sample = input
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".into());
+
+            // Un DEX malformé peut faire paniquer le crate : on isole pour
+            // qu'un échantillon pourri ne tue pas le lot.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                parser::api_surface::scan_any(input)
+            }));
+            let report = match outcome {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    eprintln!("[FAIL]  {sample} — {e:#}");
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("[PANIC] {sample} — parsing abandonné");
+                    continue;
+                }
+            };
+
+            if cli.format.wants_text() {
+                for r in &report.routes {
+                    println!(
+                        "{}\troute\t{}\t{}\t{}\t{}\t{}",
+                        sample,
+                        r.class,
+                        r.method,
+                        r.verb.as_deref().unwrap_or(""),
+                        r.path.as_deref().unwrap_or(""),
+                        parser::api_surface::route_detail(r)
+                    );
+                }
+                for f in &report.fields {
+                    println!(
+                        "{}\tchamp\t{}\t{}\tSerializedName\t{}\t{}",
+                        sample,
+                        f.class,
+                        f.field,
+                        f.serialized,
+                        parser::api_surface::field_detail(f)
+                    );
+                }
+            }
+
+            let s = &report.stats;
+            eprintln!(
+                "[API]   {sample} — {} classes, {} annotees, {} annotations ; {} routes \
+                 ({} sans_gabarit), {} params_seuls, {} params, {} champs ; {} autres, \
+                 {} directory_ko, {} orphelines, {} index_hors_plage",
+                s.classes,
+                s.annotated_classes,
+                s.annotations_seen,
+                s.routes,
+                s.routes_without_path,
+                s.params_only_methods,
+                s.params_recognized,
+                s.serialized_fields,
+                s.other_annotations,
+                s.directory_failures,
+                s.orphan_method_annotations,
+                s.param_index_mismatch
+            );
+            reports.push((sample, report));
+        }
+
+        if cli.format.wants_json() {
+            // Une entrée par échantillon : le mode bulk et le mode single
+            // rendent la même forme, seule la longueur change.
+            let json: Vec<_> = reports
+                .iter()
+                .map(|(sample, r)| serde_json::json!({ "sample": sample, "report": r }))
+                .collect();
+            emit_json(&json, cli.json_out.as_deref())?;
         }
         return Ok(());
     }

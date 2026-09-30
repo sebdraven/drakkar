@@ -529,8 +529,40 @@ fn strategy_for(sink: &str) -> SinkSpec {
 /// Extrait la liste des registres `vN` d'une instruction, dans l'ordre.
 /// Les marqueurs `type@`, `method@`, `string@` ne contiennent pas de `v` suivi
 /// de chiffres, ils ne polluent donc pas l'extraction.
+///
+/// ⚠️ Les formes `/range` sont rendues par `dex-bytecode` comme
+/// `v{lo} ... v{hi}` (formats `3rc`, `5rc`) ou `v{lo} .. v{hi}` (format `4rcc`) :
+/// le balayage n'y voit que les deux BORNES. Elles sont développées en plage,
+/// sans quoi tout appelant qui indexe la liste pour désigner l'argument *n* lit
+/// le mauvais registre — ou n'en lit aucun et croit avoir affaire à une autre
+/// surcharge.
+///
+/// Un `/range` à un seul registre est rendu SANS marqueur par `3rc` et `5rc` :
+/// le balayage y est déjà correct, et la sortie reste inchangée.
 pub(crate) fn registers(ins: &dex_bytecode::Instruction) -> Vec<u32> {
-    let ops = ins.operands();
+    registers_of(ins.operands())
+}
+
+fn registers_of(ops: &str) -> Vec<u32> {
+    let scanned = scan_registers(ops);
+    if !has_range_marker(ops) {
+        return scanned;
+    }
+    match (scanned.first().copied(), scanned.last().copied()) {
+        (Some(lo), Some(hi)) if lo <= hi => (lo..=hi).collect(),
+        // Borne haute décroissante : `dex-bytecode` la calcule par
+        // `saturating_sub(1)`, un compte nul la fait donc passer sous `lo`.
+        _ => Vec::new(),
+    }
+}
+
+/// Le rendu porte-t-il un marqueur de plage ? Les deux graphies diffèrent :
+/// `3rc` et `5rc` écrivent trois points, `4rcc` en écrit deux.
+fn has_range_marker(ops: &str) -> bool {
+    ops.contains(" ... ") || ops.contains(" .. ")
+}
+
+fn scan_registers(ops: &str) -> Vec<u32> {
     let bytes: Vec<char> = ops.chars().collect();
     let mut out = Vec::new();
     let mut i = 0;
@@ -865,6 +897,64 @@ mod tests {
             to_descriptor("com.cocospy.receivers.SMSReceiver"),
             "Lcom/cocospy/receivers/SMSReceiver;"
         );
+    }
+
+    // Les rendus attendus viennent de `dex-bytecode/src/decoder.rs`, bras
+    // `Format::F3rc | F3rmi | F3rms`, `Format::F4rcc` et `Format::F5rc`.
+
+    #[test]
+    fn plage_3rc_est_developpee() {
+        assert_eq!(
+            scan_registers("v3 ... v7, method@42"),
+            vec![3, 7],
+            "le balayage seul ne voit que les bornes"
+        );
+        assert_eq!(
+            registers_of("v3 ... v7, method@42"),
+            vec![3, 4, 5, 6, 7],
+            "l'argument 2 doit être v5, pas v7"
+        );
+    }
+
+    #[test]
+    fn plage_4rcc_a_deux_points_et_non_trois() {
+        assert_eq!(registers_of("v1 .. v4 method@8 proto@3"), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn plage_4rcc_a_un_seul_registre_ne_le_double_pas() {
+        // `4rcc` émet le marqueur même quand les deux bornes sont égales.
+        assert_eq!(registers_of("v5 .. v5 method@8 proto@3"), vec![5]);
+    }
+
+    #[test]
+    fn range_a_un_registre_est_rendu_sans_marqueur() {
+        // `3rc` et `5rc` écrivent `v{lo}, kind` quand le compte vaut 1 : le
+        // balayage y est déjà correct et ne doit rien changer.
+        assert!(!has_range_marker("v5, method@42"));
+        assert_eq!(registers_of("v5, method@42"), vec![5]);
+    }
+
+    #[test]
+    fn borne_haute_decroissante_ne_rend_aucun_registre() {
+        // Compte nul : `nnnn = cccc.saturating_sub(1)` passe sous `cccc`.
+        assert_eq!(registers_of("v5 ... v4, method@42"), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn forme_non_range_est_inchangee() {
+        // Critère d'acceptation du correctif : en l'absence de marqueur, la
+        // sortie est celle du balayage, au bit près.
+        for ops in [
+            "v0, v1, v2, method@17",
+            "v3, string@904",
+            "v2, v0, field@55",
+            "v10, v11",
+            "",
+        ] {
+            assert!(!has_range_marker(ops));
+            assert_eq!(registers_of(ops), scan_registers(ops), "{ops}");
+        }
     }
 
     #[test]

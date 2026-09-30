@@ -3,7 +3,7 @@
 //! Le reste de `parser` et de `cfg` ne manipule que les types définis ici.
 //! Recette : `grep -rn 'dex_parser::' src/` ne doit citer que ce fichier.
 //!
-//! La surface est CLOSE : elle expose ce que les neuf modules consommateurs
+//! La surface est CLOSE : elle expose ce que les dix modules consommateurs
 //! utilisent, rien de plus. Une façade plus large que son usage est aussi
 //! difficile à faire évoluer que pas de façade du tout.
 //!
@@ -27,7 +27,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-use dex_parser::{ClassDef, DexFile, EncodedValue, NO_INDEX};
+use dex_parser::{visibility_name, AnnotationItem, ClassDef, DexFile, EncodedValue, NO_INDEX};
 
 /// Un DEX ouvert, pools résolus.
 pub struct DexBin {
@@ -61,6 +61,9 @@ pub struct DexClass<'a> {
 
 /// Une méthode définie par une classe.
 pub struct DexMethod<'a> {
+    /// Index global dans `method_ids`. C'est la clé de jointure vers les
+    /// annotations de méthode et de paramètre — voir [`DexBin::annotations`].
+    pub method_idx: u32,
     pub name: &'a str,
     /// Descripteurs EXACTS des paramètres déclarés.
     pub params: &'a [String],
@@ -99,6 +102,62 @@ pub struct StaticField {
     pub name: String,
     /// `None` quand l'`encoded_array` s'arrête avant ce champ.
     pub value: Option<DexValue>,
+}
+
+/// Une annotation, index de pool déjà résolus.
+pub struct Annotation {
+    /// Descripteur Dalvik du type, ex. `Lretrofit2/http/GET;`.
+    pub type_name: String,
+    /// `build`, `runtime` ou `system`. Seules les `runtime` sont lisibles par
+    /// réflexion à l'exécution — c'est ce qu'exigent Retrofit et Gson.
+    pub visibility: &'static str,
+    /// Éléments nommés, dans l'ordre du DEX.
+    pub elements: Vec<(String, DexValue)>,
+}
+
+impl Annotation {
+    pub fn element(&self, name: &str) -> Option<&DexValue> {
+        self.elements
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v)
+    }
+}
+
+/// Annotations portées par un paramètre.
+pub struct ParamAnnotations {
+    /// Position dans [`DexMethod::params`] — `this` n'y figure pas.
+    pub index: usize,
+    pub annotations: Vec<Annotation>,
+}
+
+/// Annotations portées par une méthode et par ses paramètres.
+pub struct MethodAnnotations {
+    /// Se joint à [`DexMethod::method_idx`].
+    pub method_idx: u32,
+    pub annotations: Vec<Annotation>,
+    /// Seuls les paramètres effectivement annotés figurent ici.
+    pub params: Vec<ParamAnnotations>,
+}
+
+/// Annotations portées par un champ, nom et type déjà résolus.
+pub struct FieldAnnotations {
+    pub name: String,
+    pub typ: String,
+    pub annotations: Vec<Annotation>,
+}
+
+/// L'`annotation_directory_item` d'une classe, tous niveaux confondus.
+pub struct ClassAnnotations {
+    pub class: Vec<Annotation>,
+    pub methods: Vec<MethodAnnotations>,
+    pub fields: Vec<FieldAnnotations>,
+}
+
+impl ClassAnnotations {
+    pub fn is_empty(&self) -> bool {
+        self.class.is_empty() && self.methods.is_empty() && self.fields.is_empty()
+    }
 }
 
 /// Valeur d'un `encoded_value`, index de pool DÉJÀ résolus.
@@ -293,6 +352,7 @@ impl DexBin {
         };
 
         Ok(DexMethod {
+            method_idx,
             name,
             params: proto.map_or(NO_PARAMS, |p| p.params.as_slice()),
             return_type: proto.map_or("", |p| p.return_type.as_str()),
@@ -347,6 +407,100 @@ impl DexBin {
         }
 
         Ok(pair_statics(names, values))
+    }
+
+    /// Annotations d'une classe : niveaux classe, champ, méthode et paramètre.
+    ///
+    /// `get_annotations` du crate est nommée d'après le `class_def_item` qui
+    /// porte l'offset, mais l'`annotation_directory_item` qu'elle rend porte
+    /// les QUATRE niveaux. Les index de `method_annotations` et de
+    /// `parameter_annotations` sont des index globaux de `method_ids`, déjà
+    /// absolus — `ClassData::parse` accumule le `method_idx_diff` delta-encodé.
+    /// Ils se joignent donc directement à [`DexMethod::method_idx`].
+    pub fn annotations(&self, class: &DexClass<'_>) -> Result<ClassAnnotations> {
+        let dir = self.dex.get_annotations(&class.class_def)?;
+
+        let mut methods: Vec<MethodAnnotations> = dir
+            .method_annotations
+            .iter()
+            .map(|(idx, set)| MethodAnnotations {
+                method_idx: *idx,
+                annotations: self.annotation_set(set),
+                params: Vec::new(),
+            })
+            .collect();
+
+        for (idx, per_param) in &dir.parameter_annotations {
+            // ⚠️ Un paramètre non annoté porte un set VIDE et occupe sa place
+            // dans la liste. Filtrer AVANT d'énumérer décalerait tous les
+            // index suivants — même piège que `pair_statics`.
+            let params: Vec<ParamAnnotations> = per_param
+                .iter()
+                .enumerate()
+                .filter(|(_, set)| !set.is_empty())
+                .map(|(index, set)| ParamAnnotations {
+                    index,
+                    annotations: self.annotation_set(set),
+                })
+                .collect();
+            if params.is_empty() {
+                continue;
+            }
+            match methods.iter_mut().find(|m| m.method_idx == *idx) {
+                Some(m) => m.params = params,
+                None => methods.push(MethodAnnotations {
+                    method_idx: *idx,
+                    annotations: Vec::new(),
+                    params,
+                }),
+            }
+        }
+
+        let fields = dir
+            .field_annotations
+            .iter()
+            .map(|(idx, set)| {
+                let item = self.field_item(*idx);
+                FieldAnnotations {
+                    name: item
+                        .as_ref()
+                        .map_or_else(String::new, |f| f.name.to_string()),
+                    typ: item
+                        .as_ref()
+                        .map_or_else(String::new, |f| f.typ.to_string()),
+                    annotations: self.annotation_set(set),
+                }
+            })
+            .collect();
+
+        Ok(ClassAnnotations {
+            class: self.annotation_set(&dir.class_annotations),
+            methods,
+            fields,
+        })
+    }
+
+    fn annotation_set(&self, set: &[AnnotationItem]) -> Vec<Annotation> {
+        set.iter()
+            .map(|item| Annotation {
+                type_name: self
+                    .typ(item.annotation.type_idx)
+                    .unwrap_or_default()
+                    .to_string(),
+                visibility: visibility_name(item.visibility),
+                elements: item
+                    .annotation
+                    .elements
+                    .iter()
+                    .map(|(name_idx, v)| {
+                        (
+                            self.string(*name_idx).unwrap_or_default().to_string(),
+                            self.value_of(v),
+                        )
+                    })
+                    .collect(),
+            })
+            .collect()
     }
 
     fn value_of(&self, v: &EncodedValue) -> DexValue {

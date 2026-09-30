@@ -37,8 +37,6 @@
 //!     il ne dit rien d'un champ String. On indexe donc EN PLUS, localement, les
 //!     champs dont toutes les assignations sont des `const-*` (`const_fields`) —
 //!     sans quoi tout champ-source tomberait mécaniquement en `runtime`.
-//!   - `invoke-*/range` : `registers()` rend les deux bornes, pas la plage. Les
-//!     arguments d'un appel `/range` sont donc mal lus (sous-estime `decrypt-const`).
 //!   - Trois passes de décodage par DEX (assignations de classes, assignations
 //!     constantes, scan). Assumé pour une mesure jetable.
 

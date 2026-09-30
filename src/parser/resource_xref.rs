@@ -574,17 +574,10 @@ fn find_consumer(
     None
 }
 
-/// Le registre figure-t-il parmi les arguments de l'appel ? Les formes
-/// `/range` n'énumèrent que leurs bornes.
+/// Le registre figure-t-il parmi les arguments de l'appel ? `registers` développe
+/// lui-même les formes `/range`.
 fn passes_register(ins: &dex_bytecode::Instruction, reg: u32) -> bool {
-    let regs = registers(ins);
-    if ins.mnemonic().ends_with("/range") {
-        return match (regs.first(), regs.last()) {
-            (Some(lo), Some(hi)) => (*lo..=*hi).contains(&reg),
-            _ => false,
-        };
-    }
-    regs.contains(&reg)
+    registers(ins).contains(&reg)
 }
 
 fn u16_at(d: &[u8], off: usize) -> Option<u16> {
