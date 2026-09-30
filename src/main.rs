@@ -1290,6 +1290,7 @@ est racine — ne pas comparer à une mesure `manifest`)",
 
         // ── Mode single : comportement historique inchangé ──
         (Some(apk), None) => {
+            reject_non_json_format(cli.format)?;
             let parsed = parser::parse_apk(apk)?;
             let matches = engine.run(&parsed.features, &parsed.call_graph);
 
