@@ -1084,8 +1084,9 @@ est racine — ne pas comparer à une mesure `manifest`)",
         reject_format(
             "--disasm",
             cli.format,
-            "pour une comparaison structurée, utiliser --diff-explain (opérandes résolues) \
-             ou --diff-dex (empreintes d'opcodes), qui ont tous deux --format json",
+            "le désassemblage est du texte, fait pour être lu et diffé tel quel ; pour une \
+             comparaison structurée, utiliser --diff-explain (opérandes résolues) ou \
+             --diff-dex (empreintes d'opcodes), qui ont tous deux --format json",
         )?;
         let Some(input) = &cli.apk else {
             bail!("--disasm requiert un APK ou un DEX en argument (mode single)");
