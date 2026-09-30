@@ -494,6 +494,12 @@ fn main() -> Result<()> {
     // Sortie rapide : audit d'architecture native seul (pas de moteur de règles,
     // pas de catalogue MITRE) — lit uniquement les en-têtes ELF, en mémoire.
     if cli.native_arch {
+        reject_format(
+            "--native-arch",
+            cli.format,
+            "cet audit d'en-têtes ELF n'a pas de forme structurée ; pour un inventaire des \
+             binaires natifs, passer par --list-assets (TSV) ou --extract-libs",
+        )?;
         let Some(apk) = &cli.apk else {
             bail!("--native-arch requiert un APK (mode single)");
         };
@@ -506,6 +512,12 @@ fn main() -> Result<()> {
     // MITRE ni le moteur de règles — deux passages sur les classes*.dex.
     // Fonctionne en single (APK en argument) comme en bulk (--bulk DIR).
     if cli.dyn_entrypoints {
+        reject_format(
+            "--dyn-entrypoints",
+            cli.format,
+            "la sortie est un flux TSV à en-tête, fait pour être filtré ou joint en aval ; \
+             pour du JSON sur le graphe d'appel, utiliser --orphan-audit",
+        )?;
         let apks: Vec<PathBuf> = match (&cli.apk, &cli.bulk) {
             (Some(apk), None) => vec![apk.clone()],
             (None, Some(dir)) => {
@@ -583,6 +595,11 @@ fn main() -> Result<()> {
     // Sortie rapide : mesure de provenance des cibles de réflexion. Même routage
     // APK/DEX que --dyn-entrypoints, même traitement séquentiel (flux TSV).
     if cli.reflection_inputs {
+        reject_format(
+            "--reflection-inputs",
+            cli.format,
+            "la sortie est un TSV déjà agrégé (sample, category, count), à joindre en aval",
+        )?;
         let inputs: Vec<PathBuf> = match (&cli.apk, &cli.bulk) {
             (Some(apk), None) => vec![apk.clone()],
             (None, Some(dir)) => {
@@ -746,6 +763,12 @@ est racine — ne pas comparer à une mesure `manifest`)",
     // racines que --orphan-audit, mais on interroge une API précise (est-elle un
     // nœud ? atteignable ? par quels chemins ?).
     if let Some(api) = &cli.probe {
+        reject_format(
+            "--probe",
+            cli.format,
+            "cette sonde rend un verdict et ses chemins en texte ; pour du JSON sur le graphe, \
+             utiliser --orphan-audit --format json",
+        )?;
         let Some(apk) = &cli.apk else {
             bail!("--probe requiert un APK ou un DEX brut (mode single)");
         };
@@ -785,6 +808,12 @@ est racine — ne pas comparer à une mesure `manifest`)",
 
     // Sortie rapide : chaines litterales du pool DEX. Single ou bulk, APK ou DEX.
     if let Some(motifs) = &cli.strings {
+        reject_format(
+            "--strings",
+            cli.format,
+            "le pool est un TSV à en-tête (sample, motif, chaine), à joindre en aval ; pour \
+             comparer deux pools en JSON, utiliser --diff-strings",
+        )?;
         let inputs: Vec<PathBuf> = match (&cli.apk, &cli.bulk) {
             (Some(apk), None) => vec![apk.clone()],
             (None, Some(dir)) => {
@@ -1186,6 +1215,12 @@ est racine — ne pas comparer à une mesure `manifest`)",
     // Sortie rapide : inventaire / export des entrées assets/. Ni catalogue MITRE
     // ni moteur de règles — une seule passe sur l'archive. Single ou bulk.
     if assets_mode {
+        reject_format(
+            "--list-assets / --extract-assets / --assets-fingerprint",
+            cli.format,
+            "l'inventaire est un TSV à en-tête ; --extract-assets <DIR> écrit déjà un \
+             assets.json structuré, plus un assets_index.json global en bulk",
+        )?;
         // Les hashes sont validés AVANT toute lecture d'archive : un ensemble de
         // référence mal formé doit échouer tout de suite, pas au bout du lot.
         let hash_filter = parser::assets::build_hash_filter(
@@ -1243,6 +1278,12 @@ est racine — ne pas comparer à une mesure `manifest`)",
     // Sortie rapide : extraction des .so natifs (lib/ ET hors-lib, ex. Jiagu
     // assets/libjiagu*.so) vers --out. Pas de moteur de règles ni de catalogue.
     if cli.extract_libs {
+        reject_format(
+            "--extract-libs",
+            cli.format,
+            "les bibliothèques sont écrites dans --out et récapitulées en texte ; il n'existe \
+             pas de forme structurée de ce récapitulatif",
+        )?;
         let Some(apk) = &cli.apk else {
             bail!("--extract-libs requiert un APK (mode single)");
         };
@@ -1253,6 +1294,12 @@ est racine — ne pas comparer à une mesure `manifest`)",
 
     // Sortie rapide : liste des entrées de l'archive. Rien n'est extrait.
     if cli.list_entries {
+        reject_format(
+            "--list-entries",
+            cli.format,
+            "la liste est un chemin par ligne, directement consommable ; pour des tailles, un \
+             SHA-256 et un type reniflé, utiliser --list-assets",
+        )?;
         let Some(apk) = &cli.apk else {
             bail!("--list-entries requiert un APK (mode single)");
         };
@@ -1267,6 +1314,12 @@ est racine — ne pas comparer à une mesure `manifest`)",
     // entier. Cas d'usage : APK de plugin embarqué (res/raw/plugin des
     // conteneurs DroidPlugin), payload d'un packer dans assets/.
     if !cli.extract_entry.is_empty() {
+        reject_format(
+            "--extract-entry",
+            cli.format,
+            "les entrées retenues sont écrites dans --out et récapitulées en texte, avec le \
+             SHA-256 du contenu décompressé",
+        )?;
         let Some(apk) = &cli.apk else {
             bail!("--extract-entry requiert un APK (mode single)");
         };
