@@ -1512,12 +1512,30 @@ fn check_json_dest(format: Format, dest: Option<&std::path::Path>) -> Result<()>
 
 /// Refus explicite de `--format` pour un mode dont la seule sortie est du texte.
 /// Un format accepté puis ignoré produit un `.json` qui n'en est pas un, sans
-/// que rien ne le signale. `instead` dit par quoi passer.
+/// que rien ne le signale. Ce qu'il faut faire à la place dépend du mode, d'où
+/// `instead` : c'est lui qui porte l'information utile.
 fn reject_format(mode: &str, format: Format, instead: &str) -> Result<()> {
     if format != Format::Text {
         bail!(
-            "{mode} n'a pas de sortie JSON : sa sortie est du texte, faite pour être lue et \
-             diffée telle quelle. Retirer --format, ou passer --format text ; {instead}"
+            "{mode} n'a qu'une sortie texte : --format y est sans effet, donc refusé plutôt \
+             qu'ignoré. Retirer --format, ou passer --format text ; {instead}"
+        );
+    }
+    Ok(())
+}
+
+/// Le pipeline par défaut ne sait rendre que du JSON. `--format text` n'est pas
+/// refusé ici : il est indistinguable du défaut global, que clap applique avant
+/// qu'on lise `cli.format`, donc le refuser rejetterait une invocation qui n'a
+/// pas passé `--format` du tout. Seules les valeurs qui ne peuvent pas être ce
+/// défaut sont refusées.
+fn reject_non_json_format(format: Format) -> Result<()> {
+    if matches!(format, Format::Both | Format::Csv) {
+        bail!(
+            "le pipeline par défaut ne rend que du JSON : --format both et \
+             --format csv y sont sans effet, donc refusés plutôt qu'ignorés. \
+             Passer --format json, ou rien ; pour une synthèse CSV d'un lot, \
+             utiliser --bulk <DIR> --format csv"
         );
     }
     Ok(())
