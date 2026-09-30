@@ -56,7 +56,11 @@ pub struct CallGraph {
 
 impl CallGraph {
     pub fn new() -> Self {
-        Self { graph: DiGraph::new(), index: HashMap::new(), supers: HashMap::new() }
+        Self {
+            graph: DiGraph::new(),
+            index: HashMap::new(),
+            supers: HashMap::new(),
+        }
     }
 
     /// Injecte la hiérarchie de classes relevée au parsing
@@ -109,7 +113,9 @@ impl CallGraph {
 
     /// Au moins une méthode du graphe matche `api` (sous-chaîne).
     pub fn has_api(&self, api: &str) -> bool {
-        self.graph.node_indices().any(|n| self.graph[n].api().contains(api))
+        self.graph
+            .node_indices()
+            .any(|n| self.graph[n].api().contains(api))
     }
 
     /// Renvoie les nœuds entrypoint : méthode dont le nom est un callback
@@ -216,7 +222,10 @@ impl CallGraph {
             .filter(|&n| self.graph[n].api().contains(api))
             .collect();
         if targets.is_empty() {
-            return Reachability { reachable: false, paths: Vec::new() };
+            return Reachability {
+                reachable: false,
+                paths: Vec::new(),
+            };
         }
 
         let mut paths = Vec::new();
@@ -225,7 +234,10 @@ impl CallGraph {
                 paths.push(path);
             }
         }
-        Reachability { reachable: !paths.is_empty(), paths }
+        Reachability {
+            reachable: !paths.is_empty(),
+            paths,
+        }
     }
 
     /// Clôture dirigée R(M) : nœuds atteignables depuis au moins un entrypoint.
@@ -292,8 +304,10 @@ impl CallGraph {
     /// pour ne pas dépendre du format d'`api()`. Sert à réinjecter les handlers UI
     /// (`ui_callbacks`) comme racines supplémentaires avant `orphan_audit`.
     pub fn nodes_for(&self, roots: &[(String, String)]) -> Vec<NodeIndex> {
-        let want: HashSet<(&str, &str)> =
-            roots.iter().map(|(c, m)| (c.as_str(), m.as_str())).collect();
+        let want: HashSet<(&str, &str)> = roots
+            .iter()
+            .map(|(c, m)| (c.as_str(), m.as_str()))
+            .collect();
         self.graph
             .node_indices()
             .filter(|&n| {
@@ -450,7 +464,7 @@ impl CallGraph {
                 continue;
             }
             let score = da + db;
-            if best.map_or(true, |(s, _)| score < s) {
+            if best.is_none_or(|(s, _)| score < s) {
                 best = Some((score, node));
             }
         }
@@ -473,13 +487,14 @@ impl CallGraph {
     /// plusieurs sous-systèmes disjoints (code app, chaque SDK…). Agréger les pivots
     /// sur tout le graphe mélangerait « à quel point IronSource couple crypto et
     /// réseau » avec « à quel point l'app le fait ». On isole donc par WCC :
-    ///   - `n`   = pivots communs qualifiés DANS la WCC (fonctions atteignant les
-    ///            deux primitifs), via intersection des ancêtres (2 BFS inversés) ;
-    ///   - `ad`  = longueur moyenne du pont (dist_pivot->a + dist_pivot->b) ;
-    ///   - `eff` = diamètre effectif DIRIGÉ (90e percentile) de la WCC, estimé par
-    ///            multi-sweep échantillonné à budget adaptatif (cf.
-    ///            `effective_diameter_directed`). Rend `ad` comparable entre
-    ///            composantes/APK de tailles différentes.
+    /// - `n`   = pivots communs qualifiés DANS la WCC (fonctions atteignant les
+    ///   deux primitifs), via intersection des ancêtres (2 BFS inversés) ;
+    /// - `ad`  = longueur moyenne du pont (dist_pivot->a + dist_pivot->b) ;
+    /// - `eff` = diamètre effectif DIRIGÉ (90e percentile) de la WCC, estimé par
+    ///   multi-sweep échantillonné à budget adaptatif (cf.
+    ///   `effective_diameter_directed`). Rend `ad` comparable entre
+    ///   composantes/APK de tailles différentes.
+    ///
     /// score brut = n / (ad + 1) ; score normalisé = n / (ad/eff + 1). On retourne
     /// la WCC au score normalisé maximal. Les deux scores + `eff` sont exposés pour
     /// calibration statistique en post-traitement (Mann-Whitney, cf. IntDroid).
@@ -567,7 +582,7 @@ impl CallGraph {
             let ad = sum_bridge as f64 / n as f64;
             let ad_rel = ad / eff.max(1.0);
             let score_norm = n as f64 / (ad_rel + 1.0);
-            if best.map_or(true, |(s, ..)| score_norm > s) {
+            if best.is_none_or(|(s, ..)| score_norm > s) {
                 best = Some((score_norm, n, ad, eff, pivot));
             }
         }
@@ -713,8 +728,8 @@ impl CallGraph {
         while let Some(cur) = queue.pop_front() {
             let d = dist[&cur];
             for prev in self.graph.neighbors_directed(cur, Direction::Incoming) {
-                if !dist.contains_key(&prev) {
-                    dist.insert(prev, d + 1);
+                if let std::collections::hash_map::Entry::Vacant(e) = dist.entry(prev) {
+                    e.insert(d + 1);
                     queue.push_back(prev);
                 }
             }
@@ -741,7 +756,12 @@ impl CallGraph {
                     node = p;
                 }
                 chain.reverse();
-                return Some(chain.into_iter().map(|n| self.graph[n].signature()).collect());
+                return Some(
+                    chain
+                        .into_iter()
+                        .map(|n| self.graph[n].signature())
+                        .collect(),
+                );
             }
             for next in self.graph.neighbors_directed(cur, Direction::Outgoing) {
                 if visited.insert(next) {
@@ -805,7 +825,11 @@ pub struct PivotConstraints {
 impl Default for PivotConstraints {
     fn default() -> Self {
         // Défaut prudent : on exige juste un pivot non-racine.
-        Self { exclude_entrypoints: true, max_dist: None, exclude_allowlisted: false }
+        Self {
+            exclude_entrypoints: true,
+            max_dist: None,
+            exclude_allowlisted: false,
+        }
     }
 }
 
@@ -824,7 +848,12 @@ pub struct CoReach {
 
 impl CoReach {
     fn empty() -> Self {
-        CoReach { reachable: false, pivot: None, path_first: Vec::new(), path_second: Vec::new() }
+        CoReach {
+            reachable: false,
+            pivot: None,
+            path_first: Vec::new(),
+            path_second: Vec::new(),
+        }
     }
 }
 
@@ -964,10 +993,19 @@ mod tests {
 
     #[test]
     fn prefix_stops_before_class_name() {
-        assert_eq!(package_prefix("Lorg/xmlpush/v3/PushService;"), "Lorg/xmlpush/v3");
-        assert_eq!(package_prefix("Lhelper/sqlite/database/DbHelper;"), "Lhelper/sqlite/database");
+        assert_eq!(
+            package_prefix("Lorg/xmlpush/v3/PushService;"),
+            "Lorg/xmlpush/v3"
+        );
+        assert_eq!(
+            package_prefix("Lhelper/sqlite/database/DbHelper;"),
+            "Lhelper/sqlite/database"
+        );
         // Au-delà de 3 segments, on tronque.
-        assert_eq!(package_prefix("Lcom/google/android/gms/ads/Foo;"), "Lcom/google/android");
+        assert_eq!(
+            package_prefix("Lcom/google/android/gms/ads/Foo;"),
+            "Lcom/google/android"
+        );
         // Moins de 3 segments : le nom de classe reste exclu.
         assert_eq!(package_prefix("Lcom/x/Foo$1;"), "Lcom/x");
         assert_eq!(package_prefix("LFoo;"), "LFoo");
@@ -977,12 +1015,19 @@ mod tests {
     fn closure_prend_super_et_sous_classes() {
         let mut cg = CallGraph::new();
         cg.set_supers(HashMap::from([
-            ("Lapp/MyService;".to_string(), "Lapp/BaseService;".to_string()),
-            ("Lapp/BaseService;".to_string(), "Landroid/app/Service;".to_string()),
+            (
+                "Lapp/MyService;".to_string(),
+                "Lapp/BaseService;".to_string(),
+            ),
+            (
+                "Lapp/BaseService;".to_string(),
+                "Landroid/app/Service;".to_string(),
+            ),
             ("Lapp/Child;".to_string(), "Lapp/MyService;".to_string()),
             ("Lapp/Sibling;".to_string(), "Lapp/BaseService;".to_string()),
         ]));
-        let comp = cg.component_closure(&["Lapp/MyService;".to_string()]);
+        let roots = ["Lapp/MyService;".to_string()];
+        let comp = cg.component_closure(&roots);
 
         assert!(comp.contains("Lapp/MyService;"));
         // Super-classe définie dans l'app : c'est elle qui porte onCreate.
@@ -998,7 +1043,8 @@ mod tests {
     #[test]
     fn closure_sans_hierarchie_reste_stricte() {
         let cg = CallGraph::new();
-        let comp = cg.component_closure(&["Lapp/MyService;".to_string()]);
+        let roots = ["Lapp/MyService;".to_string()];
+        let comp = cg.component_closure(&roots);
         assert_eq!(comp.len(), 1);
         assert!(comp.contains("Lapp/MyService;"));
     }

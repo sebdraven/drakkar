@@ -343,7 +343,8 @@ pub fn scan_apk_bytes(apk: &[u8]) -> Result<NativeArchSummary> {
 /// ses entrées : sur un APK trafiqué, une seule entrée chiffrée en apparence
 /// faisait échouer tout le scan.
 pub fn scan_apk_file(path: &Path) -> Result<NativeArchSummary> {
-    let file = std::fs::File::open(path).with_context(|| format!("ouverture {}", path.display()))?;
+    let file =
+        std::fs::File::open(path).with_context(|| format!("ouverture {}", path.display()))?;
     let nominal = zip::ZipArchive::new(file)
         .context("lecture APK (zip)")
         .and_then(|mut archive| scan_archive(&mut archive));

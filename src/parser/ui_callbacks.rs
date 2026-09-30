@@ -22,9 +22,10 @@
 
 use crate::model::MethodRef;
 use crate::parser::axml::Element;
+use crate::parser::dex_facade::{DexBin, DexMethod};
 use crate::parser::dyn_entrypoints::{
     backtrack_new_instance, dest_register, index_field_assignments, operand_index, registers,
-    u16_to_le_bytes, writes_register, FieldAssignments, Provenance,
+    this_register, writes_register, FieldAssignments, Provenance,
 };
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -89,8 +90,7 @@ pub fn extract(path: &Path) -> Result<UiHandlerReport> {
 /// layouts de l'APK d'origine. Une méthode du DEX qui porte l'un de ces noms
 /// ET la signature exigée par Android (`(Landroid/view/View;)V`) est retenue.
 fn extract_with_layouts(path: &Path, xml_on_click: &HashSet<String>) -> Result<UiHandlerReport> {
-    let dex = dex::DexReader::from_file(path)
-        .with_context(|| format!("open dex {}", path.display()))?;
+    let dex = DexBin::open(path)?;
 
     let mut report = UiHandlerReport::default();
 
@@ -105,13 +105,13 @@ fn extract_with_layouts(path: &Path, xml_on_click: &HashSet<String>) -> Result<U
             Ok(c) => c,
             Err(_) => continue,
         };
-        let class_name = class.jtype().type_descriptor().to_string();
+        let class_name = class.descriptor.to_string();
 
-        for method in class.methods() {
+        for method in &class.methods {
             // Volet XML : le handler n'est appelé par personne dans le bytecode,
             // il n'y a donc rien à chercher dans son code — la déclaration suffit.
-            let method_name = method.name().to_string();
-            if xml_on_click.contains(&method_name) && takes_view_returns_void(&method) {
+            let method_name = method.name.to_string();
+            if xml_on_click.contains(&method_name) && takes_view_returns_void(method) {
                 report.handlers.push(UiHandler {
                     class: class_name.clone(),
                     method: method_name.clone(),
@@ -127,41 +127,22 @@ fn extract_with_layouts(path: &Path, xml_on_click: &HashSet<String>) -> Result<U
                 });
             }
 
-            let code = match method.code() {
+            let code = match &method.code {
                 Some(c) => c,
                 None => continue,
             };
             let caller = MethodRef {
                 class: class_name.clone(),
-                name: method.name().to_string(),
+                name: method.name.to_string(),
                 descriptor: String::new(),
             };
 
-            let bytes = u16_to_le_bytes(code.insns());
-            let instructions = match dex_bytecode::decode_all(&bytes, 0) {
+            let instructions = match dex_bytecode::decode_all(code.insns, 0) {
                 Ok(i) => i,
                 Err(_) => continue,
             };
 
-            // Registre de `this` : en Dalvik les paramètres occupent les
-            // registres hauts `[regs - ins, regs)`, `this` en tête. Si `ins`
-            // dépasse la largeur des paramètres déclarés d'un mot, ce mot est
-            // `this`. (`J`/`D` = deux mots.) Même calcul que `dyn_entrypoints`.
-            let params_width: u32 = method
-                .params()
-                .iter()
-                .map(|p| match p.type_descriptor().to_string().as_str() {
-                    "J" | "D" => 2u32,
-                    _ => 1u32,
-                })
-                .sum();
-            let regs = code.registers_size() as u32;
-            let ins_sz = code.ins_size() as u32;
-            let this_reg = if ins_sz > params_width && regs >= ins_sz {
-                Some(regs - ins_sz)
-            } else {
-                None
-            };
+            let this_reg = this_register(method.is_static, code.registers_size, code.ins_size);
 
             scan_method(
                 &dex,
@@ -180,7 +161,7 @@ fn extract_with_layouts(path: &Path, xml_on_click: &HashSet<String>) -> Result<U
 }
 
 fn scan_method(
-    dex: &dex::Dex<impl AsRef<[u8]>>,
+    dex: &DexBin,
     instructions: &[dex_bytecode::Instruction],
     caller: &MethodRef,
     this_reg: Option<u32>,
@@ -229,7 +210,8 @@ fn scan_method(
         }
 
         // 3) listener détenu en CHAMP : `iget-object vListener, vThis, field@N`.
-        if let Some((class, provenance)) = backtrack_field(dex, &instructions[..i], target, assignments)
+        if let Some((class, provenance)) =
+            backtrack_field(dex, &instructions[..i], target, assignments)
         {
             report.handlers.push(UiHandler {
                 class,
@@ -245,16 +227,9 @@ fn scan_method(
 }
 
 /// Si l'invoke cible un setter de listener, renvoie (setter, handler attendu).
-fn ui_sink(
-    dex: &dex::Dex<impl AsRef<[u8]>>,
-    ins: &dex_bytecode::Instruction,
-) -> Option<(String, &'static str)> {
-    use dex::method::MethodId;
-    use dex::string::StringId;
-
+fn ui_sink(dex: &DexBin, ins: &dex_bytecode::Instruction) -> Option<(String, &'static str)> {
     let idx = operand_index(ins, "method@")?;
-    let item = dex.get_method_item(idx as MethodId).ok()?;
-    let name = dex.get_string(item.name_idx() as StringId).ok()?.to_string();
+    let name = dex.method_item(idx as u32)?.name.to_string();
 
     for &(setter, handler) in UI_SINKS {
         if setter == name.as_str() {
@@ -274,14 +249,11 @@ fn ui_sink(
 /// une interface, qui ne désigne aucun corps de méthode et ne reconnecterait
 /// rien dans le graphe.
 fn backtrack_field(
-    dex: &dex::Dex<impl AsRef<[u8]>>,
+    dex: &DexBin,
     window: &[dex_bytecode::Instruction],
     target: u32,
     assignments: &FieldAssignments,
 ) -> Option<(String, Provenance)> {
-    use dex::field::FieldId;
-    use dex::jtype::TypeId;
-
     let mut target = target;
     for ins in window.iter().rev() {
         // Traverser tout ce qui n'écrit pas le registre suivi.
@@ -300,8 +272,7 @@ fn backtrack_field(
             if let Some(Some(concrete)) = assignments.get(&idx) {
                 return Some((concrete.clone(), Provenance::FieldAssign));
             }
-            let item = dex.get_field_item(idx as FieldId).ok()?;
-            let declared = dex.get_type(*item.type_idx() as TypeId).ok()?.type_descriptor().to_string();
+            let declared = dex.field_item(idx as u32)?.typ.to_string();
             if declared.starts_with("Landroid/") || declared.starts_with("Ljava") {
                 return None;
             }
@@ -315,11 +286,10 @@ fn backtrack_field(
 
 /// Signature qu'Android exige d'un handler `android:onClick` : `void foo(View)`.
 /// Sans ce filtre, toute homonyme du DEX serait promue racine.
-fn takes_view_returns_void(method: &dex::method::Method) -> bool {
-    let params = method.params();
-    params.len() == 1
-        && params[0].type_descriptor() == "Landroid/view/View;"
-        && method.return_type().type_descriptor() == "V"
+fn takes_view_returns_void(method: &DexMethod<'_>) -> bool {
+    method.params.len() == 1
+        && method.params[0] == "Landroid/view/View;"
+        && method.return_type == "V"
 }
 
 /// Noms de méthodes cités par `android:onClick` dans les XML de ressources
@@ -339,7 +309,10 @@ fn xml_on_click_names(apk: &Path) -> HashSet<String> {
             Err(e) => tracing::debug!(error = %e, "XML de ressource illisible, ignoré"),
         }
     }
-    tracing::info!(handlers = names.len(), "android:onClick relevés dans les ressources");
+    tracing::info!(
+        handlers = names.len(),
+        "android:onClick relevés dans les ressources"
+    );
     names
 }
 
@@ -458,7 +431,10 @@ pub fn extract_any(path: &Path) -> Result<UiHandlerReport> {
     match sniff(path) {
         Some(InputKind::Apk) => extract_from_apk(path),
         Some(InputKind::Dex) => extract(path),
-        None => anyhow::bail!("{} n'est ni un APK ni un DEX (reconnu au contenu)", path.display()),
+        None => anyhow::bail!(
+            "{} n'est ni un APK ni un DEX (reconnu au contenu)",
+            path.display()
+        ),
     }
 }
 
@@ -494,6 +470,9 @@ mod tests {
                 provenance: Provenance::NewInstance,
             });
         }
-        assert_eq!(r.roots(), vec![("Lcom/x/Foo$1;".to_string(), "onClick".to_string())]);
+        assert_eq!(
+            r.roots(),
+            vec![("Lcom/x/Foo$1;".to_string(), "onClick".to_string())]
+        );
     }
 }

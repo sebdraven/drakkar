@@ -20,6 +20,16 @@
 //! fuzzy hash ssdeep sur le flux d'opcodes, avec une implémentation Python de
 //! référence sur PyPI — utilisable comme contrôle croisé de ce module.
 //!
+//! ⚠️ LIMITE STRUCTURELLE de l'empreinte d'opcodes : elle ne voit que des
+//! INSTRUCTIONS. Un `static final String` initialisé par une constante de
+//! compilation n'est écrit par aucun opcode — sa valeur vit dans
+//! `encoded_static_values`, pointé par `class_def.static_values_off`. Aucune
+//! empreinte ne peut donc la voir, et changer d'endpoint C2 par ce biais ne
+//! bouge pas d'un iota les Jaccard. D'où les deux compteurs
+//! `static_fields_*` : une table LATÉRALE, hors empreintes, qui dit s'il faut
+//! aller regarder. Le détail se lit avec `--diff-explain`, catégorie
+//! `valeur-statique`.
+//!
 //! Deux niveaux de mesure sont produits :
 //!   - GLOBAL : indice de Jaccard sur l'ensemble des empreintes de méthodes
 //!     (ordre-insensible) = « part de méthodes identiques » ; plus un Jaccard sur
@@ -39,6 +49,7 @@
 //! qui n'est PAS une citation : c'était un raccourci vers le laboratoire Argus,
 //! rattachement non confirmé.)
 
+use crate::parser::dex_facade::DexValue;
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
@@ -153,6 +164,20 @@ pub struct DiffReport {
     /// permutation. Un chiffre élevé ici sans renommage attendu doit alerter.
     pub identical_by_hash: usize,
     pub near_classes: usize,
+
+    // ── Valeurs de champs statiques ──
+    //
+    // Table LATÉRALE : elle n'entre dans aucune empreinte, aucun Jaccard,
+    // aucun appariement. Les mesures ci-dessus sont calculées exactement comme
+    // avant l'introduction de ces deux compteurs.
+    /// Champs statiques appariés : même classe (par nom normalisé), même nom de
+    /// champ. Couvre AUSSI les classes sans méthode à code, que l'appariement
+    /// par empreinte écarte — ce sont précisément les classes de constantes.
+    pub static_fields_compared: usize,
+    /// Parmi eux, ceux dont la valeur initiale diffère. Un endpoint C2 posé en
+    /// constante de compilation se lit ICI : il n'est écrit par aucune
+    /// instruction, donc aucune empreinte d'opcodes ne peut le voir.
+    pub static_fields_diverging: usize,
     pub only_in_a: Vec<String>,
     pub only_in_b: Vec<String>,
     /// Détail des classes identiques (peut être long ; utile pour voir
@@ -164,20 +189,34 @@ pub struct DiffReport {
 
 /// Point d'entrée : diff de deux entrées (DEX brut ou APK).
 pub fn run(input_a: &Path, input_b: &Path, opts: &DiffOptions) -> Result<DiffReport> {
-    let (a, _tmp_a) = load_class_prints(input_a, opts)?;
-    let (b, _tmp_b) = load_class_prints(input_b, opts)?;
+    let (a, statics_a, _tmp_a) = load_class_prints(input_a, opts)?;
+    let (b, statics_b, _tmp_b) = load_class_prints(input_b, opts)?;
+
+    let (static_fields_compared, static_fields_diverging) = compare_statics(&statics_a, &statics_b);
 
     let methods_a: usize = a.iter().map(|c| c.method_seq.len()).sum();
     let methods_b: usize = b.iter().map(|c| c.method_seq.len()).sum();
 
     // ── Global : ensembles d'empreintes de méthodes ──
-    let set_a: HashSet<u64> = a.iter().flat_map(|c| c.method_set.iter().copied()).collect();
-    let set_b: HashSet<u64> = b.iter().flat_map(|c| c.method_set.iter().copied()).collect();
+    let set_a: HashSet<u64> = a
+        .iter()
+        .flat_map(|c| c.method_set.iter().copied())
+        .collect();
+    let set_b: HashSet<u64> = b
+        .iter()
+        .flat_map(|c| c.method_set.iter().copied())
+        .collect();
     let jaccard_methods = jaccard(&set_a, &set_b);
 
     // ── Global : n-grammes de mots-méthodes (ordre de lecture) ──
-    let seq_a: Vec<u64> = a.iter().flat_map(|c| c.method_seq.iter().copied()).collect();
-    let seq_b: Vec<u64> = b.iter().flat_map(|c| c.method_seq.iter().copied()).collect();
+    let seq_a: Vec<u64> = a
+        .iter()
+        .flat_map(|c| c.method_seq.iter().copied())
+        .collect();
+    let seq_b: Vec<u64> = b
+        .iter()
+        .flat_map(|c| c.method_seq.iter().copied())
+        .collect();
     let ngram = opts.ngram.max(1);
     let ng_a = ngrams(&seq_a, ngram);
     let ng_b = ngrams(&seq_b, ngram);
@@ -258,7 +297,7 @@ pub fn run(input_a: &Path, input_b: &Path, opts: &DiffOptions) -> Result<DiffRep
                 continue;
             }
             let j = jaccard(&ca.method_set, &cb.method_set);
-            if best.map_or(true, |(_, bj)| j > bj) {
+            if best.is_none_or(|(_, bj)| j > bj) {
                 best = Some((i, j));
             }
         }
@@ -291,7 +330,11 @@ pub fn run(input_a: &Path, input_b: &Path, opts: &DiffOptions) -> Result<DiffRep
         .map(|(_, c)| c.name.clone())
         .collect();
 
-    near.sort_by(|x, y| y.jaccard.partial_cmp(&x.jaccard).unwrap_or(std::cmp::Ordering::Equal));
+    near.sort_by(|x, y| {
+        y.jaccard
+            .partial_cmp(&x.jaccard)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     Ok(DiffReport {
         input_a: input_a.display().to_string(),
@@ -308,11 +351,46 @@ pub fn run(input_a: &Path, input_b: &Path, opts: &DiffOptions) -> Result<DiffRep
         identical_by_name,
         identical_by_hash,
         near_classes: near.len(),
+        static_fields_compared,
+        static_fields_diverging,
         only_in_a,
         only_in_b,
         identical,
         near,
     })
+}
+
+/// Valeurs statiques par classe, indexées par nom de classe NORMALISÉ.
+///
+/// Table latérale, hors de `ClassPrint` : elle ne participe à aucun
+/// appariement et n'entre dans aucune empreinte. C'est ce qui permet de
+/// couvrir les classes sans méthode à code — que `ClassPrint` écarte — sans
+/// déplacer `identical_*`, `near`, `only_in_*` ni les Jaccard.
+type StaticsByClass = HashMap<String, Vec<(String, Option<DexValue>)>>;
+
+/// Compare les valeurs statiques classe par classe, par nom de classe puis nom
+/// de champ. Rend `(champs comparés, champs divergents)`.
+///
+/// Un champ sans homonyme en face n'est PAS compté comme divergent : entre deux
+/// lots obfusqués séparément, le remapping de noms en produirait en masse.
+fn compare_statics(a: &StaticsByClass, b: &StaticsByClass) -> (usize, usize) {
+    let mut compared = 0usize;
+    let mut diverging = 0usize;
+    for (key, fields_a) in a {
+        let Some(fields_b) = b.get(key) else { continue };
+        let index: HashMap<&str, &Option<DexValue>> =
+            fields_b.iter().map(|(n, v)| (n.as_str(), v)).collect();
+        for (name, va) in fields_a {
+            let Some(vb) = index.get(name.as_str()).copied() else {
+                continue;
+            };
+            compared += 1;
+            if va != vb {
+                diverging += 1;
+            }
+        }
+    }
+    (compared, diverging)
 }
 
 /// Indice de Jaccard sur deux ensembles : |A∩B| / |A∪B|. Vaut 1.0 si les deux
@@ -359,11 +437,12 @@ fn hash_window(w: &[u64]) -> u64 {
 fn load_class_prints(
     input: &Path,
     opts: &DiffOptions,
-) -> Result<(Vec<ClassPrint>, Option<tempfile::TempDir>)> {
+) -> Result<(Vec<ClassPrint>, StaticsByClass, Option<tempfile::TempDir>)> {
     let (dex_paths, tmp) = collect_dex_paths(input)?;
     let mut prints = Vec::new();
+    let mut statics = StaticsByClass::new();
     for dp in &dex_paths {
-        collect_from_dex(dp, opts, &mut prints)
+        collect_from_dex(dp, opts, &mut prints, &mut statics)
             .with_context(|| format!("parse {}", dp.display()))?;
     }
     if prints.is_empty() {
@@ -373,31 +452,54 @@ fn load_class_prints(
             input.display()
         );
     }
-    Ok((prints, tmp))
+    Ok((prints, statics, tmp))
 }
 
 /// Une classe est-elle applicative (à comparer) selon les options ?
 fn is_application_class(descriptor: &str, opts: &DiffOptions) -> bool {
     if !opts.include_prefixes.is_empty() {
         // Mode inclusion : uniquement les préfixes fournis.
-        return opts.include_prefixes.iter().any(|p| descriptor.starts_with(p));
+        return opts
+            .include_prefixes
+            .iter()
+            .any(|p| descriptor.starts_with(p));
     }
     // Mode exclusion best-effort : on retire les bibliothèques les plus courantes
     // du corpus. À défaut d'heuristique fiable sur les libs ProGuardées (noms
     // courts a/b/c), préférer --diff-include pour un diff propre.
     const LIB_PREFIXES: &[&str] = &[
-        "Landroid/", "Landroidx/", "Ljava/", "Ljavax/", "Lkotlin/", "Lkotlinx/",
-        "Ldalvik/", "Lrx/", "Lio/reactivex/", "Lokhttp3/", "Lokio/", "Lretrofit2/",
-        "Lcom/google/", "Lcom/alibaba/", "Lcom/umeng/", "Lorg/apache/", "Lorg/json/",
-        "Lorg/xmlpull/", "Luk/co/chrisjenx/", "Lgov/nist/",
+        "Landroid/",
+        "Landroidx/",
+        "Ljava/",
+        "Ljavax/",
+        "Lkotlin/",
+        "Lkotlinx/",
+        "Ldalvik/",
+        "Lrx/",
+        "Lio/reactivex/",
+        "Lokhttp3/",
+        "Lokio/",
+        "Lretrofit2/",
+        "Lcom/google/",
+        "Lcom/alibaba/",
+        "Lcom/umeng/",
+        "Lorg/apache/",
+        "Lorg/json/",
+        "Lorg/xmlpull/",
+        "Luk/co/chrisjenx/",
+        "Lgov/nist/",
     ];
     !LIB_PREFIXES.iter().any(|p| descriptor.starts_with(p))
 }
 
 /// Parse un DEX et accumule les ClassPrint des classes applicatives.
-fn collect_from_dex(path: &Path, opts: &DiffOptions, out: &mut Vec<ClassPrint>) -> Result<()> {
-    let dex = dex::DexReader::from_file(path)
-        .with_context(|| format!("open dex {}", path.display()))?;
+fn collect_from_dex(
+    path: &Path,
+    opts: &DiffOptions,
+    out: &mut Vec<ClassPrint>,
+    statics: &mut StaticsByClass,
+) -> Result<()> {
+    let dex = crate::parser::dex_facade::DexBin::open(path)?;
 
     for class in dex.classes() {
         let class = match class {
@@ -407,20 +509,45 @@ fn collect_from_dex(path: &Path, opts: &DiffOptions, out: &mut Vec<ClassPrint>) 
                 continue;
             }
         };
-        let name = class.jtype().type_descriptor().to_string();
+        let name = class.descriptor.to_string();
         if !is_application_class(&name, opts) {
             continue;
         }
 
+        let key = crate::parser::disasm::normalize(&name, &opts.normalize);
+
+        // Table latérale des valeurs statiques. Remplie AVANT le rejet des
+        // classes sans code : une classe de constantes pures n'a pas de
+        // `<clinit>`, donc aucune méthode à empreindre, et c'est justement
+        // celle-là qui porte les endpoints.
+        match dex.static_fields(&class) {
+            Ok(fields) if !fields.is_empty() => {
+                statics.insert(
+                    key.clone(),
+                    fields
+                        .into_iter()
+                        .map(|f| {
+                            let v = f.value.map(|x| x.normalized(&opts.normalize));
+                            (
+                                crate::parser::disasm::normalize(&f.name, &opts.normalize),
+                                v,
+                            )
+                        })
+                        .collect(),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(class = %name, error = %e, "valeurs statiques illisibles"),
+        }
+
         let mut method_seq = Vec::new();
-        for method in class.methods() {
+        for method in &class.methods {
             // Pas de code pour abstract / native : rien à empreindre.
-            let code = match method.code() {
+            let code = match &method.code {
                 Some(c) => c,
                 None => continue,
             };
-            let bytes = u16_to_le_bytes(code.insns());
-            let instructions = match dex_bytecode::decode_all(&bytes, 0) {
+            let instructions = match dex_bytecode::decode_all(code.insns, 0) {
                 Ok(i) => i,
                 Err(e) => {
                     tracing::warn!(class = %name, error = %e, "decode failed");
@@ -449,8 +576,13 @@ fn collect_from_dex(path: &Path, opts: &DiffOptions, out: &mut Vec<ClassPrint>) 
             sorted.hash(&mut h);
             h.finish()
         };
-        let key = crate::parser::disasm::normalize(&name, &opts.normalize);
-        out.push(ClassPrint { name, key, method_seq, method_set, class_hash });
+        out.push(ClassPrint {
+            name,
+            key,
+            method_seq,
+            method_set,
+            class_hash,
+        });
     }
     Ok(())
 }
@@ -461,8 +593,8 @@ fn collect_from_dex(path: &Path, opts: &DiffOptions, out: &mut Vec<ClassPrint>) 
 fn collect_dex_paths(input: &Path) -> Result<(Vec<PathBuf>, Option<tempfile::TempDir>)> {
     let mut magic = [0u8; 8];
     {
-        let mut f = std::fs::File::open(input)
-            .with_context(|| format!("open {}", input.display()))?;
+        let mut f =
+            std::fs::File::open(input).with_context(|| format!("open {}", input.display()))?;
         let n = f.read(&mut magic)?;
         if n < 4 {
             bail!("{} trop court pour être un DEX ou un APK", input.display());
@@ -507,15 +639,6 @@ fn extract_dexes(apk: &Path, out_dir: &Path) -> Result<Vec<PathBuf>> {
         out.push(dest);
     }
     Ok(out)
-}
-
-/// Code units (u16) → octets little-endian (format attendu par dex-bytecode).
-fn u16_to_le_bytes(insns: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(insns.len() * 2);
-    for &u in insns {
-        out.extend_from_slice(&u.to_le_bytes());
-    }
-    out
 }
 
 /// Légende des mesures (mode `--diff-dex --legend`).
@@ -564,6 +687,22 @@ Appariement par classe :
   proches      Jaccard des méthodes ≥ --diff-threshold (défaut 0.85).
   only_in_a /  Classes sans contrepartie de l'autre côté — c'est là que se
   only_in_b    lisent les vraies divergences de code entre les deux lots.
+
+Valeurs de champs statiques :
+  Un `static final String` initialisé par une constante de compilation n'est
+  écrit par AUCUNE instruction : sa valeur vit dans encoded_static_values. Les
+  empreintes d'opcodes lui sont donc structurellement aveugles — c'est là que
+  se cachent les endpoints C2.
+  comparées    Champs statiques appariés (classe par nom normalisé, puis nom de
+               champ). Couvre AUSSI les classes sans méthode à code, que
+               l'appariement par empreinte écarte : une classe de constantes
+               pures n'a pas de <clinit>, donc aucune méthode à empreindre.
+  divergentes  Ceux dont la valeur initiale diffère. Ces deux compteurs sont une
+               table LATÉRALE : ils n'entrent dans aucune empreinte, aucun
+               Jaccard, aucun appariement, et ne déplacent donc aucune des
+               mesures ci-dessus. Un chiffre non nul renvoie à --diff-explain
+               (catégorie `valeur-statique`) pour le détail, et à
+               --diff-strings pour la contre-épreuve.
 
 Note : l'appariement est nom-agnostique (par opcodes), donc --diff-include ne
 sert qu'au FILTRE et à l'affichage, pas à la mise en correspondance.\

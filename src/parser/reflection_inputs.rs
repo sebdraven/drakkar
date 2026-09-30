@@ -43,9 +43,10 @@
 //!     constantes, scan). Assumé pour une mesure jetable.
 
 use crate::model::MethodRef;
+use crate::parser::dex_facade::DexBin;
 use crate::parser::dyn_entrypoints::{
-    dest_register, index_field_assignments, operand_index, registers, u16_to_le_bytes,
-    writes_register, FieldAssignments,
+    dest_register, index_field_assignments, operand_index, registers, writes_register,
+    FieldAssignments,
 };
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -212,7 +213,7 @@ impl Fields<'_> {
 /// Même forme que `index_field_assignments` (dont on ne peut pas se servir ici :
 /// il remonte à `new-instance`/`const-class`, pas aux chaînes). Un champ vu une
 /// fois assigné depuis autre chose qu'un littéral est invalidé définitivement.
-fn index_const_fields(dex: &dex::Dex<impl AsRef<[u8]>>) -> ConstFields {
+fn index_const_fields(dex: &DexBin) -> ConstFields {
     let mut map: ConstFields = HashMap::new();
 
     for class in dex.classes() {
@@ -220,13 +221,12 @@ fn index_const_fields(dex: &dex::Dex<impl AsRef<[u8]>>) -> ConstFields {
             Ok(c) => c,
             Err(_) => continue,
         };
-        for method in class.methods() {
-            let code = match method.code() {
+        for method in &class.methods {
+            let code = match &method.code {
                 Some(c) => c,
                 None => continue,
             };
-            let bytes = u16_to_le_bytes(code.insns());
-            let instructions = match dex_bytecode::decode_all(&bytes, 0) {
+            let instructions = match dex_bytecode::decode_all(code.insns, 0) {
                 Ok(i) => i,
                 Err(_) => continue,
             };
@@ -262,12 +262,14 @@ fn index_const_fields(dex: &dex::Dex<impl AsRef<[u8]>>) -> ConstFields {
 
 /// Scanne un DEX et classe chaque site de réflexion.
 pub fn extract(path: &Path) -> Result<ReflectionInputReport> {
-    let dex = dex::DexReader::from_file(path)
-        .with_context(|| format!("open dex {}", path.display()))?;
+    let dex = DexBin::open(path)?;
 
     let assign = index_field_assignments(&dex);
     let consts = index_const_fields(&dex);
-    let fields = Fields { assign: &assign, consts: &consts };
+    let fields = Fields {
+        assign: &assign,
+        consts: &consts,
+    };
 
     let mut report = ReflectionInputReport::default();
 
@@ -279,21 +281,20 @@ pub fn extract(path: &Path) -> Result<ReflectionInputReport> {
                 continue;
             }
         };
-        let class_name = class.jtype().type_descriptor().to_string();
+        let class_name = class.descriptor.to_string();
 
-        for method in class.methods() {
-            let code = match method.code() {
+        for method in &class.methods {
+            let code = match &method.code {
                 Some(c) => c,
                 None => continue,
             };
             let caller = MethodRef {
                 class: class_name.clone(),
-                name: method.name().to_string(),
+                name: method.name.to_string(),
                 descriptor: String::new(),
             };
 
-            let bytes = u16_to_le_bytes(code.insns());
-            let instructions = match dex_bytecode::decode_all(&bytes, 0) {
+            let instructions = match dex_bytecode::decode_all(code.insns, 0) {
                 Ok(i) => i,
                 Err(e) => {
                     tracing::debug!(method = %caller.api(), error = %e, "decode failed");
@@ -310,7 +311,7 @@ pub fn extract(path: &Path) -> Result<ReflectionInputReport> {
 }
 
 fn scan_method(
-    dex: &dex::Dex<impl AsRef<[u8]>>,
+    dex: &DexBin,
     instructions: &[dex_bytecode::Instruction],
     caller: &MethodRef,
     fields: &Fields,
@@ -352,7 +353,7 @@ fn scan_method(
 /// au `getMethod`/`getDeclaredMethod` qui l'a produit ; cran 2, classer SON
 /// registre-nom. Tout ce qui n'aboutit pas au cran 1 est `indirect`.
 fn classify_invoke(
-    dex: &dex::Dex<impl AsRef<[u8]>>,
+    dex: &DexBin,
     window: &[dex_bytecode::Instruction],
     invoke: &dex_bytecode::Instruction,
     fields: &Fields,
@@ -514,23 +515,14 @@ fn arg_registers(ins: &dex_bytecode::Instruction) -> Vec<u32> {
 /// L'invoke cible-t-il un des quatre sinks de réflexion ? Matching sur le
 /// couple (propriétaire, nom) : `invoke` et `forName` sont trop communs pour
 /// être reconnus au nom seul.
-fn reflection_sink(
-    dex: &dex::Dex<impl AsRef<[u8]>>,
-    ins: &dex_bytecode::Instruction,
-) -> Option<Sink> {
-    use dex::jtype::TypeId;
-    use dex::method::MethodId;
-    use dex::string::StringId;
-
+fn reflection_sink(dex: &DexBin, ins: &dex_bytecode::Instruction) -> Option<Sink> {
     if !ins.mnemonic().starts_with("invoke-") {
         return None;
     }
     let idx = operand_index(ins, "method@")?;
-    let item = dex.get_method_item(idx as MethodId).ok()?;
-    let name = dex.get_string(item.name_idx() as StringId).ok()?.to_string();
-    let owner = dex.get_type(item.class_idx() as TypeId).ok()?.type_descriptor().to_string();
+    let item = dex.method_item(idx as u32)?;
 
-    match (owner.as_str(), name.as_str()) {
+    match (item.class, item.name) {
         ("Ljava/lang/reflect/Method;", "invoke") => Some(Sink::Invoke),
         ("Ljava/lang/Class;", "forName") => Some(Sink::ForName),
         ("Ljava/lang/Class;", "getMethod") => Some(Sink::GetMethod),

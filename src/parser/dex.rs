@@ -1,10 +1,11 @@
-//! DEX parsing : crate `dex` (structure) + `dex-bytecode` (décodage invoke-*).
+//! DEX parsing : `dex_facade` (structure) + `dex-bytecode` (décodage invoke-*).
 //!
 //! Pipeline :
-//!   dex::DexReader -> classes -> methods -> CodeItem.insns (&[u16])
-//!     -> u16->bytes -> dex_bytecode::decode_all -> instructions
+//!   DexBin -> classes -> methods -> Code.insns (&[u8])
+//!     -> dex_bytecode::decode_all -> instructions
 //!       -> filtrer invoke-* -> résoudre method@idx -> CallEdge (inter-proc)
 use crate::model::{ApkFeatures, MethodRef};
+use crate::parser::dex_facade::{DexBin, DexMethod};
 use anyhow::{Context, Result};
 use std::path::Path;
 
@@ -18,14 +19,11 @@ pub struct CallEdge {
 /// Parse le DEX et construit la liste des call edges inter-procéduraux.
 /// Peuple aussi `features.methods` et `features.strings`.
 pub fn extract(path: &Path, features: &mut ApkFeatures) -> Result<Vec<CallEdge>> {
-    let dex = dex::DexReader::from_file(path)
-        .with_context(|| format!("open dex {}", path.display()))?;
+    let dex = DexBin::open(path)?;
 
     // Strings globales du DEX -> features (utile pour les règles `string:`).
     for s in dex.strings() {
-        if let Ok(s) = s {
-            features.strings.push(s.to_string());
-        }
+        features.strings.push(s.to_string());
     }
 
     let mut edges = Vec::new();
@@ -38,35 +36,27 @@ pub fn extract(path: &Path, features: &mut ApkFeatures) -> Result<Vec<CallEdge>>
                 continue;
             }
         };
-        let class_name = class.jtype().type_descriptor().to_string();
+        let class_name = class.descriptor.to_string();
 
-        // Hiérarchie : `super_class()` rend un ClassId, qui indexe les TypeId
-        // (mêmes alias d'entier) — d'où le `get_type` direct. Absent pour
-        // `Ljava/lang/Object;` seulement.
-        if let Some(sup) = class.super_class() {
-            if let Ok(t) = dex.get_type(sup) {
-                features
-                    .superclasses
-                    .insert(class_name.clone(), t.type_descriptor().to_string());
-            }
+        // Hiérarchie : absente pour `Ljava/lang/Object;` seulement.
+        if let Some(sup) = class.superclass {
+            features
+                .superclasses
+                .insert(class_name.clone(), sup.to_string());
         }
 
-        for method in class.methods() {
+        for method in &class.methods {
             let caller = MethodRef {
                 class: class_name.clone(),
-                name: method.name().to_string(),
-                descriptor: descriptor_of(&method),
+                name: method.name.to_string(),
+                descriptor: descriptor_of(method),
             };
             features.methods.push(caller.clone());
 
             // Pas de code pour abstract / native.
-            let code = match method.code() {
-                Some(c) => c,
-                None => continue,
-            };
+            let Some(code) = &method.code else { continue };
 
-            let bytes = u16_to_le_bytes(code.insns());
-            let instructions = match dex_bytecode::decode_all(&bytes, 0) {
+            let instructions = match dex_bytecode::decode_all(code.insns, 0) {
                 Ok(i) => i,
                 Err(e) => {
                     tracing::warn!(method = %caller.signature(), error = %e, "decode failed");
@@ -78,8 +68,6 @@ pub fn extract(path: &Path, features: &mut ApkFeatures) -> Result<Vec<CallEdge>>
                 if !is_invoke(ins) {
                     continue;
                 }
-                // TODO(api): adapter `invoke_method_index` au champ réel de
-                // dex_bytecode::Instruction exposant l'index method@.
                 if let Some(midx) = invoke_method_index(ins) {
                     match resolve_method(&dex, midx) {
                         Ok(callee) => edges.push(CallEdge {
@@ -104,24 +92,15 @@ pub fn extract(path: &Path, features: &mut ApkFeatures) -> Result<Vec<CallEdge>>
     Ok(edges)
 }
 
-/// Code units (u16) -> buffer d'octets little-endian (format attendu par dex-bytecode).
-fn u16_to_le_bytes(insns: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(insns.len() * 2);
-    for &u in insns {
-        out.extend_from_slice(&u.to_le_bytes());
-    }
-    out
-}
-
-/// Descripteur Dalvik complet du caller : (params)return.
-/// Ex. (Landroid/content/Context;I)V — reconstruit depuis params() + return_type().
-fn descriptor_of(method: &dex::method::Method) -> String {
+/// Descripteur Dalvik complet du caller : (params)return, paramètres EXACTS.
+/// Ex. (Landroid/content/Context;I)V
+fn descriptor_of(method: &DexMethod<'_>) -> String {
     let mut d = String::from("(");
-    for p in method.params() {
-        d.push_str(p.type_descriptor());
+    for p in method.params {
+        d.push_str(p);
     }
     d.push(')');
-    d.push_str(method.return_type().type_descriptor());
+    d.push_str(method.return_type);
     d
 }
 
@@ -131,14 +110,13 @@ fn is_invoke(ins: &dex_bytecode::Instruction) -> bool {
 }
 
 /// Offset de l'instruction dans la méthode (en octets/units selon dex-bytecode).
-/// TODO(api): confirmer le nom du champ (`offset`) sur dex_bytecode::Instruction.
 fn instruction_offset(ins: &dex_bytecode::Instruction) -> u64 {
     ins.offset as u64
 }
 
 /// Extrait l'index `method@idx` d'une instruction invoke-*.
-/// TODO(api): dex-bytecode formate les opérandes en texte (ex. "method@5").
-/// On parse l'opérande ; à remplacer par l'accès structuré si l'API l'expose.
+/// dex-bytecode formate les opérandes en texte (ex. "method@5") et n'expose
+/// pas d'accès structuré, y compris à l'amont.
 fn invoke_method_index(ins: &dex_bytecode::Instruction) -> Option<u64> {
     let ops = ins.operands();
     let tag = "method@";
@@ -151,45 +129,16 @@ fn invoke_method_index(ins: &dex_bytecode::Instruction) -> Option<u64> {
 }
 
 /// Résout un index dans la table method_ids vers un MethodRef (class + name + proto).
-/// Les getters du crate `dex` attendent des type-alias précis (MethodId/TypeId/
-/// StringId/ProtoId), tous des alias d'entiers : on caste explicitement.
-fn resolve_method(dex: &dex::Dex<impl AsRef<[u8]>>, idx: u64) -> Result<MethodRef> {
-    use dex::jtype::TypeId;
-    use dex::method::{MethodId, ProtoId};
-    use dex::string::StringId;
-
-    let item = dex
-        .get_method_item(idx as MethodId)
+/// Le descripteur du callee porte ses paramètres en shorty : c'est la forme
+/// historique, reproduite par la façade (cf. `dex_facade::shorty_params`).
+fn resolve_method(dex: &DexBin, idx: u64) -> Result<MethodRef> {
+    let item = u32::try_from(idx)
+        .ok()
+        .and_then(|i| dex.method_item(i))
         .with_context(|| format!("method_ids[{idx}] out of range"))?;
-    let class = dex
-        .get_type(item.class_idx() as TypeId)?
-        .type_descriptor()
-        .to_string();
-    let name = dex
-        .get_string(item.name_idx() as StringId)?
-        .to_string();
-    let descriptor = resolve_proto_descriptor(dex, item.proto_idx() as ProtoId);
-    Ok(MethodRef { class, name, descriptor })
-}
-
-/// Reconstruit un descripteur lisible pour le callee depuis son ProtoIdItem.
-/// return_type est résolu exactement (TypeId -> descripteur) ; les params sont
-/// approximés via le shorty (formes courtes : L pour tout objet, types primitifs
-/// exacts). Suffisant pour le matching MITRE par class->name.
-fn resolve_proto_descriptor(dex: &dex::Dex<impl AsRef<[u8]>>, proto: dex::method::ProtoId) -> String {
-    let proto = match dex.get_proto_item(proto) {
-        Ok(p) => p,
-        Err(_) => return String::new(),
-    };
-    // shorty : 1er char = return, le reste = params (formes courtes).
-    let shorty = dex
-        .get_string(proto.shorty())
-        .map(|s| s.to_string())
-        .unwrap_or_default();
-    let params: String = shorty.chars().skip(1).collect();
-    let ret = dex
-        .get_type(proto.return_type())
-        .map(|t| t.type_descriptor().to_string())
-        .unwrap_or_else(|_| "V".into());
-    format!("({params}){ret}")
+    Ok(MethodRef {
+        class: item.class.to_string(),
+        name: item.name.to_string(),
+        descriptor: item.descriptor.to_string(),
+    })
 }

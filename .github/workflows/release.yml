@@ -1,0 +1,168 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Lecture par defaut. Seul le job `release` obtient `contents: write`.
+permissions:
+  contents: read
+
+# Pas de cancel-in-progress ici : une release a moitie publiee coute plus cher
+# qu'un run redondant.
+
+env:
+  RUST_VERSION: "1.98.1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  guard:
+    name: tag == version Cargo.toml
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          tag_version="${tag#v}"
+          # awk plutot que `cargo metadata` : pas de toolchain ni de fetch des
+          # dependances git pour lire un champ du manifeste.
+          manifest_version="$(awk '
+            /^\[package\]/ { pkg = 1; next }
+            /^\[/          { pkg = 0 }
+            pkg && /^version[[:space:]]*=/ {
+              gsub(/^version[[:space:]]*=[[:space:]]*"|"[[:space:]]*$/, "")
+              print; exit
+            }' Cargo.toml)"
+          echo "tag            ${tag}"
+          echo "tag_version    ${tag_version}"
+          echo "Cargo.toml     ${manifest_version}"
+          if [ -z "${manifest_version}" ]; then
+            echo "::error::aucun champ version dans le bloc [package] de Cargo.toml"
+            exit 1
+          fi
+          if [ "${tag_version}" != "${manifest_version}" ]; then
+            echo "::error::desaccord de version : tag ${tag} porte ${tag_version}, Cargo.toml porte ${manifest_version}. Aligne Cargo.toml puis retague ; aucune archive et aucune release ne sont produites."
+            exit 1
+          fi
+          echo "version=${manifest_version}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: guard
+    strategy:
+      # Une release partielle n'a pas d'interet : si une cible tombe, on arrete.
+      fail-fast: true
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-setup
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          cache-key: release-${{ matrix.target }}
+
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: contenu de l'archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          stem="drakkar-v${{ needs.guard.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/${stem}"
+          cp "target/${{ matrix.target }}/release/drakkar" "dist/${stem}/"
+          for f in LICENSE.md LICENSE README.md README; do
+            if [ -f "$f" ]; then cp "$f" "dist/${stem}/"; fi
+          done
+
+      - uses: ./.github/actions/build-info
+        with:
+          dest: dist/drakkar-v${{ needs.guard.outputs.version }}-${{ matrix.target }}/BUILD-INFO.txt
+          target: ${{ matrix.target }}
+          version: ${{ needs.guard.outputs.version }}
+
+      - name: archive et somme
+        shell: bash
+        run: |
+          set -euo pipefail
+          stem="drakkar-v${{ needs.guard.outputs.version }}-${{ matrix.target }}"
+
+          tar -C dist -czf "dist/${stem}.tar.gz" "${stem}"
+          rm -rf "dist/${stem}"
+
+          # SHA-256 en entier, jamais tronque. Format compatible
+          # `sha256sum -c` et `shasum -a 256 -c`.
+          (
+            cd dist
+            case "${RUNNER_OS}" in
+              macOS) shasum -a 256 "${stem}.tar.gz" | tee "${stem}.tar.gz.sha256" ;;
+              *)     sha256sum    "${stem}.tar.gz" | tee "${stem}.tar.gz.sha256" ;;
+            esac
+          )
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error
+
+  release:
+    name: github release
+    needs: [guard, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Pas de checkout : `gh release create --repo` n'en a pas besoin.
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+
+      - name: SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            cat ./*.tar.gz.sha256 | sort -k2 > SHA256SUMS
+            rm -f ./*.tar.gz.sha256
+            cat SHA256SUMS
+          )
+
+      - name: publier
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "drakkar ${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --notes "Binaires construits par la CI, feature \`lief-backend\` non activee.
+
+          Cibles : \`aarch64-apple-darwin\`, \`x86_64-unknown-linux-gnu\`.
+
+          \`SHA256SUMS\` porte les sommes SHA-256 completes des archives. Verification :
+
+          \`\`\`sh
+          sha256sum -c SHA256SUMS        # Linux
+          shasum -a 256 -c SHA256SUMS    # macOS
+          \`\`\`
+
+          Chaque archive contient un \`BUILD-INFO.txt\` avec le commit complet, la version de rustc et le rev complet de chaque dependance git (\`dex-parser\`, \`dex-bytecode\`)." \
+            dist/SHA256SUMS \
+            dist/*.tar.gz

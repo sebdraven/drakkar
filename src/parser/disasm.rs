@@ -33,6 +33,7 @@
 //! de rustc et un même binaire, ce qui suffit à comparer deux exécutions
 //! successives. **Ne pas persister ces valeurs ni les publier comme IOC.**
 
+use crate::parser::dex_facade::DexBin;
 use anyhow::{bail, Context, Result};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -40,6 +41,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Paramètres du désassemblage.
+#[derive(Default)]
 pub struct DisasmOptions {
     /// Motifs de sélection des classes. Comparaison par **sous-chaîne** sur le
     /// descripteur Dalvik, insensible à la casse — `services/g`,
@@ -51,12 +53,6 @@ pub struct DisasmOptions {
     /// namespace diffère (`com/duiyun` ↔ `com/dy`) sans que chaque ligne
     /// diverge pour cette seule raison. N'affecte QUE l'affichage.
     pub normalize: Vec<(String, String)>,
-}
-
-impl Default for DisasmOptions {
-    fn default() -> Self {
-        Self { patterns: Vec::new(), normalize: Vec::new() }
-    }
 }
 
 /// Une instruction désassemblée.
@@ -73,8 +69,7 @@ pub struct Insn {
 pub struct MethodDisasm {
     pub name: String,
     /// Descripteurs des paramètres déclarés. Le type de retour n'est pas rendu :
-    /// le crate `dex` ne l'expose pas par une API vérifiée, et il n'apporte rien
-    /// à la comparaison de deux corps de méthode.
+    /// il n'apporte rien à la comparaison de deux corps de méthode.
     pub params: Vec<String>,
     pub registers_size: u16,
     pub ins_size: u16,
@@ -126,8 +121,7 @@ pub fn run(input: &Path, opts: &DisasmOptions) -> Result<DisasmReport> {
 }
 
 fn collect_from_dex(path: &Path, opts: &DisasmOptions, out: &mut DisasmReport) -> Result<()> {
-    let dex = dex::DexReader::from_file(path)
-        .with_context(|| format!("open dex {}", path.display()))?;
+    let dex = DexBin::open(path)?;
 
     for class in dex.classes() {
         let class = match class {
@@ -139,7 +133,7 @@ fn collect_from_dex(path: &Path, opts: &DisasmOptions, out: &mut DisasmReport) -
         };
         out.scanned += 1;
 
-        let descriptor = class.jtype().type_descriptor().to_string();
+        let descriptor = class.descriptor.to_string();
         if !selected(&descriptor, &opts.patterns) {
             continue;
         }
@@ -147,8 +141,8 @@ fn collect_from_dex(path: &Path, opts: &DisasmOptions, out: &mut DisasmReport) -
         let mut methods = Vec::new();
         let mut codeless = 0usize;
 
-        for method in class.methods() {
-            let code = match method.code() {
+        for method in &class.methods {
+            let code = match &method.code {
                 Some(c) => c,
                 None => {
                     codeless += 1;
@@ -156,8 +150,7 @@ fn collect_from_dex(path: &Path, opts: &DisasmOptions, out: &mut DisasmReport) -
                 }
             };
 
-            let bytes = u16_to_le_bytes(code.insns());
-            let instructions = match dex_bytecode::decode_all(&bytes, 0) {
+            let instructions = match dex_bytecode::decode_all(code.insns, 0) {
                 Ok(i) => i,
                 Err(e) => {
                     tracing::warn!(class = %descriptor, error = %e, "decode failed");
@@ -181,21 +174,20 @@ fn collect_from_dex(path: &Path, opts: &DisasmOptions, out: &mut DisasmReport) -
                 .map(|ins| Insn {
                     offset: ins.offset as u64,
                     mnemonic: ins.mnemonic().to_string(),
-                    operands: normalize(&ins.operands().to_string(), &opts.normalize),
-                    resolved: annotate(&dex, ins)
-                        .map(|s| normalize(&s, &opts.normalize)),
+                    operands: normalize(ins.operands(), &opts.normalize),
+                    resolved: annotate(&dex, ins).map(|s| normalize(&s, &opts.normalize)),
                 })
                 .collect();
 
             methods.push(MethodDisasm {
-                name: method.name().to_string(),
+                name: method.name.to_string(),
                 params: method
-                    .params()
+                    .params
                     .iter()
-                    .map(|p| normalize(&p.type_descriptor().to_string(), &opts.normalize))
+                    .map(|p| normalize(p, &opts.normalize))
                     .collect(),
-                registers_size: code.registers_size(),
-                ins_size: code.ins_size(),
+                registers_size: code.registers_size,
+                ins_size: code.ins_size,
                 fingerprint,
                 insns,
             });
@@ -285,67 +277,40 @@ impl Operand {
 /// qu'un à la fois. L'ordre d'essai place `string@` en premier, cas le plus
 /// fréquent et le plus informatif à la lecture.
 ///
-/// ⚠️ **C'est le SEUL endroit du projet où les getters de `MethodIdItem` et
-/// `FieldIdItem` sont appelés.** Le crate est asymétrique (valeurs pour l'un,
-/// références pour l'autre) : concentrer les appels ici évite d'avoir à corriger
-/// la même subtilité en deux endroits.
-pub fn resolve(
-    dex: &dex::Dex<impl AsRef<[u8]>>,
-    ins: &dex_bytecode::Instruction,
-) -> Option<Operand> {
-    use dex::field::FieldId;
-    use dex::jtype::TypeId;
-    use dex::method::MethodId;
-    use dex::string::StringId;
-
+/// ⚠️ **C'est le SEUL endroit du projet où les entrées de `method_ids` et de
+/// `field_ids` sont traduites en opérande affichable.** Concentrer les appels
+/// ici évite d'avoir à corriger la même subtilité en deux endroits.
+pub fn resolve(dex: &DexBin, ins: &dex_bytecode::Instruction) -> Option<Operand> {
     if let Some(idx) = operand_index(ins, "string@") {
-        return Some(Operand::Str(dex.get_string(idx as StringId).ok()?.to_string()));
+        return Some(Operand::Str(dex.string(idx as u32)?.to_string()));
     }
 
     if let Some(idx) = operand_index(ins, "method@") {
-        // ⚠️ Sur MethodIdItem les getters rendent des VALEURS (cf. le call site
-        // vérifié de dyn_entrypoints::sink_name) — pas de déréférencement ici.
-        let item = dex.get_method_item(idx as MethodId).ok()?;
-        let owner = dex
-            .get_type(item.class_idx() as TypeId)
-            .ok()?
-            .type_descriptor()
-            .to_string();
-        let name = dex.get_string(item.name_idx() as StringId).ok()?.to_string();
-        return Some(Operand::Method(owner, name));
+        let item = dex.method_item(idx as u32)?;
+        return Some(Operand::Method(
+            item.class.to_string(),
+            item.name.to_string(),
+        ));
     }
 
     if let Some(idx) = operand_index(ins, "field@") {
-        // ⚠️ Sur FieldIdItem les getters rendent des RÉFÉRENCES `&ushort` — d'où
-        // le `*`. Seul `type_idx` est vérifié à la source (dyn_entrypoints) ;
-        // `class_idx` et `name_idx` sont déduits par analogie. Si la compilation
-        // échoue, c'est ici, et le correctif est de retirer les trois `*`.
-        let item = dex.get_field_item(idx as FieldId).ok()?;
-        let owner = dex
-            .get_type(*item.class_idx() as TypeId)
-            .ok()?
-            .type_descriptor()
-            .to_string();
-        let name = dex.get_string(*item.name_idx() as StringId).ok()?.to_string();
-        let ty = dex
-            .get_type(*item.type_idx() as TypeId)
-            .ok()?
-            .type_descriptor()
-            .to_string();
-        return Some(Operand::Field(owner, name, ty));
+        let item = dex.field_item(idx as u32)?;
+        return Some(Operand::Field(
+            item.class.to_string(),
+            item.name.to_string(),
+            item.typ.to_string(),
+        ));
     }
 
     if let Some(idx) = operand_index(ins, "type@") {
-        return Some(Operand::Type(
-            dex.get_type(idx as TypeId).ok()?.type_descriptor().to_string(),
-        ));
+        return Some(Operand::Type(dex.typ(idx as u32)?.to_string()));
     }
 
     None
 }
 
 /// Rendu texte d'une opérande résolue, pour l'affichage du désassemblage.
-fn annotate(dex: &dex::Dex<impl AsRef<[u8]>>, ins: &dex_bytecode::Instruction) -> Option<String> {
+fn annotate(dex: &DexBin, ins: &dex_bytecode::Instruction) -> Option<String> {
     resolve(dex, ins).map(|o| o.render())
 }
 
@@ -355,7 +320,10 @@ fn annotate(dex: &dex::Dex<impl AsRef<[u8]>>, ins: &dex_bytecode::Instruction) -
 pub fn operand_index(ins: &dex_bytecode::Instruction, tag: &str) -> Option<u64> {
     let ops = ins.operands();
     let pos = ops.find(tag)? + tag.len();
-    let digits: String = ops[pos..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = ops[pos..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     digits.parse().ok()
 }
 
@@ -375,8 +343,8 @@ pub fn escape(s: &str) -> String {
 fn collect_dex_paths(input: &Path) -> Result<(Vec<PathBuf>, Option<tempfile::TempDir>)> {
     let mut magic = [0u8; 8];
     {
-        let mut f = std::fs::File::open(input)
-            .with_context(|| format!("open {}", input.display()))?;
+        let mut f =
+            std::fs::File::open(input).with_context(|| format!("open {}", input.display()))?;
         let n = f.read(&mut magic)?;
         if n < 4 {
             bail!("{} trop court pour être un DEX ou un APK", input.display());
@@ -420,15 +388,6 @@ fn extract_dexes(apk: &Path, out_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Code units (u16) → octets little-endian.
-fn u16_to_le_bytes(insns: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(insns.len() * 2);
-    for &u in insns {
-        out.extend_from_slice(&u.to_le_bytes());
-    }
-    out
-}
-
 /// Rendu texte, une instruction par ligne. Sortie conçue pour être passée à
 /// `diff` : pas d'en-tête variable, pas d'horodatage, ordre stable.
 pub fn render(r: &DisasmReport) -> String {
@@ -436,7 +395,10 @@ pub fn render(r: &DisasmReport) -> String {
     for c in &r.classes {
         s.push_str(&format!("== {} ==\n", c.descriptor));
         if c.codeless > 0 {
-            s.push_str(&format!("   ({} méthode(s) sans code : abstraite ou native)\n", c.codeless));
+            s.push_str(&format!(
+                "   ({} méthode(s) sans code : abstraite ou native)\n",
+                c.codeless
+            ));
         }
         for m in &c.methods {
             s.push_str(&format!(
@@ -530,7 +492,10 @@ mod tests {
     #[test]
     fn normalize_applies_in_order() {
         let subs = vec![("com/duiyun".to_string(), "com/dy".to_string())];
-        assert_eq!(normalize("Lcom/duiyun/services/g;", &subs), "Lcom/dy/services/g;");
+        assert_eq!(
+            normalize("Lcom/duiyun/services/g;", &subs),
+            "Lcom/dy/services/g;"
+        );
         assert_eq!(normalize("rien à voir", &subs), "rien à voir");
     }
 

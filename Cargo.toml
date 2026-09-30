@@ -17,8 +17,11 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# DEX parsing structurel (stable, crates.io) : classes -> methods -> code_item
-dex = "0.5"
+# DEX parsing structurel : classes -> methods -> code_item. Apache-2.0,
+# compatible en aval avec l'AGPL-3.0-or-later de Drakkar. Le paquet vit dans le
+# sous-répertoire dexparser-rs/ du dépôt, qui n'a pas de Cargo.toml à sa racine.
+# Consommé UNIQUEMENT par parser::dex_facade.
+dex-parser = { git = "https://github.com/androguard/dex-parser" }
 
 # Lecture de l'archive APK (zip) pour extraire classes*.dex et lib/*/*.so
 zip = "2"
@@ -55,8 +58,13 @@ sha1 = "0.10"
 md-5 = "0.10"
 
 # Décodage bytecode Dalvik (invoke-* + CFG intra-méthode). Repo Androguard,
-# pas encore de release -> dépendance git. À pinner sur un rev une fois l'API stable.
-dex-bytecode = { git = "https://github.com/androguard/dex-bytecode", branch = "main" }
+# pas encore de release -> dépendance git.
+#
+# ⚠️ Déclaration SANS `branch` ni `rev` : dex-parser déclare le même dépôt sans
+# branche (GitReference::DefaultBranch). Toute autre forme ici donnerait un
+# SourceId distinct, donc DEUX paquets dex-bytecode v0.0.1 dans le graphe, donc
+# deux `Instruction` non interchangeables. Rev épinglé par Cargo.lock.
+dex-bytecode = { git = "https://github.com/androguard/dex-bytecode" }
 
 # LIEF: réservé au parsing ELF natif (lib/*/*.so). Build C++ lourd, activé à la
 # demande -> `cargo build --features lief-backend`.

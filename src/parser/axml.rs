@@ -78,7 +78,7 @@ impl Element {
             .or_else(|| {
                 self.attributes
                     .iter()
-                    .find(|(k, _)| k.split(':').last() == Some(key))
+                    .find(|(k, _)| k.split(':').next_back() == Some(key))
             })
             .map(|(_, v)| v.clone())
     }
@@ -168,7 +168,7 @@ fn from_axmldecoder(e: &axmldecoder::Element) -> Element {
 }
 
 thread_local! {
-    static QUIET: Cell<bool> = Cell::new(false);
+    static QUIET: Cell<bool> = const { Cell::new(false) };
 }
 static QUIET_HOOK: Once = Once::new();
 
@@ -264,7 +264,10 @@ fn decode_tolerant(data: &[u8]) -> Result<Element> {
             // champ crédible pour retrouver le chunk suivant.
             hsize
         } else {
-            tracing::debug!(offset = off, "taille de chunk inexploitable, parcours interrompu");
+            tracing::debug!(
+                offset = off,
+                "taille de chunk inexploitable, parcours interrompu"
+            );
             break;
         };
         let chunk = &data[off..off + step];
@@ -323,7 +326,7 @@ fn decode_tolerant(data: &[u8]) -> Result<Element> {
 }
 
 /// Rattache un élément refermé à son parent, ou l'installe comme racine.
-fn close(stack: &mut Vec<Element>, root: &mut Option<Element>, done: Element) {
+fn close(stack: &mut [Element], root: &mut Option<Element>, done: Element) {
     if stack.len() > MAX_DEPTH {
         return;
     }
@@ -342,8 +345,10 @@ fn parse_resource_map(chunk: &[u8], hsize: usize) -> Vec<u32> {
         CHUNK_HEADER
     };
     chunk[start..]
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect()
 }
 
@@ -543,7 +548,10 @@ fn length_u16(d: &[u8], off: usize) -> Option<(usize, usize)> {
         return Some((first as usize, off + 2));
     }
     let second = u16_at(d, off + 2)?;
-    Some(((((first & 0x7fff) as usize) << 16) | second as usize, off + 4))
+    Some((
+        (((first & 0x7fff) as usize) << 16) | second as usize,
+        off + 4,
+    ))
 }
 
 fn decode_utf8(d: &[u8], off: usize) -> Option<String> {
@@ -558,8 +566,10 @@ fn decode_utf16(d: &[u8], off: usize) -> Option<String> {
     let end = p.saturating_add(len.saturating_mul(2)).min(d.len());
     let units: Vec<u16> = d
         .get(p..end)?
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     Some(String::from_utf16_lossy(&units))
 }

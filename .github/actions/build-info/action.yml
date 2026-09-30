@@ -1,0 +1,71 @@
+name: build-info
+description: Ecrit le fichier de provenance d'un artefact, revs git complets.
+
+inputs:
+  dest:
+    description: Chemin du fichier a ecrire.
+    required: true
+  target:
+    description: Triplet de la cible construite.
+    required: true
+  version:
+    description: Version du paquet. Omise hors release.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: provenance
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Toute source git de Cargo.lock, quel qu'en soit le nombre. Le champ
+        # `source` est recopie tel quel : il porte le rev sur 40 hex, jamais
+        # tronque. C'est ce qui rattache une mesure sur corpus a un etat de
+        # dependances exact.
+        git_deps="$(awk '
+          function flush() {
+            if (src != "") printf "  %-13s %-8s %s\n", name, ver, src
+            name = ""; ver = ""; src = ""
+          }
+          /^\[\[package\]\]/   { flush(); next }
+          /^name = "/          { name = $0; sub(/^name = "/, "", name);    sub(/"$/, "", name); next }
+          /^version = "/       { ver  = $0; sub(/^version = "/, "", ver);   sub(/"$/, "", ver);  next }
+          /^source = "git\+/   { src  = $0; sub(/^source = "/, "", src);    sub(/"$/, "", src);  next }
+          END { flush() }
+        ' Cargo.lock)"
+
+        # Une provenance partielle est pire que pas de fichier : on compte les
+        # sources git d'un cote, les lignes produites de l'autre, et on refuse
+        # d'ecrire si les deux ne concordent pas.
+        expected="$(grep -c '^source = "git+' Cargo.lock || true)"
+        actual="$(printf '%s\n' "${git_deps}" | grep -c . || true)"
+        if [ "${expected}" -eq 0 ]; then
+          echo "::error::aucune source git dans Cargo.lock — la provenance attendue de drakkar en compte au moins deux (dex-parser, dex-bytecode). Extraction a revoir avant de publier un artefact."
+          exit 1
+        fi
+        if [ "${actual}" -ne "${expected}" ]; then
+          echo "::error::provenance incomplete : ${actual} entrees extraites pour ${expected} sources git dans Cargo.lock. Aucun artefact ne doit partir avec une provenance partielle."
+          exit 1
+        fi
+
+        mkdir -p "$(dirname "${{ inputs.dest }}")"
+        {
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "drakkar       ${{ inputs.version }}"
+          fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "tag           ${GITHUB_REF_NAME}"
+          fi
+          echo "commit        ${GITHUB_SHA}"
+          echo "ref           ${GITHUB_REF}"
+          echo "target        ${{ inputs.target }}"
+          echo "rustc         $(rustc --version)"
+          echo "features      default (lief-backend desactive)"
+          echo "dependances git (${expected}, rev complet jamais tronque) :"
+          printf '%s\n' "${git_deps}"
+        } > "${{ inputs.dest }}"
+
+        cat "${{ inputs.dest }}"

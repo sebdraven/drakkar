@@ -66,8 +66,9 @@
 //! construction ; le second sort quand même, mais sans corroboration.
 
 use super::arsc::{ResourceEntry, ResourceTable};
+use super::dex_facade::{DexBin, DexValue};
 use super::disasm::{resolve, Operand};
-use super::dyn_entrypoints::{dest_register, registers, u16_to_le_bytes, writes_register};
+use super::dyn_entrypoints::{dest_register, registers, writes_register};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -302,11 +303,7 @@ pub fn scan(apk: &Path, table: &ResourceTable) -> Result<XrefReport> {
     report.stats.matched = report.uses.len() - report.stats.via_static_field;
     report.stats.distinct_rejected = rejected.len();
     report.stats.distinct_ids = report.used.len();
-    report.stats.corroborated = report
-        .uses
-        .iter()
-        .filter(|u| u.consumer.is_some())
-        .count();
+    report.stats.corroborated = report.uses.iter().filter(|u| u.consumer.is_some()).count();
 
     tracing::info!(
         uses = report.uses.len(),
@@ -324,8 +321,7 @@ fn scan_dex(
     report: &mut XrefReport,
     rejected: &mut HashSet<u32>,
 ) -> Result<()> {
-    let dex = dex::DexReader::from_file(path)
-        .with_context(|| format!("open dex {}", path.display()))?;
+    let dex = DexBin::open(path)?;
 
     // Passe 1 : valeur des champs statiques entiers, par (classe, nom). C'est
     // le seul moyen d'atteindre `encoded_static_values`, où vivent les
@@ -340,28 +336,28 @@ fn scan_dex(
             Err(_) => continue,
         };
         report.stats.classes += 1;
-        let class_name = class.jtype().type_descriptor().to_string();
+        let class_name = class.descriptor.to_string();
         let in_r_class = is_r_class(&class_name);
 
-        for method in class.methods() {
-            let Some(code) = method.code() else { continue };
+        for method in &class.methods {
+            let Some(code) = &method.code else { continue };
             report.stats.methods += 1;
 
-            let bytes = u16_to_le_bytes(code.insns());
-            let instructions = match dex_bytecode::decode_all(&bytes, 0) {
+            let bytes = code.insns;
+            let instructions = match dex_bytecode::decode_all(bytes, 0) {
                 Ok(i) => i,
                 Err(_) => {
                     report.stats.decode_failures += 1;
                     continue;
                 }
             };
-            let method_name = method.name().to_string();
+            let method_name = method.name.to_string();
 
             for (i, ins) in instructions.iter().enumerate() {
                 let mnemonic = ins.mnemonic();
 
                 if mnemonic == PAYLOAD_MNEMONIC {
-                    for value in payload_ints(&bytes, ins.offset as usize) {
+                    for value in payload_ints(bytes, ins.offset as usize) {
                         record(
                             table,
                             report,
@@ -408,11 +404,11 @@ fn scan_dex(
                     continue;
                 }
 
-                let Some(value) = const_literal(&bytes, ins.opcode(), ins.offset as usize) else {
+                let Some(value) = const_literal(bytes, ins.opcode(), ins.offset as usize) else {
                     continue;
                 };
-                let consumer = dest_register(ins)
-                    .and_then(|reg| find_consumer(&dex, &instructions, i, reg));
+                let consumer =
+                    dest_register(ins).and_then(|reg| find_consumer(&dex, &instructions, i, reg));
                 record(
                     table,
                     report,
@@ -498,23 +494,22 @@ fn record(
 /// Restreinte à la plage des packages de la table : un `static final int`
 /// quelconque n'a rien à faire dans l'index, et sa présence ferait passer pour
 /// une ressource le premier `sget` venu.
-fn index_static_ints(
-    dex: &dex::Dex<impl AsRef<[u8]>>,
-    table: &ResourceTable,
-) -> HashMap<(String, String), u32> {
-    use dex::encoded_value::EncodedValue;
-
+fn index_static_ints(dex: &DexBin, table: &ResourceTable) -> HashMap<(String, String), u32> {
     let mut out = HashMap::new();
     for class in dex.classes() {
         let Ok(class) = class else { continue };
-        let owner = class.jtype().type_descriptor().to_string();
-        for field in class.static_fields() {
-            let Some(EncodedValue::Int(v)) = field.initial_value() else {
+        // Un class_data illisible saute la classe, il ne tue pas le balayage.
+        let Ok(fields) = dex.static_fields(&class) else {
+            continue;
+        };
+        let owner = class.descriptor.to_string();
+        for field in fields {
+            let Some(DexValue::Int(v)) = field.value else {
                 continue;
             };
-            let value = *v as u32;
+            let value = v as u32;
             if table.in_package_range(value) {
-                out.insert((owner.clone(), field.name().to_string()), value);
+                out.insert((owner.clone(), field.name), value);
             }
         }
     }
@@ -555,7 +550,7 @@ fn payload_ints(bytes: &[u8], at: usize) -> Vec<u32> {
 /// `reg` et dont le nom figure dans [`RESOURCE_APIS`]. S'arrête dès que le
 /// registre est réécrit : au-delà, la constante n'y est plus.
 fn find_consumer(
-    dex: &dex::Dex<impl AsRef<[u8]>>,
+    dex: &DexBin,
     instructions: &[dex_bytecode::Instruction],
     from: usize,
     reg: u32,
@@ -705,6 +700,8 @@ mod tests {
         assert!(payload_ints(&b, 0).is_empty());
     }
 
+    // `R` est la classe de ressources d'Android : la minuscule perdrait le sens.
+    #[allow(non_snake_case)]
     #[test]
     fn classes_R_reconnues() {
         assert!(is_r_class("Lcom/parental/control/kidgy/R;"));

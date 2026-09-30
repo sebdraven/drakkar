@@ -40,14 +40,21 @@
 //!   - une CHAÎNE qui change → contenu, c'est là que se voit un endpoint ;
 //!   - un CHAMP dont seul le nom change, owner et type égaux → remapping, bruit ;
 //!   - une CIBLE DE MÉTHODE ou un TYPE qui change → divergence réelle.
-//! Sans cette distinction, la réserve sur `f2425a` / `f2068a` reste un problème
-//! de lecture. Avec, elle devient une catégorie comptée.
+//!
+//! Sans cette distinction, la réserve sur `Lcom/dy/MyApplication;->a` reste un
+//! problème de lecture. Avec, elle devient une catégorie comptée.
+//!
+//! ⚠️ Une opérande n'est pas la seule porteuse de contenu : un `static final
+//! String` initialisé par une constante de compilation n'est écrit par AUCUNE
+//! instruction, sa valeur vit dans `encoded_static_values`. D'où la catégorie
+//! `valeur-statique`, lue dans le `class_def_item` et non dans le code.
 
-use crate::parser::disasm::{normalize, resolve, Operand};
+use crate::parser::dex_facade::DexValue;
+use crate::parser::disasm::{escape, normalize, resolve, Operand};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
@@ -72,9 +79,7 @@ impl ColorMode {
             Self::Never => false,
             // Redirigé vers un fichier ou un pipe -> pas d'ANSI, sinon la sortie
             // est illisible et ingrep-able. `NO_COLOR` est respecté (no-color.org).
-            Self::Auto => {
-                std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
-            }
+            Self::Auto => std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
         }
     }
 }
@@ -109,6 +114,11 @@ pub enum Divergence {
     /// Une chaîne littérale change. **La catégorie qui compte** : hôte C2, clé
     /// d'API, chemin d'endpoint, message de debug.
     StringValue,
+    /// La valeur initiale d'un champ statique change. Lue dans
+    /// `encoded_static_values`, pas dans les instructions — c'est la seule
+    /// catégorie qui ne vient pas du bytecode, et elle porte les mêmes enjeux
+    /// que `StringValue`.
+    StaticValue,
     /// La méthode appelée change (owner ou nom).
     MethodTarget,
     /// Un descripteur de type change.
@@ -128,6 +138,7 @@ impl Divergence {
     pub fn label(self) -> &'static str {
         match self {
             Self::StringValue => "chaîne",
+            Self::StaticValue => "valeur-statique",
             Self::MethodTarget => "cible-méthode",
             Self::TypeRef => "type",
             Self::FieldTarget => "champ-réel",
@@ -139,7 +150,7 @@ impl Divergence {
     fn color(self) -> &'static str {
         match self {
             // Rouge : contenu. C'est ce qu'on cherche.
-            Self::StringValue => RED,
+            Self::StringValue | Self::StaticValue => RED,
             Self::MethodTarget | Self::TypeRef | Self::FieldTarget => YELLOW,
             // Atténué : bruit d'obfuscation attendu.
             Self::FieldRename => DIM,
@@ -174,7 +185,14 @@ struct ClassRich {
     methods: Vec<MethodRich>,
     /// Hash du multiset trié des empreintes de méthodes — identique au calcul de
     /// `diff_dex.rs`, pour que l'appariement de classes soit le même.
+    ///
+    /// ⚠️ N'inclut PAS les valeurs statiques, et ne doit pas les inclure : il
+    /// pilote l'appariement, donc le toucher déplacerait `identical_*`, `near`
+    /// et `only_in_*` de `--diff-dex`.
     class_hash: u64,
+    /// Champs statiques et leur valeur initiale, déjà normalisées. Vecteur vide
+    /// si la classe n'en porte aucun.
+    statics: Vec<(String, Option<DexValue>)>,
 }
 
 /// Une divergence localisée.
@@ -183,6 +201,11 @@ pub struct Finding {
     pub class_a: String,
     pub class_b: String,
     pub method: String,
+    /// Nom du champ, pour les divergences de valeur statique. Absent pour les
+    /// divergences d'opérande, qui n'en ont pas — d'où le `skip` : le schéma
+    /// JSON des `findings` existants ne bouge pas.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
     pub offset: u64,
     pub mnemonic: String,
     pub kind: Divergence,
@@ -259,6 +282,19 @@ pub struct ExplainReport {
     pub methods_compared: usize,
     /// Méthodes appariées dont TOUTES les opérandes coïncident.
     pub methods_clean: usize,
+    /// Champs statiques appariés par NOM entre deux classes appariées.
+    pub statics_compared: usize,
+    /// Champs statiques sans homonyme en face. Comptés, jamais remontés en
+    /// divergence : entre deux lots obfusqués séparément, un remapping de noms
+    /// de champs en produirait en masse, ce qui noierait le signal.
+    pub statics_unpaired: usize,
+    /// Classes retenues pour leurs SEULES valeurs statiques, côté A puis B :
+    /// aucune méthode porteuse de code. Une classe de constantes pures n'a pas
+    /// de `<clinit>`, elle était donc écartée avant que ce mode lise
+    /// `encoded_static_values`. Ce compteur rend le déplacement de
+    /// `classes_paired` lisible.
+    pub classes_without_code_a: usize,
+    pub classes_without_code_b: usize,
     pub findings: Vec<Finding>,
     /// Comptes par catégorie, ordonnés par gravité.
     pub by_kind: Vec<(String, usize)>,
@@ -318,6 +354,10 @@ pub fn run(input_a: &Path, input_b: &Path, opts: &ExplainOptions) -> Result<Expl
         paired_by_hash: 0,
         methods_compared: 0,
         methods_clean: 0,
+        statics_compared: 0,
+        statics_unpaired: 0,
+        classes_without_code_a: a.iter().filter(|c| c.methods.is_empty()).count(),
+        classes_without_code_b: b.iter().filter(|c| c.methods.is_empty()).count(),
         findings: Vec::new(),
         by_kind: Vec::new(),
         unaligned: Vec::new(),
@@ -341,7 +381,13 @@ pub fn run(input_a: &Path, input_b: &Path, opts: &ExplainOptions) -> Result<Expl
     let mut b_by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
     let mut b_by_name: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, c) in b.iter().enumerate() {
-        b_by_hash.entry(c.class_hash).or_default().push(i);
+        // 🔴 Les classes SANS méthode à code ont toutes la même empreinte —
+        // celle du multiset vide. Les laisser entrer dans l'index par empreinte
+        // les chaînerait en cycle de permutation en PASSE 2, exactement le
+        // défaut corrigé pour les POJO. Elles s'apparient par NOM ou pas du tout.
+        if !c.methods.is_empty() {
+            b_by_hash.entry(c.class_hash).or_default().push(i);
+        }
         b_by_name.entry(c.descriptor.clone()).or_default().push(i);
     }
 
@@ -364,7 +410,7 @@ pub fn run(input_a: &Path, input_b: &Path, opts: &ExplainOptions) -> Result<Expl
     // PASSE 2 — même empreinte, nom différent : renommage RÉEL de classe.
     // Les opérandes restent comparables (même séquence de mnémoniques).
     for (ia, ca) in a.iter().enumerate() {
-        if a_taken[ia] {
+        if a_taken[ia] || ca.methods.is_empty() {
             continue;
         }
         let found = b_by_hash
@@ -402,6 +448,9 @@ pub fn run(input_a: &Path, input_b: &Path, opts: &ExplainOptions) -> Result<Expl
             // est donc payé sur une poignée de méthodes, pas sur le corpus.
             let ac = align_class(ca, &b[ib], opts);
             report.aligned.push(ac);
+            // Les valeurs statiques ne dépendent d'aucun alignement d'opcodes :
+            // elles se comparent ici aussi.
+            compare_statics(ca, &b[ib], opts, &mut report);
         }
     }
 
@@ -426,7 +475,10 @@ pub fn run(input_a: &Path, input_b: &Path, opts: &ExplainOptions) -> Result<Expl
     }
     let mut kinds: Vec<(Divergence, usize)> = counts.into_iter().collect();
     kinds.sort_by_key(|(k, _)| *k);
-    report.by_kind = kinds.into_iter().map(|(k, n)| (k.label().to_string(), n)).collect();
+    report.by_kind = kinds
+        .into_iter()
+        .map(|(k, n)| (k.label().to_string(), n))
+        .collect();
 
     Ok(report)
 }
@@ -434,6 +486,8 @@ pub fn run(input_a: &Path, input_b: &Path, opts: &ExplainOptions) -> Result<Expl
 /// Compare deux classes de même empreinte : apparie les méthodes par empreinte,
 /// puis les opérandes index par index.
 fn compare_class(a: &ClassRich, b: &ClassRich, opts: &ExplainOptions, out: &mut ExplainReport) {
+    compare_statics(a, b, opts, out);
+
     // Index des méthodes B par empreinte. Plusieurs méthodes peuvent partager la
     // même (accesseurs triviaux) : on consomme dans l'ordre.
     let mut pool: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -467,6 +521,7 @@ fn compare_class(a: &ClassRich, b: &ClassRich, opts: &ExplainOptions, out: &mut 
                     class_a: a.descriptor.clone(),
                     class_b: b.descriptor.clone(),
                     method: ma.name.clone(),
+                    field: None,
                     offset: sa.offset,
                     mnemonic: sa.mnemonic.clone(),
                     kind,
@@ -478,6 +533,83 @@ fn compare_class(a: &ClassRich, b: &ClassRich, opts: &ExplainOptions, out: &mut 
         if out.findings.len() == before {
             out.methods_clean += 1;
         }
+    }
+}
+
+/// Compare les valeurs initiales des champs statiques de deux classes appariées.
+///
+/// Appariement par NOM de champ. Un champ sans homonyme en face est COMPTÉ mais
+/// pas remonté : entre deux lots obfusqués séparément le remapping de noms en
+/// produirait en masse, et ce bruit noierait la poignée de valeurs qui compte.
+fn compare_statics(a: &ClassRich, b: &ClassRich, opts: &ExplainOptions, out: &mut ExplainReport) {
+    if a.statics.is_empty() && b.statics.is_empty() {
+        return;
+    }
+    let b_by_name: HashMap<&str, &Option<DexValue>> =
+        b.statics.iter().map(|(n, v)| (n.as_str(), v)).collect();
+
+    for (name, va) in &a.statics {
+        let Some(vb) = b_by_name.get(name.as_str()).copied() else {
+            out.statics_unpaired += 1;
+            continue;
+        };
+        out.statics_compared += 1;
+        if va == vb {
+            continue;
+        }
+        out.findings.push(Finding {
+            class_a: a.descriptor.clone(),
+            class_b: b.descriptor.clone(),
+            method: STATIC_SLOT.to_string(),
+            field: Some(name.clone()),
+            offset: 0,
+            mnemonic: STATIC_SLOT.to_string(),
+            kind: Divergence::StaticValue,
+            value_a: truncate(&render_static(va.as_ref()), opts.max_value),
+            value_b: truncate(&render_static(vb.as_ref()), opts.max_value),
+        });
+    }
+
+    let a_names: HashSet<&str> = a.statics.iter().map(|(n, _)| n.as_str()).collect();
+    out.statics_unpaired += b
+        .statics
+        .iter()
+        .filter(|(n, _)| !a_names.contains(n.as_str()))
+        .count();
+}
+
+/// Pseudo-méthode sous laquelle les divergences de valeur statique sont
+/// regroupées : elles n'appartiennent à aucun corps de méthode.
+const STATIC_SLOT: &str = "<static>";
+
+/// Rendu d'une valeur statique. `None` = le `encoded_array` s'arrêtait avant ce
+/// champ, ce qui est une information en soi et non une valeur nulle.
+fn render_static(v: Option<&DexValue>) -> String {
+    let Some(v) = v else {
+        return "(pas de valeur initiale)".to_string();
+    };
+    match v {
+        DexValue::Str(s) => format!("\"{}\"", escape(s)),
+        DexValue::Type(t) => t.clone(),
+        DexValue::Field(f) | DexValue::Enum(f) => f.clone(),
+        DexValue::Method(m) => format!("{m}()"),
+        DexValue::Byte(n) => n.to_string(),
+        DexValue::Short(n) => n.to_string(),
+        DexValue::Char(n) => format!("u+{n:04x}"),
+        DexValue::Int(n) => n.to_string(),
+        DexValue::Long(n) => n.to_string(),
+        DexValue::Float(n) => n.to_string(),
+        DexValue::Double(n) => n.to_string(),
+        DexValue::Bool(b) => b.to_string(),
+        DexValue::Null => "null".to_string(),
+        DexValue::Array(v) => format!(
+            "[{}]",
+            v.iter()
+                .map(|x| render_static(Some(x)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        DexValue::Opaque(k) => format!("<{k}>"),
     }
 }
 
@@ -513,7 +645,10 @@ fn truncate(s: &str, max: usize) -> String {
     if n <= max {
         return s.to_string();
     }
-    format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+    format!(
+        "{}…",
+        s.chars().take(max.saturating_sub(1)).collect::<String>()
+    )
 }
 
 // ── Alignement LCS ──────────────────────────────────────────────────
@@ -702,9 +837,7 @@ fn visible(lines: &[AlignedLine], ctx: usize) -> Vec<usize> {
         if l.is_change() {
             let lo = i.saturating_sub(ctx);
             let hi = (i + ctx + 1).min(lines.len());
-            for k in lo..hi {
-                keep[k] = true;
-            }
+            keep[lo..hi].fill(true);
         }
     }
     keep.iter()
@@ -716,7 +849,10 @@ fn visible(lines: &[AlignedLine], ctx: usize) -> Vec<usize> {
 
 // ── Chargement ───────────────────────────────────────────────────────────────
 
-fn load(input: &Path, opts: &ExplainOptions) -> Result<(Vec<ClassRich>, Option<tempfile::TempDir>)> {
+fn load(
+    input: &Path,
+    opts: &ExplainOptions,
+) -> Result<(Vec<ClassRich>, Option<tempfile::TempDir>)> {
     let (paths, tmp) = collect_dex_paths(input)?;
     let mut out = Vec::new();
     for p in &paths {
@@ -733,8 +869,7 @@ fn load(input: &Path, opts: &ExplainOptions) -> Result<(Vec<ClassRich>, Option<t
 }
 
 fn collect_from_dex(path: &Path, opts: &ExplainOptions, out: &mut Vec<ClassRich>) -> Result<()> {
-    let dex = dex::DexReader::from_file(path)
-        .with_context(|| format!("open dex {}", path.display()))?;
+    let dex = crate::parser::dex_facade::DexBin::open(path)?;
 
     for class in dex.classes() {
         let class = match class {
@@ -744,17 +879,16 @@ fn collect_from_dex(path: &Path, opts: &ExplainOptions, out: &mut Vec<ClassRich>
                 continue;
             }
         };
-        let raw = class.jtype().type_descriptor().to_string();
+        let raw = class.descriptor.to_string();
         if !included(&raw, &opts.include_prefixes) {
             continue;
         }
 
         let mut methods = Vec::new();
-        for method in class.methods() {
-            let Some(code) = method.code() else { continue };
+        for method in &class.methods {
+            let Some(code) = &method.code else { continue };
 
-            let bytes = u16_to_le_bytes(code.insns());
-            let instructions = match dex_bytecode::decode_all(&bytes, 0) {
+            let instructions = match dex_bytecode::decode_all(code.insns, 0) {
                 Ok(i) => i,
                 Err(e) => {
                     tracing::warn!(class = %raw, error = %e, "decode failed");
@@ -782,13 +916,34 @@ fn collect_from_dex(path: &Path, opts: &ExplainOptions, out: &mut Vec<ClassRich>
                 .collect();
 
             methods.push(MethodRich {
-                name: method.name().to_string(),
+                name: method.name.to_string(),
                 fingerprint,
                 slots,
             });
         }
 
-        if methods.is_empty() {
+        // Valeurs statiques : lues dans `encoded_static_values`, jamais dans
+        // les instructions. Normalisées comme les opérandes, sans quoi un
+        // endpoint de marque divergerait sur le seul namespace.
+        let statics: Vec<(String, Option<DexValue>)> = match dex.static_fields(&class) {
+            Ok(fields) => fields
+                .into_iter()
+                .map(|f| {
+                    let value = f.value.map(|v| v.normalized(&opts.normalize));
+                    (normalize(&f.name, &opts.normalize), value)
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(class = %raw, error = %e, "valeurs statiques illisibles");
+                Vec::new()
+            }
+        };
+
+        // Une classe qui ne porte QUE des constantes de compilation n'a pas de
+        // `<clinit>` : zéro méthode avec code. L'écarter ici reviendrait à
+        // rendre invisible exactement ce que la catégorie `valeur-statique`
+        // cherche.
+        if methods.is_empty() && statics.is_empty() {
             continue;
         }
 
@@ -804,6 +959,7 @@ fn collect_from_dex(path: &Path, opts: &ExplainOptions, out: &mut Vec<ClassRich>
             descriptor: normalize(&raw, &opts.normalize),
             methods,
             class_hash,
+            statics,
         });
     }
     Ok(())
@@ -816,10 +972,26 @@ fn included(descriptor: &str, prefixes: &[String]) -> bool {
         return prefixes.iter().any(|p| descriptor.starts_with(p));
     }
     const LIB_PREFIXES: &[&str] = &[
-        "Landroid/", "Landroidx/", "Ljava/", "Ljavax/", "Lkotlin/", "Lkotlinx/",
-        "Ldalvik/", "Lrx/", "Lio/reactivex/", "Lokhttp3/", "Lokio/", "Lretrofit2/",
-        "Lcom/google/", "Lcom/alibaba/", "Lcom/umeng/", "Lorg/apache/", "Lorg/json/",
-        "Lorg/xmlpull/", "Luk/co/chrisjenx/", "Lgov/nist/",
+        "Landroid/",
+        "Landroidx/",
+        "Ljava/",
+        "Ljavax/",
+        "Lkotlin/",
+        "Lkotlinx/",
+        "Ldalvik/",
+        "Lrx/",
+        "Lio/reactivex/",
+        "Lokhttp3/",
+        "Lokio/",
+        "Lretrofit2/",
+        "Lcom/google/",
+        "Lcom/alibaba/",
+        "Lcom/umeng/",
+        "Lorg/apache/",
+        "Lorg/json/",
+        "Lorg/xmlpull/",
+        "Luk/co/chrisjenx/",
+        "Lgov/nist/",
     ];
     !LIB_PREFIXES.iter().any(|p| descriptor.starts_with(p))
 }
@@ -827,8 +999,8 @@ fn included(descriptor: &str, prefixes: &[String]) -> bool {
 fn collect_dex_paths(input: &Path) -> Result<(Vec<PathBuf>, Option<tempfile::TempDir>)> {
     let mut magic = [0u8; 8];
     {
-        let mut f = std::fs::File::open(input)
-            .with_context(|| format!("open {}", input.display()))?;
+        let mut f =
+            std::fs::File::open(input).with_context(|| format!("open {}", input.display()))?;
         if f.read(&mut magic)? < 4 {
             bail!("{} trop court pour être un DEX ou un APK", input.display());
         }
@@ -865,14 +1037,6 @@ fn collect_dex_paths(input: &Path) -> Result<(Vec<PathBuf>, Option<tempfile::Tem
     )
 }
 
-fn u16_to_le_bytes(insns: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(insns.len() * 2);
-    for &u in insns {
-        out.extend_from_slice(&u.to_le_bytes());
-    }
-    out
-}
-
 // ── Rendu ────────────────────────────────────────────────────────────────────
 
 pub fn render_report(r: &ExplainReport, opts: &ExplainOptions) -> String {
@@ -885,13 +1049,33 @@ pub fn render_report(r: &ExplainReport, opts: &ExplainOptions) -> String {
 
     s.push_str(&format!(
         "Classes appariées {}   (par nom {}, par empreinte seule {})\n\
-         Méthodes comparées {}   dont sans divergence {}\n",
+         Méthodes comparées {}   dont sans divergence {}\n\
+         Champs statiques comparés {}   sans homonyme en face {}\n",
         paint(c, CYAN, &r.classes_paired.to_string()),
         r.paired_by_name,
-        paint(c, if r.paired_by_hash > 0 { YELLOW } else { DIM }, &r.paired_by_hash.to_string()),
+        paint(
+            c,
+            if r.paired_by_hash > 0 { YELLOW } else { DIM },
+            &r.paired_by_hash.to_string()
+        ),
         paint(c, CYAN, &r.methods_compared.to_string()),
         paint(c, GREEN, &r.methods_clean.to_string()),
+        paint(c, CYAN, &r.statics_compared.to_string()),
+        paint(c, DIM, &r.statics_unpaired.to_string()),
     ));
+
+    if r.classes_without_code_a > 0 || r.classes_without_code_b > 0 {
+        s.push_str(&format!(
+            "  {} A={} B={}\n",
+            paint(
+                c,
+                DIM,
+                "dont classes sans méthode à code, retenues pour leurs valeurs statiques :"
+            ),
+            r.classes_without_code_a,
+            r.classes_without_code_b,
+        ));
+    }
 
     // ── Divergences, regroupées par classe puis méthode ──
     if r.findings.is_empty() {
@@ -912,6 +1096,20 @@ pub fn render_report(r: &ExplainReport, opts: &ExplainOptions) -> String {
             if head != current {
                 s.push_str(&format!("\n  {}\n", paint(c, BOLD, &head)));
                 current = head;
+            }
+            if f.kind == Divergence::StaticValue {
+                // Pas d'offset ni de mnémonique : la valeur ne vient d'aucune
+                // instruction. La colonne porte le nom du champ.
+                s.push_str(&format!(
+                    "    {:<28} {:<14}\n           {} {}\n           {} {}\n",
+                    f.field.as_deref().unwrap_or("?"),
+                    paint(c, f.kind.color(), f.kind.label()),
+                    paint(c, DIM, "A"),
+                    paint(c, f.kind.color(), &f.value_a),
+                    paint(c, DIM, "B"),
+                    paint(c, f.kind.color(), &f.value_b),
+                ));
+                continue;
             }
             s.push_str(&format!(
                 "    {:04x}  {:<22} {:<14} {}\n           {} {}\n           {} {}\n",
@@ -947,7 +1145,11 @@ pub fn render_report(r: &ExplainReport, opts: &ExplainOptions) -> String {
         ));
         s.push_str(&format!(
             "  {}\n",
-            paint(c, DIM, "= identique   ~ même opcode, opérande différente   - seulement A   + seulement B")
+            paint(
+                c,
+                DIM,
+                "= identique   ~ même opcode, opérande différente   - seulement A   + seulement B"
+            )
         ));
 
         for ac in &r.aligned {
@@ -977,7 +1179,11 @@ pub fn render_report(r: &ExplainReport, opts: &ExplainOptions) -> String {
                 if m.skipped {
                     s.push_str(&format!(
                         "      {}\n",
-                        paint(c, DIM, "méthode trop longue pour l'alignement (--explain-align-cap)")
+                        paint(
+                            c,
+                            DIM,
+                            "méthode trop longue pour l'alignement (--explain-align-cap)"
+                        )
                     ));
                     continue;
                 }
@@ -1036,7 +1242,10 @@ pub fn render_report(r: &ExplainReport, opts: &ExplainOptions) -> String {
                 }
             }
 
-            for (title, list) in [("méthodes seulement dans A", &ac.only_a), ("méthodes seulement dans B", &ac.only_b)] {
+            for (title, list) in [
+                ("méthodes seulement dans A", &ac.only_a),
+                ("méthodes seulement dans B", &ac.only_b),
+            ] {
                 if !list.is_empty() {
                     s.push_str(&format!("    {} : {}\n", title, list.join(", ")));
                 }
@@ -1069,17 +1278,29 @@ pub fn render_report(r: &ExplainReport, opts: &ExplainOptions) -> String {
     s.push_str(&format!("\n{}\n", paint(c, BOLD, "Verdict :")));
     s.push_str(&format!(
         "  {} divergence(s) d'opérande de fond, {} de renommage ProGuard (bruit).\n",
-        paint(c, if substantive == 0 { GREEN } else { RED }, &substantive.to_string()),
+        paint(
+            c,
+            if substantive == 0 { GREEN } else { RED },
+            &substantive.to_string()
+        ),
         paint(c, DIM, &noise.to_string()),
     ));
     s.push_str(&format!(
         "  {} ligne(s) de divergence STRUCTURELLE sur les classes alignées par LCS.\n",
-        paint(c, if structural == 0 { GREEN } else { RED }, &structural.to_string()),
+        paint(
+            c,
+            if structural == 0 { GREEN } else { RED },
+            &structural.to_string()
+        ),
     ));
     if substantive == 0 && structural == 0 {
         s.push_str(&format!(
             "  {}\n",
-            paint(c, GREEN, "Rien ne distingue les deux binaires au-delà de l'obfuscation.")
+            paint(
+                c,
+                GREEN,
+                "Rien ne distingue les deux binaires au-delà de l'obfuscation."
+            )
         ));
     }
 
@@ -1118,6 +1339,14 @@ Options :
 Catégories, par gravité décroissante :
   {chaine:<15} Une chaîne littérale change. LA catégorie qui compte —
                   hôte C2, clé d'API, chemin d'endpoint.            [rouge]
+  {stat:<15} La valeur initiale d'un champ statique change. Lue dans
+                  `encoded_static_values` du class_def_item, PAS dans les
+                  instructions : un `static final String` initialisé par une
+                  constante de compilation n'est écrit par aucun opcode. C'est
+                  pourquoi elle est comptée à part — l'empreinte d'opcodes ne
+                  peut structurellement pas la voir, et --diff-dex non plus.
+                  Ligne sans offset ni mnémonique : la colonne porte le NOM du
+                  champ.                                            [rouge]
   {meth:<15} La méthode appelée change (owner ou nom).          [jaune]
   {typ:<15} Un descripteur de type change.                     [jaune]
   {freal:<15} Un champ change d'owner ou de type.                [jaune]
@@ -1128,6 +1357,23 @@ Catégories, par gravité décroissante :
   {pres:<15} Opérande d'un côté, absente de l'autre. Anormal à
                   mnémonique égal — signalé plutôt que masqué.      [bleu]
 
+Champs statiques :
+  Appariement par NOM de champ, au sein d'une paire de classes déjà appariée.
+  Un champ sans homonyme en face est COMPTÉ (« sans homonyme ») et jamais
+  remonté en divergence : entre deux lots obfusqués séparément, le remapping de
+  noms en produirait en masse et noierait la poignée de valeurs qui compte.
+  Une classe qui ne porte QUE des constantes n'a pas de <clinit>, donc aucune
+  méthode à code ; elle est retenue quand même, et comptée séparément.
+  ⚠️ ANGLE MORT : les valeurs de type method-type, method-handle et annotation
+  sont rendues `<...>` et tenues pour ÉGALES entre elles. Leurs charges utiles
+  sont des index de pool, incomparables d'un DEX à l'autre ; les comparer
+  fabriquerait des faux positifs. Faux négatif choisi contre faux positif.
+
+CONTRE-ÉPREUVE : toute valeur-statique divergente doit AUSSI apparaître dans
+--diff-strings sur le même couple, qui lit le pool de chaînes et voit donc tout.
+Une valeur-statique absente du diff de chaînes est un faux positif — très
+probablement un décalage de l'appariement positionnel champ ↔ valeur.
+
 Le VERDICT sépare les divergences « de fond » (toutes sauf champ-renommé) du
 bruit d'obfuscation. Zéro divergence de fond ET aucune classe non alignée =
 identité sémantique, et non plus seulement structurelle.
@@ -1137,6 +1383,7 @@ expliquées — il faudrait un aligneur de séquences (LCS/Myers). Elles sont
 appariées par nom, signalées, et renvoyées vers --disasm. Choix assumé : sur le
 couple de référence ça ne concerne qu'une classe.",
         chaine = Divergence::StringValue.label(),
+        stat = Divergence::StaticValue.label(),
         meth = Divergence::MethodTarget.label(),
         typ = Divergence::TypeRef.label(),
         freal = Divergence::FieldTarget.label(),
@@ -1171,13 +1418,13 @@ mod tests {
     #[test]
     fn field_rename_is_noise_but_owner_change_is_not() {
         // Même owner, même type, nom remappé -> bruit ProGuard.
-        let a = f("Lcom/dy/MyApplication;", "f2425a", "Landroid/content/Context;");
-        let b = f("Lcom/dy/MyApplication;", "f2431b", "Landroid/content/Context;");
+        let a = f("Lcom/dy/MyApplication;", "a", "Landroid/content/Context;");
+        let b = f("Lcom/dy/MyApplication;", "b", "Landroid/content/Context;");
         assert_eq!(classify(Some(&a), Some(&b)), Some(Divergence::FieldRename));
         assert!(!Divergence::FieldRename.is_substantive());
 
         // Owner différent -> divergence réelle.
-        let c = f("Lcom/dy/Autre;", "f2425a", "Landroid/content/Context;");
+        let c = f("Lcom/dy/Autre;", "a", "Landroid/content/Context;");
         assert_eq!(classify(Some(&a), Some(&c)), Some(Divergence::FieldTarget));
     }
 
@@ -1189,7 +1436,11 @@ mod tests {
 
     #[test]
     fn gravity_ordering_puts_strings_first() {
-        let mut v = vec![Divergence::FieldRename, Divergence::StringValue, Divergence::TypeRef];
+        let mut v = [
+            Divergence::FieldRename,
+            Divergence::StringValue,
+            Divergence::TypeRef,
+        ];
         v.sort();
         assert_eq!(v[0], Divergence::StringValue);
         assert_eq!(v[2], Divergence::FieldRename);

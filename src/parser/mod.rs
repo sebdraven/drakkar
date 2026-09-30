@@ -1,8 +1,9 @@
 //! Parsing APK -> ApkFeatures + CallGraph.
 //!
-//! Un APK est une archive zip : on extrait les `classes*.dex` (parsés par le
-//! crate `dex` + `dex-bytecode`) et les `lib/*/*.so` (parsés par LIEF, derrière
-//! la feature `lief-backend`). Le manifest binaire est traité par `manifest`.
+//! Un APK est une archive zip : on extrait les `classes*.dex` (parsés via
+//! `dex_facade` + `dex-bytecode`) et les `lib/*/*.so` (parsés par LIEF,
+//! derrière la feature `lief-backend`). Le manifest binaire est traité par
+//! `manifest`.
 //!
 //! Certaines familles trafiquent la structure ZIP pour casser les outils sans
 //! gêner l'installation par Android. Quand le crate `zip` refuse l'archive, on
@@ -16,6 +17,7 @@ pub mod axml;
 pub mod cert;
 pub mod dating;
 pub mod dex;
+pub mod dex_facade;
 pub mod dex_strings;
 pub mod diff_dex;
 pub mod diff_explain;
@@ -89,7 +91,10 @@ pub fn parse_apk(path: &Path) -> Result<ParsedApk> {
         "native arch"
     );
 
-    Ok(ParsedApk { features, call_graph })
+    Ok(ParsedApk {
+        features,
+        call_graph,
+    })
 }
 
 /// Construit features + CFG depuis un **DEX brut** (déjà déballé) : ni
@@ -104,14 +109,17 @@ pub fn parse_dex(path: &Path) -> Result<ParsedApk> {
     let mut features = ApkFeatures::default();
     let mut call_graph = CallGraph::new();
 
-    let edges = dex::extract(path, &mut features)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let edges =
+        dex::extract(path, &mut features).with_context(|| format!("parse {}", path.display()))?;
     for e in edges {
         call_graph.add_call(e.caller, e.callee, e.site);
     }
     call_graph.set_supers(features.superclasses.clone());
 
-    Ok(ParsedApk { features, call_graph })
+    Ok(ParsedApk {
+        features,
+        call_graph,
+    })
 }
 
 /// Route APK vs DEX brut au **contenu** (magic bytes, cf.
@@ -230,12 +238,11 @@ fn extract_apk(apk: &Path, out_dir: &Path, want: Want) -> Result<ApkEntries> {
         }
     }
 
-    tracing::info!(
-        dex = dex_files.len(),
-        so = so_files.len(),
-        "APK extracted"
-    );
-    Ok(ApkEntries { dex_files, so_files })
+    tracing::info!(dex = dex_files.len(), so = so_files.len(), "APK extracted");
+    Ok(ApkEntries {
+        dex_files,
+        so_files,
+    })
 }
 
 /// Repli quand le crate `zip` refuse l'archive : lecteur calqué sur le
@@ -291,5 +298,8 @@ fn extract_apk_tolerant(apk: &Path, out_dir: &Path, want: Want) -> Result<ApkEnt
         so = so_files.len(),
         "APK extracted (lecteur tolérant)"
     );
-    Ok(ApkEntries { dex_files, so_files })
+    Ok(ApkEntries {
+        dex_files,
+        so_files,
+    })
 }

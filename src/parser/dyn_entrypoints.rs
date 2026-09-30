@@ -43,9 +43,11 @@
 //!   - `ComponentName` construit à partir de deux `const-string` (partiellement
 //!     couvert : on remonte la string la plus proche) ;
 //!   - réflexion sur nom construit par concaténation.
+//!
 //! Ces cas ressortent en `unresolved` plutôt que d'être silencieusement perdus.
 
 use crate::model::MethodRef;
+use crate::parser::dex_facade::DexBin;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
@@ -188,8 +190,7 @@ pub struct UnresolvedSink {
     pub caller: MethodRef,
     pub site: u64,
     pub reason: UnresolvedReason,
-    /// Registre cible, quand il est connu. `this` ou paramètre non distingués
-    /// faute d'accès à `registers_size`/`ins_size`.
+    /// Registre cible, quand il est connu. `this` ou paramètre non distingués.
     pub target_reg: Option<u32>,
     /// Mnémonique de l'instruction qui écrit le registre cible sans qu'on sache
     /// en tirer une classe. C'est LUI qui dit quoi implémenter ensuite.
@@ -231,7 +232,7 @@ pub type FieldAssignments = HashMap<u64, Option<String>>;
 ///
 /// Coût : une seconde passe de décodage sur tout le DEX. Assumé — c'est le seul
 /// moyen d'obtenir la classe concrète d'un receiver détenu en champ.
-pub(crate) fn index_field_assignments(dex: &dex::Dex<impl AsRef<[u8]>>) -> FieldAssignments {
+pub(crate) fn index_field_assignments(dex: &DexBin) -> FieldAssignments {
     let mut map: FieldAssignments = HashMap::new();
 
     for class in dex.classes() {
@@ -239,13 +240,12 @@ pub(crate) fn index_field_assignments(dex: &dex::Dex<impl AsRef<[u8]>>) -> Field
             Ok(c) => c,
             Err(_) => continue,
         };
-        for method in class.methods() {
-            let code = match method.code() {
+        for method in &class.methods {
+            let code = match &method.code {
                 Some(c) => c,
                 None => continue,
             };
-            let bytes = u16_to_le_bytes(code.insns());
-            let instructions = match dex_bytecode::decode_all(&bytes, 0) {
+            let instructions = match dex_bytecode::decode_all(code.insns, 0) {
                 Ok(i) => i,
                 Err(_) => continue,
             };
@@ -290,12 +290,10 @@ pub(crate) fn index_field_assignments(dex: &dex::Dex<impl AsRef<[u8]>>) -> Field
 /// traçant les `move-object`. Utilisé par la passe 1, où l'on ne cherche que la
 /// classe concrète d'une valeur assignée.
 pub(crate) fn backtrack_new_instance(
-    dex: &dex::Dex<impl AsRef<[u8]>>,
+    dex: &DexBin,
     window: &[dex_bytecode::Instruction],
     target: u32,
 ) -> Option<String> {
-    use dex::jtype::TypeId;
-
     let mut target = target;
     for ins in window.iter().rev() {
         // Une instruction qui n'écrit pas ne peut pas être la source : on la
@@ -313,7 +311,7 @@ pub(crate) fn backtrack_new_instance(
         }
         if m.starts_with("new-instance") || m.starts_with("const-class") {
             let idx = operand_index(ins, "type@")?;
-            return Some(dex.get_type(idx as TypeId).ok()?.type_descriptor().to_string());
+            return Some(dex.typ(idx as u32)?.to_string());
         }
         // Écriture d'une autre nature : on ne remonte pas plus loin.
         return None;
@@ -323,8 +321,7 @@ pub(crate) fn backtrack_new_instance(
 
 /// Scanne le DEX et renvoie les points d'entrée dynamiques.
 pub fn extract(path: &Path) -> Result<DynEntrypointReport> {
-    let dex = dex::DexReader::from_file(path)
-        .with_context(|| format!("open dex {}", path.display()))?;
+    let dex = DexBin::open(path)?;
 
     let mut report = DynEntrypointReport::default();
 
@@ -339,21 +336,20 @@ pub fn extract(path: &Path) -> Result<DynEntrypointReport> {
                 continue;
             }
         };
-        let class_name = class.jtype().type_descriptor().to_string();
+        let class_name = class.descriptor.to_string();
 
-        for method in class.methods() {
-            let code = match method.code() {
+        for method in &class.methods {
+            let code = match &method.code {
                 Some(c) => c,
                 None => continue,
             };
             let caller = MethodRef {
                 class: class_name.clone(),
-                name: method.name().to_string(),
+                name: method.name.to_string(),
                 descriptor: String::new(),
             };
 
-            let bytes = u16_to_le_bytes(code.insns());
-            let instructions = match dex_bytecode::decode_all(&bytes, 0) {
+            let instructions = match dex_bytecode::decode_all(code.insns, 0) {
                 Ok(i) => i,
                 Err(e) => {
                     tracing::debug!(method = %caller.api(), error = %e, "decode failed");
@@ -361,32 +357,19 @@ pub fn extract(path: &Path) -> Result<DynEntrypointReport> {
                 }
             };
 
-            // Registre portant `this`, quand la méthode n'est pas statique.
-            //
-            // En Dalvik les paramètres occupent les registres HAUTS :
-            // `[registers_size - ins_size, registers_size)`, et `this` est le
-            // premier d'entre eux. Reste à savoir s'il y en a un — le crate
-            // n'expose pas les access flags, mais la largeur des paramètres
-            // déclarés suffit : si `ins_size` dépasse cette largeur d'un mot,
-            // c'est qu'un `this` occupe la place manquante. (`J` et `D` comptent
-            // pour deux mots.)
-            let params_width: u32 = method
-                .params()
-                .iter()
-                .map(|p| match p.type_descriptor().to_string().as_str() {
-                    "J" | "D" => 2u32,
-                    _ => 1u32,
-                })
-                .sum();
-            let regs = code.registers_size() as u32;
-            let ins = code.ins_size() as u32;
-            let this_reg = if ins > params_width && regs >= ins {
-                Some(regs - ins)
-            } else {
-                None
-            };
+            // Registre portant `this`. En Dalvik les paramètres occupent les
+            // registres HAUTS `[registers_size - ins_size, registers_size)` et
+            // `this` est le premier d'entre eux. `ACC_STATIC` dit s'il y en a un.
+            let this_reg = this_register(method.is_static, code.registers_size, code.ins_size);
 
-            scan_method(&dex, &instructions, &caller, this_reg, &assignments, &mut report);
+            scan_method(
+                &dex,
+                &instructions,
+                &caller,
+                this_reg,
+                &assignments,
+                &mut report,
+            );
         }
     }
 
@@ -400,7 +383,7 @@ pub fn extract(path: &Path) -> Result<DynEntrypointReport> {
 
 /// Parcours d'une méthode : à chaque sink, remonte au littéral le plus proche.
 fn scan_method(
-    dex: &dex::Dex<impl AsRef<[u8]>>,
+    dex: &DexBin,
     instructions: &[dex_bytecode::Instruction],
     caller: &MethodRef,
     this_reg: Option<u32>,
@@ -427,7 +410,15 @@ fn scan_method(
             &instructions[i.saturating_sub(MAX_LOOKBACK)..i]
         };
 
-        match backtrack_literal(dex, window, ins, &spec, assignments, this_reg, &caller.class) {
+        match backtrack_literal(
+            dex,
+            window,
+            ins,
+            &spec,
+            assignments,
+            this_reg,
+            &caller.class,
+        ) {
             Ok((class, provenance)) => report.entrypoints.push(DynEntrypoint {
                 class,
                 via,
@@ -455,22 +446,15 @@ fn scan_method(
 }
 
 /// Si l'invoke cible un sink de composant, renvoie son nom de méthode.
-fn sink_name(dex: &dex::Dex<impl AsRef<[u8]>>, ins: &dex_bytecode::Instruction) -> Option<String> {
-    use dex::method::MethodId;
-    use dex::string::StringId;
-
+fn sink_name(dex: &DexBin, ins: &dex_bytecode::Instruction) -> Option<String> {
     let idx = operand_index(ins, "method@")?;
-    let item = dex.get_method_item(idx as MethodId).ok()?;
-    let name = dex.get_string(item.name_idx() as StringId).ok()?.to_string();
+    let item = dex.method_item(idx as u32)?;
+    let name = item.name.to_string();
 
     if COMPONENT_SINKS.contains(&name.as_str()) {
         // `<init>` est trop générique seul : ne le retenir que pour Intent.
-        if name == "<init>" {
-            use dex::jtype::TypeId;
-            let owner = dex.get_type(item.class_idx() as TypeId).ok()?.type_descriptor().to_string();
-            if owner != "Landroid/content/Intent;" {
-                return None;
-            }
+        if name == "<init>" && item.class != "Landroid/content/Intent;" {
+            return None;
         }
         Some(name)
     } else {
@@ -566,6 +550,18 @@ pub(crate) fn registers(ins: &dex_bytecode::Instruction) -> Vec<u32> {
     out
 }
 
+/// Registre portant `this`, ou `None` si la méthode est statique.
+///
+/// Les paramètres occupent les registres hauts `[regs - ins, regs)` et `this`
+/// est le premier. `ins_size == 0` sur une méthode d'instance est malformé :
+/// on refuse plutôt que de rendre un registre hors plage.
+pub(crate) fn this_register(is_static: bool, registers_size: u16, ins_size: u16) -> Option<u32> {
+    if is_static || ins_size == 0 || registers_size < ins_size {
+        return None;
+    }
+    Some((registers_size - ins_size) as u32)
+}
+
 /// Registre de destination d'une instruction d'écriture : le premier `vN`.
 /// ⚠️ N'a de sens QUE si `writes_register(ins)` est vrai.
 pub(crate) fn dest_register(ins: &dex_bytecode::Instruction) -> Option<u32> {
@@ -608,7 +604,7 @@ pub(crate) fn writes_register(ins: &dex_bytecode::Instruction) -> bool {
 ///
 /// `Ok((descripteur, provenance))` ou `Err((raison, registre, mnémonique bloquant))`.
 fn backtrack_literal(
-    dex: &dex::Dex<impl AsRef<[u8]>>,
+    dex: &DexBin,
     window: &[dex_bytecode::Instruction],
     invoke: &dex_bytecode::Instruction,
     spec: &SinkSpec,
@@ -659,12 +655,8 @@ fn backtrack_literal(
                     }
                     // 2) Repli : type DÉCLARÉ du champ — souvent abstrait, donc
                     //    marqué `field~` pour ne jamais être pris pour un fait.
-                    use dex::field::FieldId;
-                    use dex::jtype::TypeId;
-                    if let Ok(item) = dex.get_field_item(idx as FieldId) {
-                        if let Ok(t) = dex.get_type(*item.type_idx() as TypeId) {
-                            return Ok((t.type_descriptor().to_string(), Provenance::FieldType));
-                        }
+                    if let Some(item) = dex.field_item(idx as u32) {
+                        return Ok((item.typ.to_string(), Provenance::FieldType));
                     }
                 }
                 return Err((UnresolvedReason::Field, target, Some(m.to_string())));
@@ -707,28 +699,25 @@ fn backtrack_literal(
 
 /// Lit le littéral porté par une instruction, si son type est accepté.
 fn literal_of(
-    dex: &dex::Dex<impl AsRef<[u8]>>,
+    dex: &DexBin,
     ins: &dex_bytecode::Instruction,
     kinds: &[LiteralKind],
 ) -> Option<(String, Provenance)> {
-    use dex::jtype::TypeId;
-    use dex::string::StringId;
-
     let m = ins.mnemonic();
 
     if kinds.contains(&LiteralKind::NewInstance) && m.starts_with("new-instance") {
         let idx = operand_index(ins, "type@")?;
-        let t = dex.get_type(idx as TypeId).ok()?.type_descriptor().to_string();
+        let t = dex.typ(idx as u32)?.to_string();
         return Some((t, Provenance::NewInstance));
     }
     if kinds.contains(&LiteralKind::ConstClass) && m.starts_with("const-class") {
         let idx = operand_index(ins, "type@")?;
-        let t = dex.get_type(idx as TypeId).ok()?.type_descriptor().to_string();
+        let t = dex.typ(idx as u32)?.to_string();
         return Some((t, Provenance::ConstClass));
     }
     if kinds.contains(&LiteralKind::ConstString) && m.starts_with("const-string") {
         let idx = operand_index(ins, "string@")?;
-        let s = dex.get_string(idx as StringId).ok()?.to_string();
+        let s = dex.string(idx as u32)?.to_string();
         if looks_like_class_name(&s) {
             return Some((to_descriptor(&s), Provenance::ConstString));
         }
@@ -738,11 +727,15 @@ fn literal_of(
 
 /// Extrait l'entier d'un opérande textuel de la forme `<tag>N`.
 /// dex-bytecode formate les opérandes en texte ; même approche que
-/// `dex::invoke_method_index`, à remplacer si l'API expose l'accès structuré.
+/// `parser::dex::invoke_method_index`. L'amont n'expose toujours pas d'accès
+/// structuré à l'index.
 pub(crate) fn operand_index(ins: &dex_bytecode::Instruction, tag: &str) -> Option<u64> {
     let ops = ins.operands();
     let pos = ops.find(tag)? + tag.len();
-    let digits: String = ops[pos..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = ops[pos..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     digits.parse().ok()
 }
 
@@ -753,7 +746,8 @@ fn looks_like_class_name(s: &str) -> bool {
     if !(s.contains('.')
         && !s.contains(' ')
         && !s.contains('/')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '$')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '$')
         && s.split('.').count() >= 2)
     {
         return false;
@@ -767,15 +761,6 @@ fn looks_like_class_name(s: &str) -> bool {
 /// `com.x.Y` -> `Lcom/x/Y;`
 fn to_descriptor(dotted: &str) -> String {
     format!("L{};", dotted.replace('.', "/"))
-}
-
-/// Code units (u16) -> octets little-endian.
-pub(crate) fn u16_to_le_bytes(insns: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(insns.len() * 2);
-    for &u in insns {
-        out.extend_from_slice(&u.to_le_bytes());
-    }
-    out
 }
 
 /// Variante prenant un APK : dézippe les `classes*.dex` dans un tempdir et
@@ -849,7 +834,10 @@ pub fn extract_any(path: &Path) -> Result<DynEntrypointReport> {
 pub fn collect_inputs(dir: &Path, recursive: bool) -> Result<Vec<std::path::PathBuf>> {
     let mut out = Vec::new();
     if recursive {
-        for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        for entry in walkdir::WalkDir::new(dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             let p = entry.path();
             if p.is_file() && sniff(p).is_some() {
                 out.push(p.to_path_buf());
@@ -873,15 +861,33 @@ mod tests {
 
     #[test]
     fn descriptor_conversion() {
-        assert_eq!(to_descriptor("com.cocospy.receivers.SMSReceiver"),
-                   "Lcom/cocospy/receivers/SMSReceiver;");
+        assert_eq!(
+            to_descriptor("com.cocospy.receivers.SMSReceiver"),
+            "Lcom/cocospy/receivers/SMSReceiver;"
+        );
+    }
+
+    #[test]
+    fn this_register_suit_acc_static() {
+        // Méthode d'instance `void f(Object)` : regs=4, ins=2 -> this en v2.
+        assert_eq!(this_register(false, 4, 2), Some(2));
+        // Même forme, mais statique : pas de `this`.
+        assert_eq!(this_register(true, 4, 2), None);
+        // `ins_size == 0` sur une méthode d'instance est malformé.
+        assert_eq!(this_register(false, 4, 0), None);
+        // `ins_size > registers_size` est malformé.
+        assert_eq!(this_register(false, 2, 4), None);
+        // Méthode d'instance sans paramètre : regs=1, ins=1 -> this en v0.
+        assert_eq!(this_register(false, 1, 1), Some(0));
     }
 
     #[test]
     fn class_name_heuristic() {
         assert!(looks_like_class_name("com.cocospy.receivers.SMSReceiver"));
         assert!(!looks_like_class_name("android.intent.action.SCREEN_OFF"));
-        assert!(!looks_like_class_name("android.provider.Telephony.SMS_RECEIVED"));
+        assert!(!looks_like_class_name(
+            "android.provider.Telephony.SMS_RECEIVED"
+        ));
         assert!(!looks_like_class_name("com.cocospy.filldb.finish"));
         assert!(!looks_like_class_name("hello world"));
         assert!(!looks_like_class_name("plugin.apk"));

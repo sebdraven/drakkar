@@ -1,0 +1,44 @@
+name: rust-setup
+description: Toolchain Rust epinglee + cache cargo (registre, depots git, target).
+
+inputs:
+  toolchain:
+    description: Version stable exacte, jamais `stable` flottant.
+    required: true
+  cache-key:
+    description: Discriminant de cache, un par profil de build (fmt, clippy, test, release).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # rustup est preinstalle sur les runners GitHub : pas d'action tierce, donc
+    # pas de runtime Node a surveiller sur cette etape.
+    - name: toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        rustup toolchain install "${{ inputs.toolchain }}" \
+          --profile minimal \
+          --no-self-update
+        rustup component add rustfmt clippy --toolchain "${{ inputs.toolchain }}"
+        rustup default "${{ inputs.toolchain }}"
+        rustc --version --verbose
+        cargo --version
+
+    - name: cache cargo
+      uses: actions/cache@v5
+      with:
+        # registry/src et git/checkouts sont regeneres depuis registry/cache et
+        # git/db : les cacher doublerait le volume pour rien.
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        # Cargo.lock porte le rev exact de dex-parser et dex-bytecode, tous deux
+        # declares sans branche ni rev dans Cargo.toml. Un bump de rev change
+        # le hash, donc change la cle : aucun cache perime ne peut etre servi.
+        # Pas de restore-keys, volontairement : un repli qui ignore le lock
+        # reintroduirait exactement ce risque.
+        key: cargo-${{ runner.os }}-${{ runner.arch }}-rust${{ inputs.toolchain }}-${{ inputs.cache-key }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}

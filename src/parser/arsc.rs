@@ -234,7 +234,9 @@ impl ResourceTable {
     }
 
     pub fn by_type<'a>(&'a self, type_name: &'a str) -> impl Iterator<Item = &'a ResourceEntry> {
-        self.entries.iter().filter(move |e| e.type_name == type_name)
+        self.entries
+            .iter()
+            .filter(move |e| e.type_name == type_name)
     }
 
     pub fn contains(&self, id: u32) -> bool {
@@ -447,9 +449,9 @@ fn parse_package(chunk: &[u8], global: &StringPool, table: &mut ResourceTable) {
             // déclarés, pas par ce parcours ; le typeSpec ne porte que des
             // drapeaux de configuration, dont on ne fait rien.
             RES_STRING_POOL_TYPE | RES_TABLE_TYPE_SPEC_TYPE => {}
-            other => table
-                .anomalies
-                .push(format!("chunk de type {other:#06x} ignoré dans le package {id:#04x}")),
+            other => table.anomalies.push(format!(
+                "chunk de type {other:#06x} ignoré dans le package {id:#04x}"
+            )),
         }
     }
 
@@ -588,7 +590,11 @@ fn parse_entry(chunk: &[u8], at: usize) -> Option<(u32, Option<(u8, u32)>)> {
     }
 
     // `first` est la taille de l'en-tête d'entrée : la `Res_value` la suit.
-    let size = if first as usize >= 8 { first as usize } else { 8 };
+    let size = if first as usize >= 8 {
+        first as usize
+    } else {
+        8
+    };
     let value_at = at.checked_add(size)?;
     let data_type = *chunk.get(value_at + 3)?;
     let data = u32_at(chunk, value_at + 4)?;
@@ -639,10 +645,7 @@ fn complex(data: u32, units: &[&str]) -> String {
 /// défaut » — la seule dont ce module retient les valeurs.
 fn config_is_default(chunk: &[u8], at: usize, header_size: usize) -> bool {
     let size = u32_at(chunk, at).unwrap_or(0) as usize;
-    let end = at
-        .saturating_add(size)
-        .min(header_size)
-        .min(chunk.len());
+    let end = at.saturating_add(size).min(header_size).min(chunk.len());
     let body = at + 4;
     if body >= end {
         // Config réduite à son seul champ de taille : rien n'est qualifié.
@@ -976,7 +979,10 @@ mod tests {
         let e = t.by_id(0x7f11_0228).expect("entrée 0x7f110228");
         assert_eq!(e.type_name, "string");
         assert_eq!(e.name, "please_find_more_details_in_mlite");
-        assert_eq!(e.value.as_deref(), Some("Please, find more details in mLite"));
+        assert_eq!(
+            e.value.as_deref(),
+            Some("Please, find more details in mLite")
+        );
         assert_eq!(e.value_kind, ValueKind::String);
         assert_eq!(t.by_name("please_find_more_details_in_mlite").len(), 1);
     }
@@ -1056,7 +1062,10 @@ mod tests {
         // déborderait d'un u32, elle n'est donc pas proposée.
         assert_eq!(parse_id_candidates("2131886120"), vec![2_131_886_120]);
         assert_eq!(parse_id_candidates("7f110228"), vec![0x7f11_0228]);
-        assert_eq!(parse_id_candidates("12345678"), vec![12_345_678, 0x1234_5678]);
+        assert_eq!(
+            parse_id_candidates("12345678"),
+            vec![12_345_678, 0x1234_5678]
+        );
     }
 
     #[test]

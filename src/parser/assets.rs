@@ -197,7 +197,10 @@ pub fn read_hash_file(path: &Path) -> Result<Vec<String>> {
         if line.is_empty() {
             continue;
         }
-        out.push(normalize_hash(line, &format!("{}:{}", path.display(), n + 1))?);
+        out.push(normalize_hash(
+            line,
+            &format!("{}:{}", path.display(), n + 1),
+        )?);
     }
     Ok(out)
 }
@@ -494,7 +497,10 @@ fn collect_nominal(apk: &Path, opts: &AssetsOptions) -> Result<Collected> {
         // avant d'être écartée. On lit un octet de plus que le plafond pour que
         // le contrôle sur la taille réelle, dans `push_entry`, puisse déclencher.
         let read = match opts.max_size {
-            Some(limit) => zf.by_ref().take(limit.saturating_add(1)).read_to_end(&mut bytes),
+            Some(limit) => zf
+                .by_ref()
+                .take(limit.saturating_add(1))
+                .read_to_end(&mut bytes),
             None => zf.read_to_end(&mut bytes),
         };
         read.with_context(|| format!("lecture {name}"))?;
@@ -854,7 +860,10 @@ pub fn write_all(report: &mut AssetsReport, dir: &Path) -> Result<PathBuf> {
             if let Err(err) = std::fs::create_dir_all(parent) {
                 // Typiquement un `assets/a` fichier et un `assets/a/b` fichier
                 // dans la même archive : le parent existe déjà comme fichier.
-                e.note = Some(format!("non écrit : création de {} — {err}", parent.display()));
+                e.note = Some(format!(
+                    "non écrit : création de {} — {err}",
+                    parent.display()
+                ));
                 continue;
             }
         }
@@ -1348,7 +1357,10 @@ mod tests {
         let r = collect(&apk, &opts).unwrap();
         assert_eq!(r.assets_seen, 3);
         assert_eq!(r.count(), 2);
-        assert!(r.skipped.is_empty(), "un non-retenu par filtre n'est pas un skip");
+        assert!(
+            r.skipped.is_empty(),
+            "un non-retenu par filtre n'est pas un skip"
+        );
 
         // B5 : jeu tronqué par --assets-include -> pas d'empreinte.
         assert!(r.fingerprint.is_none());
@@ -1373,7 +1385,11 @@ mod tests {
         assert_eq!(r.not_evaluated, 1);
         assert!(r.skipped.is_empty(), "non évalué != illisible");
 
-        let big = r.entries.iter().find(|e| e.entry == "assets/big.bin").unwrap();
+        let big = r
+            .entries
+            .iter()
+            .find(|e| e.entry == "assets/big.bin")
+            .unwrap();
         assert!(!big.evaluated);
         assert_eq!(big.sha256, NOT_EVALUATED);
         assert_eq!(big.kind, NOT_EVALUATED);
@@ -1386,7 +1402,11 @@ mod tests {
         );
         assert_eq!(big.size, 4096, "taille déclarée, faute de mesure");
 
-        let small = r.entries.iter().find(|e| e.entry == "assets/small.bin").unwrap();
+        let small = r
+            .entries
+            .iter()
+            .find(|e| e.entry == "assets/small.bin")
+            .unwrap();
         assert!(small.evaluated);
         assert_eq!(small.sha256.len(), 64);
 
@@ -1598,7 +1618,10 @@ mod tests {
         let b = collect(&tampered, &AssetsOptions::default()).unwrap();
         assert_eq!(a.reader, Reader::Nominal);
         assert_eq!(b.reader, Reader::Tolerant);
-        assert_eq!(a.entries[0].sha256, format!("{:x}", Sha256::digest(&payload)));
+        assert_eq!(
+            a.entries[0].sha256,
+            format!("{:x}", Sha256::digest(&payload))
+        );
         assert_eq!(a.entries[0].sha256, b.entries[0].sha256);
         assert_eq!(a.fingerprint, b.fingerprint);
     }
@@ -1641,7 +1664,10 @@ mod tests {
         let r = collect(&apk, &opts).unwrap();
         assert_eq!(r.count(), 1);
         assert_eq!(r.entries[0].entry, "assets/a.bin");
-        assert_eq!(r.entries[0].sha256, ha, "la casse d'entrée est indifférente");
+        assert_eq!(
+            r.entries[0].sha256, ha,
+            "la casse d'entrée est indifférente"
+        );
         assert_eq!(r.hash_filter, Some(HashMode::Keep));
     }
 
@@ -1668,7 +1694,7 @@ mod tests {
         let kept = collect(
             &apk,
             &AssetsOptions {
-                hash_filter: build_hash_filter(&[ha.clone()], None, &[], None).unwrap(),
+                hash_filter: build_hash_filter(std::slice::from_ref(&ha), None, &[], None).unwrap(),
                 ..Default::default()
             },
         )
@@ -1704,7 +1730,8 @@ mod tests {
             &apk,
             &AssetsOptions {
                 max_size: Some(1024),
-                hash_filter: build_hash_filter(&[other.clone()], None, &[], None).unwrap(),
+                hash_filter: build_hash_filter(std::slice::from_ref(&other), None, &[], None)
+                    .unwrap(),
                 ..Default::default()
             },
         )
@@ -1743,7 +1770,10 @@ mod tests {
         ] {
             let err = normalize_hash(&bad, "--assets-hash #1").unwrap_err();
             let msg = format!("{err:#}");
-            assert!(msg.contains("--assets-hash #1"), "la source doit être nommée : {msg}");
+            assert!(
+                msg.contains("--assets-hash #1"),
+                "la source doit être nommée : {msg}"
+            );
             assert!(msg.contains("64"), "{msg}");
         }
     }
@@ -1767,14 +1797,23 @@ mod tests {
         let bad = dir.path().join("casse.txt");
         std::fs::write(&bad, format!("{}\ndeadbeef\n", "a".repeat(64))).unwrap();
         let msg = format!("{:#}", read_hash_file(&bad).unwrap_err());
-        assert!(msg.contains("casse.txt:2"), "ligne fautive non nommée : {msg}");
+        assert!(
+            msg.contains("casse.txt:2"),
+            "ligne fautive non nommée : {msg}"
+        );
     }
 
     /// B2 : les deux sens sont mutuellement exclusifs.
     #[test]
     fn keep_and_exclude_are_mutually_exclusive() {
         let h = "a".repeat(64);
-        let err = build_hash_filter(&[h.clone()], None, &[h], None).unwrap_err();
+        let err = build_hash_filter(
+            std::slice::from_ref(&h),
+            None,
+            std::slice::from_ref(&h),
+            None,
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("mutuellement exclusifs"));
 
         assert!(build_hash_filter(&[], None, &[], None).unwrap().is_none());
@@ -1833,7 +1872,10 @@ mod tests {
         let (_d1, a) = on_disk(&make_apk(&[("assets/big.bin", vec![2u8; 4096])]));
         let ra = collect(
             &a,
-            &AssetsOptions { max_size: Some(64), ..Default::default() },
+            &AssetsOptions {
+                max_size: Some(64),
+                ..Default::default()
+            },
         )
         .unwrap();
         let na = ra.entries[0].note.as_ref().unwrap();
@@ -1857,7 +1899,10 @@ mod tests {
         let (_d2, b) = on_disk(&z);
         let rb = collect(
             &b,
-            &AssetsOptions { max_size: Some(64), ..Default::default() },
+            &AssetsOptions {
+                max_size: Some(64),
+                ..Default::default()
+            },
         )
         .unwrap();
         let e = &rb.entries[0];
@@ -1866,7 +1911,10 @@ mod tests {
         let nb = e.note.as_ref().unwrap();
         assert!(nb.contains("contenu réel au-delà"), "{nb}");
         assert!(nb.contains("DÉCLARÉE"), "{nb}");
-        assert_eq!(e.size, 1, "la taille affichée est bien la déclaration, mensongère");
+        assert_eq!(
+            e.size, 1,
+            "la taille affichée est bien la déclaration, mensongère"
+        );
     }
 
     /// B5, l'invariant central : une empreinte HEXADÉCIMALE ne peut jamais
@@ -1896,12 +1944,18 @@ mod tests {
             (
                 "tronqué par include",
                 &apk,
-                AssetsOptions { include: vec!["www".into()], ..Default::default() },
+                AssetsOptions {
+                    include: vec!["www".into()],
+                    ..Default::default()
+                },
             ),
             (
                 "tronqué par max-size",
                 &apk,
-                AssetsOptions { max_size: Some(1024), ..Default::default() },
+                AssetsOptions {
+                    max_size: Some(1024),
+                    ..Default::default()
+                },
             ),
             (
                 "include ET max-size",
@@ -1915,13 +1969,17 @@ mod tests {
             (
                 "plafond jamais atteint",
                 &apk,
-                AssetsOptions { max_size: Some(1 << 20), ..Default::default() },
+                AssetsOptions {
+                    max_size: Some(1 << 20),
+                    ..Default::default()
+                },
             ),
             (
                 "filtre par hash (sans effet sur l'empreinte)",
                 &apk,
                 AssetsOptions {
-                    hash_filter: build_hash_filter(&[ha.clone()], None, &[], None).unwrap(),
+                    hash_filter: build_hash_filter(std::slice::from_ref(&ha), None, &[], None)
+                        .unwrap(),
                     ..Default::default()
                 },
             ),
@@ -1954,7 +2012,10 @@ mod tests {
                     assert!(f.bytes().all(|b| b.is_ascii_hexdigit()), "{label}");
                     assert_eq!(r.fingerprint_status, FP_COMPLETE, "{label}");
                     assert_eq!(r.grouping_key(), Some(f.as_str()), "{label}");
-                    assert_eq!(r.not_evaluated, 0, "{label} : un jeu complet n'a pas de non-évaluée");
+                    assert_eq!(
+                        r.not_evaluated, 0,
+                        "{label} : un jeu complet n'a pas de non-évaluée"
+                    );
                 }
                 None => {
                     assert!(
@@ -1987,7 +2048,10 @@ mod tests {
         let full = collect(&apk, &AssetsOptions::default()).unwrap();
         let partial = collect(
             &apk,
-            &AssetsOptions { max_size: Some(1024), ..Default::default() },
+            &AssetsOptions {
+                max_size: Some(1024),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -2025,7 +2089,10 @@ mod tests {
         let (_d2, capped) = on_disk(&make_apk(&[("assets/big.bin", vec![2u8; 4096])]));
         let partial = collect(
             &capped,
-            &AssetsOptions { max_size: Some(16), ..Default::default() },
+            &AssetsOptions {
+                max_size: Some(16),
+                ..Default::default()
+            },
         )
         .unwrap();
         let row = fingerprint_tsv_row("ech", &partial);
@@ -2077,7 +2144,11 @@ mod tests {
         for sample in [false, true] {
             for written in [false, true] {
                 for narrow in [false, true] {
-                    let shape = TsvShape { sample, written, narrow };
+                    let shape = TsvShape {
+                        sample,
+                        written,
+                        narrow,
+                    };
                     let who = sample.then_some("s");
                     assert_eq!(
                         tsv_header(shape).split('\t').count(),
@@ -2093,8 +2164,14 @@ mod tests {
         assert!(tsv_row(&e, None, wide).ends_with("8.00"));
 
         // Forme étroite du pivot : chemin puis sha256 COMPLET, rien d'autre.
-        let narrow = TsvShape { narrow: true, ..Default::default() };
+        let narrow = TsvShape {
+            narrow: true,
+            ..Default::default()
+        };
         assert_eq!(tsv_header(narrow), "chemin\tsha256");
-        assert_eq!(tsv_row(&e, None, narrow), format!("assets/p.bin\t{}", "a".repeat(64)));
+        assert_eq!(
+            tsv_row(&e, None, narrow),
+            format!("assets/p.bin\t{}", "a".repeat(64))
+        );
     }
 }

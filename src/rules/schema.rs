@@ -44,7 +44,10 @@ pub enum Feature {
     And(Vec<Feature>),
     Or(Vec<Feature>),
     Not(Box<Feature>),
-    Count { feature: Box<Feature>, min: usize },
+    Count {
+        feature: Box<Feature>,
+        min: usize,
+    },
     Sequence(Vec<Feature>),
     /// Co-atteignabilité depuis un pivot commun : `first` ET `second` (deux API)
     /// sont atteintes depuis un même nœud du CFG, qualifié par les trois garde-fous.
@@ -112,9 +115,7 @@ impl<'de> Deserialize<'de> for Feature {
                 .as_sequence()
                 .ok_or_else(|| D::Error::custom(format!("`{key}` expects a list")))?;
             seq.iter()
-                .map(|item| {
-                    Feature::deserialize(item.clone()).map_err(D::Error::custom)
-                })
+                .map(|item| Feature::deserialize(item.clone()).map_err(D::Error::custom))
                 .collect()
         };
 

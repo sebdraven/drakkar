@@ -128,10 +128,26 @@ pub struct MatrixReport {
 // ── Extraction ───────────────────────────────────────────────────────────────
 
 const LIB_PREFIXES: &[&str] = &[
-    "Landroid/", "Landroidx/", "Ljava/", "Ljavax/", "Lkotlin/", "Lkotlinx/",
-    "Ldalvik/", "Lrx/", "Lio/reactivex/", "Lokhttp3/", "Lokio/", "Lretrofit2/",
-    "Lcom/google/", "Lcom/alibaba/", "Lcom/umeng/", "Lorg/apache/", "Lorg/json/",
-    "Lorg/xmlpull/", "Luk/co/chrisjenx/", "Lgov/nist/",
+    "Landroid/",
+    "Landroidx/",
+    "Ljava/",
+    "Ljavax/",
+    "Lkotlin/",
+    "Lkotlinx/",
+    "Ldalvik/",
+    "Lrx/",
+    "Lio/reactivex/",
+    "Lokhttp3/",
+    "Lokio/",
+    "Lretrofit2/",
+    "Lcom/google/",
+    "Lcom/alibaba/",
+    "Lcom/umeng/",
+    "Lorg/apache/",
+    "Lorg/json/",
+    "Lorg/xmlpull/",
+    "Luk/co/chrisjenx/",
+    "Lgov/nist/",
 ];
 
 fn is_application_class(descriptor: &str) -> bool {
@@ -152,7 +168,7 @@ fn load(path: &Path, opts: &MatrixOptions) -> Result<Sample> {
     let mut methods = 0usize;
 
     for dp in &dex_paths {
-        let dex = match dex::DexReader::from_file(dp) {
+        let dex = match crate::parser::dex_facade::DexBin::open(dp) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(sample = %name, error = %e, "dex illisible, ignoré");
@@ -161,18 +177,14 @@ fn load(path: &Path, opts: &MatrixOptions) -> Result<Sample> {
         };
         for class in dex.classes() {
             let Ok(class) = class else { continue };
-            let descriptor = normalize(
-                &class.jtype().type_descriptor().to_string(),
-                &opts.normalize,
-            );
+            let descriptor = normalize(class.descriptor, &opts.normalize);
             if !is_application_class(&descriptor) {
                 continue;
             }
             classes += 1;
-            for method in class.methods() {
-                let Some(code) = method.code() else { continue };
-                let bytes = u16_to_le_bytes(code.insns());
-                let Ok(instructions) = dex_bytecode::decode_all(&bytes, 0) else {
+            for method in &class.methods {
+                let Some(code) = &method.code else { continue };
+                let Ok(instructions) = dex_bytecode::decode_all(code.insns, 0) else {
                     continue;
                 };
                 let mut h = DefaultHasher::new();
@@ -331,6 +343,9 @@ fn single_linkage(sim: &[Vec<f64>], samples: &[Sample], threshold: f64) -> Vec<V
         parent[x]
     }
 
+    // `sim` est un paramètre : rien ne garantit que sa taille vaut `n`. Itérer
+    // dessus au lieu de `0..n` remplacerait un panic par un regroupement faux.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         for j in (i + 1)..n {
             if sim[i][j] >= threshold {
@@ -343,9 +358,9 @@ fn single_linkage(sim: &[Vec<f64>], samples: &[Sample], threshold: f64) -> Vec<V
     }
 
     let mut buckets: std::collections::HashMap<usize, Vec<String>> = Default::default();
-    for i in 0..n {
+    for (i, s) in samples.iter().enumerate() {
         let r = find(&mut parent, i);
-        buckets.entry(r).or_default().push(samples[i].name.clone());
+        buckets.entry(r).or_default().push(s.name.clone());
     }
     let mut groups: Vec<Vec<String>> = buckets.into_values().collect();
     for g in groups.iter_mut() {
@@ -363,8 +378,8 @@ fn collect_dex_paths(input: &Path) -> Result<(Vec<PathBuf>, Option<tempfile::Tem
 
     let mut magic = [0u8; 4];
     {
-        let mut f = std::fs::File::open(input)
-            .with_context(|| format!("open {}", input.display()))?;
+        let mut f =
+            std::fs::File::open(input).with_context(|| format!("open {}", input.display()))?;
         if f.read(&mut magic)? < 4 {
             bail!("{} trop court", input.display());
         }
@@ -397,30 +412,34 @@ fn collect_dex_paths(input: &Path) -> Result<(Vec<PathBuf>, Option<tempfile::Tem
     bail!("{} n'est ni un DEX ni un APK", input.display())
 }
 
-fn u16_to_le_bytes(insns: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(insns.len() * 2);
-    for &u in insns {
-        out.extend_from_slice(&u.to_le_bytes());
-    }
-    out
-}
-
 // ── Rendu ────────────────────────────────────────────────────────────────────
 
 pub fn render(r: &MatrixReport, opts: &MatrixOptions) -> String {
     let n = r.samples.len();
     let mut s = String::new();
 
-    s.push_str(&format!("== Matrice de similarité — métrique « {} » ==\n\n", r.metric.label()));
+    s.push_str(&format!(
+        "== Matrice de similarité — métrique « {} » ==\n\n",
+        r.metric.label()
+    ));
     s.push_str(&format!("Répertoire  {}\n", r.dir));
-    s.push_str(&format!("Échantillons {}   paires {}   seuil de groupe {:.2}\n\n", n, r.pairs.len(), r.threshold));
+    s.push_str(&format!(
+        "Échantillons {}   paires {}   seuil de groupe {:.2}\n\n",
+        n,
+        r.pairs.len(),
+        r.threshold
+    ));
 
     // ── Légende des indices ──
     s.push_str("Échantillons :\n");
     for (i, si) in r.samples.iter().enumerate() {
         s.push_str(&format!(
             "  {:>2}  {:<28} {:>5} classes  {:>6} méthodes  {:>6} chaînes\n",
-            i + 1, si.name, si.classes, si.methods, si.strings
+            i + 1,
+            si.name,
+            si.classes,
+            si.methods,
+            si.strings
         ));
     }
 
@@ -452,21 +471,30 @@ pub fn render(r: &MatrixReport, opts: &MatrixOptions) -> String {
         s.push_str(&format!("{:>4}", i + 1));
     }
     s.push('\n');
-    for i in 0..n {
+    for (i, row) in m.iter().enumerate() {
         s.push_str(&format!("  {:>2} ", i + 1));
-        for j in 0..n {
+        for (j, v) in row.iter().enumerate() {
             if i == j {
                 s.push_str("   .");
             } else {
-                s.push_str(&format!("{:>4.0}", m[i][j] * 100.0));
+                s.push_str(&format!("{:>4.0}", v * 100.0));
             }
         }
         s.push('\n');
     }
 
     // ── Classement des paires ──
-    let shown = if opts.top == 0 { r.pairs.len() } else { opts.top.min(r.pairs.len()) };
-    s.push_str(&format!("\nPaires, {} décroissant ({} sur {}) :\n", r.metric.label(), shown, r.pairs.len()));
+    let shown = if opts.top == 0 {
+        r.pairs.len()
+    } else {
+        opts.top.min(r.pairs.len())
+    };
+    s.push_str(&format!(
+        "\nPaires, {} décroissant ({} sur {}) :\n",
+        r.metric.label(),
+        shown,
+        r.pairs.len()
+    ));
     s.push_str(&format!(
         "  {:<26} {:<26} {:>8} {:>8} {:>10}\n",
         "A", "B", "opcodes", "chaînes", "div. str."
@@ -474,21 +502,30 @@ pub fn render(r: &MatrixReport, opts: &MatrixOptions) -> String {
     for p in r.pairs.iter().take(shown) {
         s.push_str(&format!(
             "  {:<26} {:<26} {:>8.4} {:>8.4} {:>10}\n",
-            truncate(&p.a, 26), truncate(&p.b, 26),
-            p.jaccard_opcodes, p.jaccard_strings, p.divergent_strings
+            truncate(&p.a, 26),
+            truncate(&p.b, 26),
+            p.jaccard_opcodes,
+            p.jaccard_strings,
+            p.divergent_strings
         ));
     }
 
     // ── Groupes ──
     s.push_str(&format!(
         "\nGroupes (lien simple, {} ≥ {:.2}) :\n",
-        r.metric.label(), r.threshold
+        r.metric.label(),
+        r.threshold
     ));
     for (k, g) in r.groups.iter().enumerate() {
         if g.len() == 1 {
             s.push_str(&format!("  [{}] isolé : {}\n", k + 1, g[0]));
         } else {
-            s.push_str(&format!("  [{}] {} membres : {}\n", k + 1, g.len(), g.join(", ")));
+            s.push_str(&format!(
+                "  [{}] {} membres : {}\n",
+                k + 1,
+                g.len(),
+                g.join(", ")
+            ));
         }
     }
 
@@ -506,7 +543,10 @@ fn truncate(s: &str, max: usize) -> String {
     if n <= max {
         return s.to_string();
     }
-    format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+    format!(
+        "{}…",
+        s.chars().take(max.saturating_sub(1)).collect::<String>()
+    )
 }
 
 /// Légende (`--diff-matrix DIR --legend`).
