@@ -540,7 +540,10 @@ mod tests {
     fn nom_simple_des_annotations_retrofit() {
         assert_eq!(http_name("Lretrofit2/http/GET;"), Some("GET"));
         assert_eq!(http_name("Lretrofit2/http/Path;"), Some("Path"));
-        assert_eq!(http_name("Lcom/google/gson/annotations/SerializedName;"), None);
+        assert_eq!(
+            http_name("Lcom/google/gson/annotations/SerializedName;"),
+            None
+        );
         assert_eq!(http_name("Lkotlin/Metadata;"), None);
         // Un paquet plus profond sous retrofit2/http n'est pas une annotation.
         assert_eq!(http_name("Lretrofit2/http/sub/GET;"), None);
@@ -588,19 +591,28 @@ mod tests {
     #[test]
     fn route_vide_n_est_pas_un_gabarit() {
         // `@GET("")` suivi d'un `@Url` : le verbe est là, la route ne l'est pas.
-        let a = annot("Lretrofit2/http/GET;", vec![("value", DexValue::Str(String::new()))]);
+        let a = annot(
+            "Lretrofit2/http/GET;",
+            vec![("value", DexValue::Str(String::new()))],
+        );
         assert_eq!(verb_of(&a), Some(("GET".into(), None)));
     }
 
     #[test]
     fn annotation_de_parametre_n_est_pas_un_verbe() {
-        let a = annot("Lretrofit2/http/Path;", vec![("value", DexValue::Str("userId".into()))]);
+        let a = annot(
+            "Lretrofit2/http/Path;",
+            vec![("value", DexValue::Str("userId".into()))],
+        );
         assert_eq!(verb_of(&a), None);
     }
 
     #[test]
     fn valeur_imbriquee_sort_opaque() {
-        assert_eq!(render_value(&DexValue::Opaque("annotation")), "<annotation>");
+        assert_eq!(
+            render_value(&DexValue::Opaque("annotation")),
+            "<annotation>"
+        );
     }
 
     #[test]
