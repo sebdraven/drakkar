@@ -1000,6 +1000,7 @@ est racine — ne pas comparer à une mesure `manifest`)",
             println!("{}", parser::diff_explain::legend());
             return Ok(());
         }
+        check_json_dest(cli.format, cli.json_out.as_deref())?;
 
         let report = parser::diff_explain::run(&pair[0], &pair[1], &opts)?;
         if cli.format.wants_text() {
@@ -1052,6 +1053,12 @@ est racine — ne pas comparer à une mesure `manifest`)",
             println!("{}", parser::disasm::legend());
             return Ok(());
         }
+        reject_format(
+            "--disasm",
+            cli.format,
+            "pour une comparaison structurée, utiliser --diff-explain (opérandes résolues) \
+             ou --diff-dex (empreintes d'opcodes), qui ont tous deux --format json",
+        )?;
         let Some(input) = &cli.apk else {
             bail!("--disasm requiert un APK ou un DEX en argument (mode single)");
         };
