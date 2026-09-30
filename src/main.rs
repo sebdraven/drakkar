@@ -2468,7 +2468,7 @@ mod tests {
         }
     }
 
-    // --- #10 : un mode sans JSON refuse `--format` au lieu de l'ignorer ---
+    // --- #10, #12 : un mode sans JSON refuse `--format` au lieu de l'ignorer ---
 
     #[test]
     fn a_text_only_mode_accepts_only_text() {
@@ -2489,5 +2489,21 @@ mod tests {
         assert!(message.contains("--disasm"), "{message}");
         assert!(message.contains("--format text"), "{message}");
         assert!(message.contains("utiliser --diff-explain"), "{message}");
+    }
+
+    // --- #13 : le pipeline par défaut refuse ce qu'il ne sait pas rendre ---
+
+    #[test]
+    fn the_default_pipeline_refuses_both_and_csv() {
+        assert!(reject_non_json_format(Format::Both).is_err());
+        assert!(reject_non_json_format(Format::Csv).is_err());
+    }
+
+    /// `text` doit passer : il est indistinguable du défaut global, donc le
+    /// refuser rejetterait `drakkar sample.apk`, qui n'a pas passé --format.
+    #[test]
+    fn the_default_pipeline_still_accepts_the_global_default() {
+        assert!(reject_non_json_format(Format::Text).is_ok());
+        assert!(reject_non_json_format(Format::Json).is_ok());
     }
 }
