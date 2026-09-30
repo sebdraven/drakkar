@@ -529,8 +529,40 @@ fn strategy_for(sink: &str) -> SinkSpec {
 /// Extrait la liste des registres `vN` d'une instruction, dans l'ordre.
 /// Les marqueurs `type@`, `method@`, `string@` ne contiennent pas de `v` suivi
 /// de chiffres, ils ne polluent donc pas l'extraction.
+///
+/// ⚠️ Les formes `/range` sont rendues par `dex-bytecode` comme
+/// `v{lo} ... v{hi}` (formats `3rc`, `5rc`) ou `v{lo} .. v{hi}` (format `4rcc`) :
+/// le balayage n'y voit que les deux BORNES. Elles sont développées en plage,
+/// sans quoi tout appelant qui indexe la liste pour désigner l'argument *n* lit
+/// le mauvais registre — ou n'en lit aucun et croit avoir affaire à une autre
+/// surcharge.
+///
+/// Un `/range` à un seul registre est rendu SANS marqueur par `3rc` et `5rc` :
+/// le balayage y est déjà correct, et la sortie reste inchangée.
 pub(crate) fn registers(ins: &dex_bytecode::Instruction) -> Vec<u32> {
-    let ops = ins.operands();
+    registers_of(ins.operands())
+}
+
+fn registers_of(ops: &str) -> Vec<u32> {
+    let scanned = scan_registers(ops);
+    if !has_range_marker(ops) {
+        return scanned;
+    }
+    match (scanned.first().copied(), scanned.last().copied()) {
+        (Some(lo), Some(hi)) if lo <= hi => (lo..=hi).collect(),
+        // Borne haute décroissante : `dex-bytecode` la calcule par
+        // `saturating_sub(1)`, un compte nul la fait donc passer sous `lo`.
+        _ => Vec::new(),
+    }
+}
+
+/// Le rendu porte-t-il un marqueur de plage ? Les deux graphies diffèrent :
+/// `3rc` et `5rc` écrivent trois points, `4rcc` en écrit deux.
+fn has_range_marker(ops: &str) -> bool {
+    ops.contains(" ... ") || ops.contains(" .. ")
+}
+
+fn scan_registers(ops: &str) -> Vec<u32> {
     let bytes: Vec<char> = ops.chars().collect();
     let mut out = Vec::new();
     let mut i = 0;
