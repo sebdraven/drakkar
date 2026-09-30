@@ -1000,6 +1000,7 @@ est racine — ne pas comparer à une mesure `manifest`)",
             println!("{}", parser::diff_explain::legend());
             return Ok(());
         }
+        check_json_dest(cli.format, cli.json_out.as_deref())?;
 
         let report = parser::diff_explain::run(&pair[0], &pair[1], &opts)?;
         if cli.format.wants_text() {
@@ -1052,6 +1053,12 @@ est racine — ne pas comparer à une mesure `manifest`)",
             println!("{}", parser::disasm::legend());
             return Ok(());
         }
+        reject_format(
+            "--disasm",
+            cli.format,
+            "pour une comparaison structurée, utiliser --diff-explain (opérandes résolues) \
+             ou --diff-dex (empreintes d'opcodes), qui ont tous deux --format json",
+        )?;
         let Some(input) = &cli.apk else {
             bail!("--disasm requiert un APK ou un DEX en argument (mode single)");
         };
@@ -1445,6 +1452,19 @@ fn bulk_options(cli: &Cli) -> bulk::BulkOptions {
 fn check_json_dest(format: Format, dest: Option<&std::path::Path>) -> Result<()> {
     if format == Format::Both && dest.is_none() {
         bail!("--format both requiert --json-out <FILE> (le tableau va sur stdout)");
+    }
+    Ok(())
+}
+
+/// Refus explicite de `--format` pour un mode dont la seule sortie est du texte.
+/// Un format accepté puis ignoré produit un `.json` qui n'en est pas un, sans
+/// que rien ne le signale. `instead` dit par quoi passer.
+fn reject_format(mode: &str, format: Format, instead: &str) -> Result<()> {
+    if format != Format::Text {
+        bail!(
+            "{mode} n'a pas de sortie JSON : sa sortie est du texte, faite pour être lue et \
+             diffée telle quelle. Retirer --format, ou passer --format text ; {instead}"
+        );
     }
     Ok(())
 }
@@ -2422,4 +2442,52 @@ fn truncate(s: &str, max: usize) -> String {
     }
     let skip = n - (max - 1);
     format!("…{}", s.chars().skip(skip).collect::<String>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // --- #9 : `--format both` exige une destination fichier ---
+
+    #[test]
+    fn both_without_json_out_is_refused() {
+        assert!(check_json_dest(Format::Both, None).is_err());
+    }
+
+    #[test]
+    fn both_with_json_out_is_accepted() {
+        assert!(check_json_dest(Format::Both, Some(Path::new("/tmp/report.json"))).is_ok());
+    }
+
+    #[test]
+    fn the_other_formats_need_no_destination() {
+        for format in [Format::Text, Format::Json, Format::Csv] {
+            assert!(check_json_dest(format, None).is_ok(), "{format:?}");
+        }
+    }
+
+    // --- #10 : un mode sans JSON refuse `--format` au lieu de l'ignorer ---
+
+    #[test]
+    fn a_text_only_mode_accepts_only_text() {
+        assert!(reject_format("--disasm", Format::Text, "voir --diff-dex").is_ok());
+        for format in [Format::Json, Format::Both, Format::Csv] {
+            assert!(
+                reject_format("--disasm", format, "voir --diff-dex").is_err(),
+                "{format:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_mode_and_what_to_use_instead() {
+        let message = reject_format("--disasm", Format::Json, "utiliser --diff-explain")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("--disasm"), "{message}");
+        assert!(message.contains("--format text"), "{message}");
+        assert!(message.contains("utiliser --diff-explain"), "{message}");
+    }
 }
