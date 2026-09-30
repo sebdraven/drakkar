@@ -117,7 +117,10 @@ pub struct Annotation {
 
 impl Annotation {
     pub fn element(&self, name: &str) -> Option<&DexValue> {
-        self.elements.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+        self.elements
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v)
     }
 }
 
@@ -459,8 +462,12 @@ impl DexBin {
             .map(|(idx, set)| {
                 let item = self.field_item(*idx);
                 FieldAnnotations {
-                    name: item.as_ref().map_or_else(String::new, |f| f.name.to_string()),
-                    typ: item.as_ref().map_or_else(String::new, |f| f.typ.to_string()),
+                    name: item
+                        .as_ref()
+                        .map_or_else(String::new, |f| f.name.to_string()),
+                    typ: item
+                        .as_ref()
+                        .map_or_else(String::new, |f| f.typ.to_string()),
                     annotations: self.annotation_set(set),
                 }
             })
