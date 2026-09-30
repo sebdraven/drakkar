@@ -1456,6 +1456,19 @@ fn check_json_dest(format: Format, dest: Option<&std::path::Path>) -> Result<()>
     Ok(())
 }
 
+/// Refus explicite de `--format` pour un mode dont la seule sortie est du texte.
+/// Un format accepté puis ignoré produit un `.json` qui n'en est pas un, sans
+/// que rien ne le signale. `instead` dit par quoi passer.
+fn reject_format(mode: &str, format: Format, instead: &str) -> Result<()> {
+    if format != Format::Text {
+        bail!(
+            "{mode} n'a pas de sortie JSON : sa sortie est du texte, faite pour être lue et \
+             diffée telle quelle. Retirer --format, ou passer --format text ; {instead}"
+        );
+    }
+    Ok(())
+}
+
 /// Sérialise un rapport en JSON : vers `dest` si fourni, sinon sur stdout.
 fn emit_json<T: serde::Serialize>(report: &T, dest: Option<&std::path::Path>) -> Result<()> {
     let json = serde_json::to_string_pretty(report)?;
