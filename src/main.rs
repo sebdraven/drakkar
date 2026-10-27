@@ -1789,7 +1789,8 @@ fn run_bundle(input: &std::path::Path, out: &std::path::Path, cli: &Cli) -> Resu
                 root.display()
             );
         }
-        std::fs::remove_dir_all(&root).with_context(|| format!("suppression {}", root.display()))?;
+        std::fs::remove_dir_all(&root)
+            .with_context(|| format!("suppression {}", root.display()))?;
     }
     let classes_dir = root.join("classes");
     std::fs::create_dir_all(&classes_dir)

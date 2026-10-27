@@ -431,7 +431,9 @@ pub fn render(r: &DecompileReport) -> String {
         s.push_str(&format!("// == {} — {} ==\n", c.descriptor, c.dex));
         if let Some(why) = &c.fallback {
             let why = why.replace(['\n', '\r'], " ");
-            s.push_str(&format!("// repli méthode par méthode — decompile_class : {why}\n"));
+            s.push_str(&format!(
+                "// repli méthode par méthode — decompile_class : {why}\n"
+            ));
         }
         s.push_str(&c.java);
         if !c.java.is_empty() && !c.java.ends_with('\n') {
@@ -925,7 +927,9 @@ fn static_descriptor(
     name: &str,
 ) -> Result<String, String> {
     let (Some(file), Ok(fields)) = (file, fields) else {
-        return Err(format!("{name} : classe non lue par dex-decompiler, type inconnu"));
+        return Err(format!(
+            "{name} : classe non lue par dex-decompiler, type inconnu"
+        ));
     };
     let idx = fields
         .get(k)
@@ -935,7 +939,9 @@ fn static_descriptor(
         .map_err(|e| format!("{name} : {e}"))?;
     if info.name != name {
         let found = info.name;
-        return Err(format!("{name} : appariement positionnel incohérent ({found})"));
+        return Err(format!(
+            "{name} : appariement positionnel incohérent ({found})"
+        ));
     }
     Ok(format!("{}->{}:{}", info.class, info.name, info.typ))
 }
@@ -978,8 +984,8 @@ fn partial_markers(java: &str) -> Vec<String> {
             let after = &rest[pos + 3..];
             let Some(end) = after.find(" */") else { break };
             let inner = &after[..end];
-            let opcode = rest[..pos].ends_with("; ")
-                && dex_bytecode::opcode_for_mnemonic(inner).is_some();
+            let opcode =
+                rest[..pos].ends_with("; ") && dex_bytecode::opcode_for_mnemonic(inner).is_some();
             if opcode || inner.starts_with("fill-array-data ") {
                 push(&rest[pos..pos + end + 6]);
             }
