@@ -203,7 +203,7 @@ fn collect_from_dex(path: &Path, opts: &DisasmOptions, out: &mut DisasmReport) -
 }
 
 /// Le descripteur correspond-il à l'un des motifs ? Vide = tout.
-fn selected(descriptor: &str, patterns: &[String]) -> bool {
+pub(crate) fn selected(descriptor: &str, patterns: &[String]) -> bool {
     if patterns.is_empty() {
         return true;
     }

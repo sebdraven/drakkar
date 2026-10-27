@@ -150,7 +150,7 @@ const LIB_PREFIXES: &[&str] = &[
     "Lgov/nist/",
 ];
 
-fn is_application_class(descriptor: &str) -> bool {
+pub(crate) fn is_application_class(descriptor: &str) -> bool {
     !LIB_PREFIXES.iter().any(|p| descriptor.starts_with(p))
 }
 
