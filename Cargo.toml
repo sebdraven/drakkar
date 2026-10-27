@@ -21,7 +21,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # compatible en aval avec l'AGPL-3.0-or-later de Drakkar. Le paquet vit dans le
 # sous-répertoire dexparser-rs/ du dépôt, qui n'a pas de Cargo.toml à sa racine.
 # Consommé UNIQUEMENT par parser::dex_facade.
-dex-parser = { git = "https://github.com/androguard/dex-parser" }
+#
+# ⚠️ `branch = "main"` : c'est la forme exacte que déclare dex-decompiler.
+# Toute autre forme donnerait un SourceId distinct, donc DEUX paquets
+# dex-parser dans le graphe et deux `DexFile` non interchangeables.
+dex-parser = { git = "https://github.com/androguard/dex-parser", branch = "main" }
 
 # Lecture de l'archive APK (zip) pour extraire classes*.dex et lib/*/*.so
 zip = "2"
@@ -60,11 +64,16 @@ md-5 = "0.10"
 # Décodage bytecode Dalvik (invoke-* + CFG intra-méthode). Repo Androguard,
 # pas encore de release -> dépendance git.
 #
-# ⚠️ Déclaration SANS `branch` ni `rev` : dex-parser déclare le même dépôt sans
-# branche (GitReference::DefaultBranch). Toute autre forme ici donnerait un
-# SourceId distinct, donc DEUX paquets dex-bytecode v0.0.1 dans le graphe, donc
-# deux `Instruction` non interchangeables. Rev épinglé par Cargo.lock.
+# ⚠️ Déclaration SANS `branch` ni `rev` : dex-parser et dex-decompiler déclarent
+# le même dépôt sans branche (GitReference::DefaultBranch). Toute autre forme
+# ici donnerait un SourceId distinct, donc DEUX paquets dex-bytecode v0.0.1 dans
+# le graphe, donc deux `Instruction` non interchangeables. Rev épinglé par
+# Cargo.lock.
 dex-bytecode = { git = "https://github.com/androguard/dex-bytecode" }
+
+# Décompilation Java (--decompile, --bundle). Repo Androguard, Apache-2.0.
+# Consommé UNIQUEMENT par parser::decompile.
+dex-decompiler = { git = "https://github.com/androguard/dex-decompiler", rev = "f7fa4a4853d957ebc3c54355d128a3835ef5ae22" }
 
 # LIEF: réservé au parsing ELF natif (lib/*/*.so). Build C++ lourd, activé à la
 # demande -> `cargo build --features lief-backend`.

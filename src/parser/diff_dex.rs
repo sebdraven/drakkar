@@ -492,6 +492,15 @@ fn is_application_class(descriptor: &str, opts: &DiffOptions) -> bool {
     !LIB_PREFIXES.iter().any(|p| descriptor.starts_with(p))
 }
 
+/// Empreinte de méthode = hash de la séquence de mnémoniques seuls.
+pub(crate) fn opcode_fingerprint(instructions: &[dex_bytecode::Instruction]) -> u64 {
+    let mut h = DefaultHasher::new();
+    for ins in instructions {
+        ins.mnemonic().hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Parse un DEX et accumule les ClassPrint des classes applicatives.
 fn collect_from_dex(
     path: &Path,
@@ -554,12 +563,7 @@ fn collect_from_dex(
                     continue;
                 }
             };
-            // Empreinte de méthode = hash de la séquence de mnémoniques seuls.
-            let mut h = DefaultHasher::new();
-            for ins in &instructions {
-                ins.mnemonic().hash(&mut h);
-            }
-            method_seq.push(h.finish());
+            method_seq.push(opcode_fingerprint(&instructions));
         }
 
         // Classe sans aucune méthode à code : on l'ignore (interfaces vides,

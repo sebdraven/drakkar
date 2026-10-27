@@ -17,6 +17,7 @@ pub mod assets;
 pub mod axml;
 pub mod cert;
 pub mod dating;
+pub mod decompile;
 pub mod dex;
 pub mod dex_facade;
 pub mod dex_strings;
