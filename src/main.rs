@@ -59,11 +59,12 @@ struct Cli {
     #[arg(long)]
     recursive: bool,
 
-    /// Ré-analyse même si le JSON de sortie existe déjà (mode bulk).
+    /// Ré-analyse même si le JSON de sortie existe déjà (mode bulk). Avec
+    /// --bundle : remplace le répertoire OUT/<sha256> existant.
     #[arg(long)]
     overwrite: bool,
 
-    /// Threads rayon en mode bulk (0 = auto, tous les cœurs).
+    /// Threads rayon en mode bulk et --bundle (0 = auto, tous les cœurs).
     #[arg(short = 'j', long, default_value_t = 0)]
     jobs: usize,
 
@@ -339,6 +340,23 @@ struct Cli {
     #[arg(long, value_name = "DEPUIS=VERS", num_args = 1..)]
     disasm_normalize: Vec<String>,
 
+    /// Décompile en Java (dex-decompiler) les classes dont le descripteur
+    /// Dalvik contient l'un des motifs. Même sélection que --disasm :
+    /// sous-chaîne insensible à la casse, répétable, sans motif = toutes les
+    /// classes. Accepte un APK ou un DEX brut, reconnu au contenu. Java sur
+    /// stdout, puis sort.
+    #[arg(long, value_name = "MOTIF", num_args = 0..)]
+    decompile: Option<Vec<String>>,
+
+    /// Écrit OUT/<sha256 de l'entrée>/ : manifeste, signature, datation,
+    /// règles, chaînes, points d'entrée dynamiques, et chaque classe
+    /// désassemblée et décompilée. Accepte un APK ou un DEX brut, reconnu au
+    /// contenu. Mode single : `drakkar <APK> --bundle <OUT>`. Refuse un
+    /// répertoire existant sans --overwrite. --bundle --legend définit chaque
+    /// fichier et chaque champ.
+    #[arg(long, value_name = "OUT", num_args = 0..=1, conflicts_with = "bulk")]
+    bundle: Option<Option<PathBuf>>,
+
     /// Diff EXPLIQUÉ de deux DEX (ou APK), en mémoire : compare les opérandes
     /// RÉSOLUES des méthodes de même empreinte d'opcodes, index par index, et
     /// catégorise chaque divergence (chaîne / cible de méthode / type / champ
@@ -437,7 +455,8 @@ struct Cli {
     json_out: Option<PathBuf>,
 
     /// Affiche la légende des étiquettes et règles de dérivation, puis sort.
-    /// Se combine avec --manifest, --cert, --dating ou --enrich.
+    /// Se combine avec --manifest, --cert, --dating, --enrich, --decompile ou
+    /// --bundle.
     #[arg(long)]
     legend: bool,
 
@@ -543,7 +562,7 @@ fn main() -> Result<()> {
         // Traitement séquentiel : la sortie est un flux TSV ordonné, destiné à
         // être filtré (`awk`, `sort`). Du parallélisme entrelacerait les lignes
         // pour un gain négligeable sur un corpus de quelques dizaines d'APK.
-        println!("sample\torigine\tclasse\tsink\toffset\tappelant\tdetail");
+        println!("{DYN_ENTRYPOINTS_HEADER}");
         for apk in &apks {
             let sample = apk
                 .file_stem()
@@ -567,31 +586,7 @@ fn main() -> Result<()> {
                 }
             };
 
-            for e in &report.entrypoints {
-                println!(
-                    "{}\t{}\t{}\t{}\t+{}\t{}\t",
-                    sample,
-                    e.provenance.as_str(),
-                    e.class,
-                    e.via,
-                    e.site,
-                    e.caller.api()
-                );
-            }
-            for u in &report.unresolved {
-                println!(
-                    "{}\t?\t\t{}\t+{}\t{}\t{} {} {}",
-                    sample,
-                    u.via,
-                    u.site,
-                    u.caller.api(),
-                    u.reason.as_str(),
-                    u.target_reg
-                        .map(|r| format!("v{r}"))
-                        .unwrap_or_else(|| "-".into()),
-                    u.blocking_insn.as_deref().unwrap_or("-")
-                );
-            }
+            print!("{}", dyn_entrypoints_tsv(&sample, &report));
             eprintln!(
                 "[OK]    {sample} — {} resolus ({} classes distinctes), {} non resolus",
                 report.entrypoints.len(),
@@ -1232,6 +1227,60 @@ est racine — ne pas comparer à une mesure `manifest`)",
         return Ok(());
     }
 
+    // Sortie rapide : Java des classes sélectionnées, même sélection que
+    // --disasm. Ni catalogue MITRE ni moteur de règles.
+    if let Some(patterns) = &cli.decompile {
+        if cli.legend {
+            println!("{}", parser::decompile::legend());
+            return Ok(());
+        }
+        reject_format(
+            "--decompile",
+            cli.format,
+            "le Java est du texte ; pour une sortie structurée par méthode, utiliser \
+             --bundle <OUT>",
+        )?;
+        let Some(input) = &cli.apk else {
+            bail!("--decompile requiert un APK ou un DEX en argument (mode single)");
+        };
+        let report = parser::decompile::decompile_matching(input, patterns)?;
+        print!("{}", parser::decompile::render(&report));
+        eprintln!(
+            "[OK]    {} classe(s) décompilée(s) sur {} lues, {} en repli méthode par méthode",
+            report.classes.len(),
+            report.scanned,
+            report
+                .classes
+                .iter()
+                .filter(|c| c.fallback.is_some())
+                .count()
+        );
+        return Ok(());
+    }
+
+    // Bundle d'un échantillon. Charge le moteur de règles pour rules.json ; une
+    // partie en échec n'arrête pas le bundle, elle part dans errors.json.
+    if let Some(out) = &cli.bundle {
+        if cli.legend {
+            println!("{}", parser::decompile::legend());
+            return Ok(());
+        }
+        reject_format(
+            "--bundle",
+            cli.format,
+            "le bundle est une arborescence fixe de fichiers JSON, TSV et texte, décrite par \
+             --bundle --legend",
+        )?;
+        let Some(out) = out else {
+            bail!("--bundle requiert un répertoire de sortie : drakkar <APK> --bundle <OUT>");
+        };
+        let Some(input) = &cli.apk else {
+            bail!("--bundle requiert un APK ou un DEX en argument (mode single)");
+        };
+        setup_jobs(cli.jobs)?;
+        return run_bundle(input, out, &cli);
+    }
+
     // Sortie rapide : légende seule (aucun APK requis).
     if cli.legend {
         if cli.cert {
@@ -1680,6 +1729,251 @@ fn emit_json<T: serde::Serialize>(report: &T, dest: Option<&std::path::Path>) ->
         None => println!("{json}"),
     }
     Ok(())
+}
+
+/// En-tête et lignes de `--dyn-entrypoints`, partagés avec `--bundle`.
+const DYN_ENTRYPOINTS_HEADER: &str = "sample\torigine\tclasse\tsink\toffset\tappelant\tdetail";
+
+fn dyn_entrypoints_tsv(
+    sample: &str,
+    report: &drakkar::parser::dyn_entrypoints::DynEntrypointReport,
+) -> String {
+    let mut out = String::new();
+    for e in &report.entrypoints {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t+{}\t{}\t\n",
+            sample,
+            e.provenance.as_str(),
+            e.class,
+            e.via,
+            e.site,
+            e.caller.api()
+        ));
+    }
+    for u in &report.unresolved {
+        out.push_str(&format!(
+            "{}\t?\t\t{}\t+{}\t{}\t{} {} {}\n",
+            sample,
+            u.via,
+            u.site,
+            u.caller.api(),
+            u.reason.as_str(),
+            u.target_reg
+                .map(|r| format!("v{r}"))
+                .unwrap_or_else(|| "-".into()),
+            u.blocking_insn.as_deref().unwrap_or("-")
+        ));
+    }
+    out
+}
+
+/// Mode `--bundle` : `out/<sha256>/`, arborescence définie par
+/// `--bundle --legend`.
+fn run_bundle(input: &std::path::Path, out: &std::path::Path, cli: &Cli) -> Result<()> {
+    use parser::decompile::{self, BundleError, BundleInfo};
+    use parser::dyn_entrypoints::InputKind;
+    use parser::{cert, dating, manifest_info};
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let generated_at = cert::fmt_unix_utc(now);
+
+    let src = decompile::open(input)?;
+    let root = out.join(&src.sha256);
+    if root.exists() {
+        if !cli.overwrite {
+            bail!(
+                "{} existe déjà — --overwrite pour le remplacer",
+                root.display()
+            );
+        }
+        std::fs::remove_dir_all(&root).with_context(|| format!("suppression {}", root.display()))?;
+    }
+    let classes_dir = root.join("classes");
+    std::fs::create_dir_all(&classes_dir)
+        .with_context(|| format!("création {}", classes_dir.display()))?;
+
+    let decompiled = decompile::decompile_all(&src, &classes_dir);
+    let mut errors = Vec::new();
+    let apk = src.kind == InputKind::Apk;
+
+    let manifest = if apk {
+        bundle_part("manifest", &mut errors, || manifest_info::extract(input))
+    } else {
+        None
+    };
+    write_bundle_json(&root, "manifest.json", &manifest)?;
+    let signing = if apk {
+        bundle_part("cert", &mut errors, || cert::extract(input))
+    } else {
+        None
+    };
+    write_bundle_json(&root, "cert.json", &signing)?;
+    let datation = if apk {
+        bundle_part("dating", &mut errors, || dating::extract(input))
+    } else {
+        None
+    };
+    write_bundle_json(&root, "dating.json", &datation)?;
+
+    let engine = match &cli.rules {
+        Some(dir) => Engine::load(dir),
+        None => Engine::load_cached(cli.refresh),
+    };
+    let matches = match engine {
+        Ok(engine) => bundle_part("rules", &mut errors, || {
+            let parsed = parser::parse_any(input)?;
+            Ok(engine.run(&parsed.features, &parsed.call_graph))
+        }),
+        Err(e) => {
+            errors.push(BundleError::new("rules", format!("{e:#}")));
+            None
+        }
+    };
+    write_bundle_json(&root, "rules.json", &matches)?;
+
+    let mut tsv = format!("{DYN_ENTRYPOINTS_HEADER}\n");
+    let dyn_report = bundle_part("dyn_entrypoints", &mut errors, || {
+        parser::dyn_entrypoints::extract_any(input)
+    });
+    if let Some(report) = &dyn_report {
+        tsv.push_str(&dyn_entrypoints_tsv(&src.sha256, report));
+    }
+    write_bundle_file(&root.join("dyn_entrypoints.tsv"), &tsv)?;
+
+    let (pool, pool_errors) = decompile::string_pools(&src);
+    errors.extend(pool_errors);
+    let strings = serde_json::json!({
+        "pool": pool,
+        "static_values": decompiled.static_values,
+    });
+    write_bundle_json(&root, "strings.json", &strings)?;
+
+    let citations = rule_citations(matches.as_deref().unwrap_or(&[]));
+    let mut index = decompiled.classes;
+    for class in &mut index {
+        if let Some(c) = class.descriptor.as_deref().and_then(|d| citations.get(d)) {
+            class.rules_direct = c.direct.clone();
+            class.rules_path = c.path.clone();
+        }
+    }
+    write_bundle_json(&root, "index.json", &index)?;
+
+    let info = BundleInfo::new(&src, &decompiled.stats, generated_at);
+    write_bundle_json(&root, "bundle.json", &info)?;
+
+    let mut all_errors = decompiled.errors;
+    all_errors.extend(errors);
+    write_bundle_json(&root, "errors.json", &all_errors)?;
+
+    let s = &decompiled.stats;
+    eprintln!(
+        "[OK]    {} — {} classes, {} méthodes (ok {}, partial {}, failed {}), {} erreur(s)",
+        root.display(),
+        s.classes,
+        s.methods,
+        s.decompile_ok,
+        s.decompile_partial,
+        s.decompile_failed,
+        all_errors.len()
+    );
+    Ok(())
+}
+
+/// Une partie du bundle : en cas d'échec, `None` et une entrée d'erreur, pas
+/// un abandon.
+fn bundle_part<T>(
+    stage: &'static str,
+    errors: &mut Vec<parser::decompile::BundleError>,
+    run: impl FnOnce() -> Result<T>,
+) -> Option<T> {
+    use parser::decompile::{panic_message, BundleError};
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(Ok(v)) => Some(v),
+        Ok(Err(e)) => {
+            errors.push(BundleError::new(stage, format!("{e:#}")));
+            None
+        }
+        Err(p) => {
+            errors.push(BundleError::new(stage, panic_message(&*p)));
+            None
+        }
+    }
+}
+
+fn write_bundle_json<T: serde::Serialize>(
+    root: &std::path::Path,
+    name: &str,
+    value: &T,
+) -> Result<()> {
+    write_bundle_file(&root.join(name), &serde_json::to_string_pretty(value)?)
+}
+
+fn write_bundle_file(path: &std::path::Path, body: &str) -> Result<()> {
+    std::fs::write(path, body).with_context(|| format!("écriture {}", path.display()))
+}
+
+/// Règles qui citent une classe, dans l'ordre de `rules.json`.
+#[derive(Debug, Default)]
+struct Citations {
+    direct: Vec<String>,
+    path: Vec<String>,
+}
+
+/// Descripteur de classe → règles qui le citent. Directe : descripteur dans
+/// `evidence.value`, ou propriétaire de l'avant-dernier nœud d'un chemin (le
+/// dernier est l'API, cf. `CallGraph::bfs_path`). Par chemin : propriétaire de
+/// tout autre nœud.
+fn rule_citations(
+    matches: &[drakkar::rules::Match],
+) -> std::collections::HashMap<String, Citations> {
+    let mut out: std::collections::HashMap<String, Citations> = Default::default();
+    for m in matches {
+        let mut direct = std::collections::HashSet::new();
+        let mut traversed = std::collections::HashSet::new();
+        for e in &m.evidence {
+            direct.extend(cited_descriptors(&e.value));
+            for path in &e.paths {
+                if let [.., caller, _api] = path.as_slice() {
+                    direct.extend(node_owner(caller));
+                }
+                traversed.extend(path.iter().filter_map(|n| node_owner(n)));
+            }
+        }
+        for d in &direct {
+            let c = out.entry(d.to_string()).or_default();
+            c.direct.push(m.id.clone());
+        }
+        for d in traversed.difference(&direct) {
+            let c = out.entry(d.to_string()).or_default();
+            c.path.push(m.id.clone());
+        }
+    }
+    out
+}
+
+/// `Lowner;` d'un nœud de chemin `Lowner;->nom(desc)ret`.
+fn node_owner(node: &str) -> Option<&str> {
+    node.split_once("->").map(|(owner, _)| owner)
+}
+
+/// Descripteurs de classe complets (`L…;`) qui figurent dans `s`. Un `L`
+/// collé à un caractère de nom (`Lx/Lcom/a;`) n'ouvre pas de descripteur.
+fn cited_descriptors(s: &str) -> impl Iterator<Item = &str> {
+    let bytes = s.as_bytes();
+    (0..bytes.len()).filter_map(move |i| {
+        if bytes[i] != b'L' || (i > 0 && is_name_byte(bytes[i - 1])) {
+            return None;
+        }
+        let end = i + s[i..].find(';')?;
+        Some(&s[i..=end])
+    })
+}
+
+fn is_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'/') || b >= 0x80
 }
 
 /// Rendu console de l'inventaire du manifest (mode `--manifest`).
@@ -2699,5 +2993,46 @@ mod tests {
     fn the_default_pipeline_still_accepts_the_global_default() {
         assert!(reject_non_json_format(Format::Text).is_ok());
         assert!(reject_non_json_format(Format::Json).is_ok());
+    }
+
+    // --- --bundle : une preuve cite une classe par son descripteur entier ---
+
+    #[test]
+    fn a_descriptor_is_cited_only_as_a_whole_token() {
+        let cited: Vec<&str> = cited_descriptors("Lcom/a/B;->run").collect();
+        assert_eq!(cited, ["Lcom/a/B;"]);
+        let cited: Vec<&str> = cited_descriptors("(Lcom/a/B;[Lx/Y;)V").collect();
+        assert_eq!(cited, ["Lcom/a/B;", "Lx/Y;"]);
+        assert_eq!(cited_descriptors("Lx/Lcom/a/B;").count(), 1);
+    }
+
+    #[test]
+    fn the_immediate_caller_is_direct_and_the_rest_of_the_path_is_not() {
+        let m = drakkar::rules::Match {
+            id: "R1".into(),
+            name: String::new(),
+            tactic: String::new(),
+            evidence: vec![drakkar::rules::Evidence {
+                kind: "api".into(),
+                value: "Landroid/telephony/SmsManager;->sendTextMessage".into(),
+                reachable: Some(true),
+                score: None,
+                depth: Some(2),
+                fanin: Some(1),
+                paths: vec![vec![
+                    "Lcom/a/Main;->onCreate(Landroid/os/Bundle;)V".into(),
+                    "Lcom/a/Sms;->send(Ljava/lang/String;)V".into(),
+                    "Landroid/telephony/SmsManager;->sendTextMessage(LLLLL)V".into(),
+                ]],
+            }],
+        };
+        let c = rule_citations(&[m]);
+        assert_eq!(c["Lcom/a/Sms;"].direct, ["R1"]);
+        assert!(c["Lcom/a/Sms;"].path.is_empty());
+        assert_eq!(c["Lcom/a/Main;"].path, ["R1"]);
+        assert!(c["Lcom/a/Main;"].direct.is_empty());
+        assert_eq!(c["Landroid/telephony/SmsManager;"].direct, ["R1"]);
+        assert!(c["Landroid/telephony/SmsManager;"].path.is_empty());
+        assert!(!c.contains_key("Landroid/os/Bundle;"));
     }
 }
