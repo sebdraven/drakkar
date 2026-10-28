@@ -1649,11 +1649,16 @@ fn walk_functions(ctx: &Ctx, entries: Vec<Entry>, options: &DisasmOptions) -> El
     let mut level = entries;
     for depth in 0..=options.depth {
         let mut next = Vec::new();
-        for entry in level {
+        let mut queue = level;
+        let mut at = 0;
+        while let Some(&entry) = queue.get(at) {
+            at += 1;
             if !done.insert(entry.address) {
                 continue;
             }
             let analyzed = analyze_guarded(ctx, &entry, options.max_insns);
+            // main est désassemblé au niveau de l'entrée qui le passe.
+            queue.extend(analyzed.mains);
             if depth < options.depth {
                 next.extend(analyzed.callees);
             }
