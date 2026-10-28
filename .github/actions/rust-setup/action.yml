@@ -8,6 +8,10 @@ inputs:
   cache-key:
     description: Discriminant de cache, un par profil de build (fmt, clippy, test, release).
     required: true
+  target:
+    description: Triplet a construire. Doit etre l'hote de la toolchain, aucune compilation croisee. Vide = hote, sans controle.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -26,6 +30,22 @@ runs:
         rustc --version --verbose
         cargo --version
 
+    # zstd-sys, bzip2-sys et lzma-sys compilent du C : seule une toolchain
+    # native au runner est admise.
+    - name: cible native
+      if: inputs.target != ''
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+      run: |
+        set -euo pipefail
+        host="$(rustc --version --verbose | tr -d '\r' | sed -n 's/^host: //p')"
+        if [ "${host}" != "${TARGET}" ]; then
+          echo "::error::toolchain hote ${host}, cible ${TARGET} : ce serait une compilation croisee"
+          exit 1
+        fi
+        rustup target add "${TARGET}" --toolchain "${{ inputs.toolchain }}"
+
     - name: cache cargo
       uses: actions/cache@v5
       with:
@@ -36,9 +56,10 @@ runs:
           ~/.cargo/registry/cache
           ~/.cargo/git/db
           target
-        # Cargo.lock porte le rev exact de dex-parser et dex-bytecode, tous deux
-        # declares sans branche ni rev dans Cargo.toml. Un bump de rev change
-        # le hash, donc change la cle : aucun cache perime ne peut etre servi.
+        # Cargo.lock porte le rev exact de chaque dependance git. Un bump de rev
+        # change le hash, donc change la cle : aucun cache perime ne peut etre
+        # servi. runner.os + runner.arch distinguent deja les six cibles de
+        # release ; cache-key porte en plus le triplet.
         # Pas de restore-keys, volontairement : un repli qui ignore le lock
         # reintroduirait exactement ce risque.
         key: cargo-${{ runner.os }}-${{ runner.arch }}-rust${{ inputs.toolchain }}-${{ inputs.cache-key }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
