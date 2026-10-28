@@ -1431,14 +1431,20 @@ mod tests {
     const A64_JNI: &[(u32, &str)] = &[
         (0xaa0003f3, "1000  mov  x19, x0"),
         (0xf9400268, "1004  ldr  x8, [x19]"),
-        (0xf9401908, "1008  ldr  x8, [x8, #0x30]   ; FindClass, index 6"),
+        (
+            0xf9401908,
+            "1008  ldr  x8, [x8, #0x30]   ; FindClass, index 6",
+        ),
         (0xb0000001, "100c  adrp x1, 0x2000"),
         (0x91000021, "1010  add  x1, x1, #0x0      ; com/foo/Bar"),
         (0xaa1303e0, "1014  mov  x0, x19"),
         (0xd63f0100, "1018  blr  x8"),
         (0xaa0003f4, "101c  mov  x20, x0           ; jclass"),
         (0xf9400268, "1020  ldr  x8, [x19]"),
-        (0xf9408508, "1024  ldr  x8, [x8, #0x108]  ; GetMethodID, index 33"),
+        (
+            0xf9408508,
+            "1024  ldr  x8, [x8, #0x108]  ; GetMethodID, index 33",
+        ),
         (0xb0000002, "1028  adrp x2, 0x2000"),
         (0x91004042, "102c  add  x2, x2, #0x10     ; run"),
         (0xb0000003, "1030  adrp x3, 0x2000"),
@@ -1447,7 +1453,10 @@ mod tests {
         (0xaa1303e0, "103c  mov  x0, x19"),
         (0xd63f0100, "1040  blr  x8"),
         (0xf9400268, "1044  ldr  x8, [x19]"),
-        (0xf9429d08, "1048  ldr  x8, [x8, #0x538]  ; NewStringUTF, index 167"),
+        (
+            0xf9429d08,
+            "1048  ldr  x8, [x8, #0x538]  ; NewStringUTF, index 167",
+        ),
         (0xb0000001, "104c  adrp x1, 0x2000"),
         (0x91008021, "1050  add  x1, x1, #0x20     ; hello"),
         (0xaa1303e0, "1054  mov  x0, x19"),
@@ -1466,7 +1475,10 @@ mod tests {
         (0xd63f0100, "1018  blr  x8"),
         (0xaa0003e1, "101c  mov  x1, x0            ; jclass"),
         (0xf9400268, "1020  ldr  x8, [x19]"),
-        (0xf9435d08, "1024  ldr  x8, [x8, #0x6b8]  ; RegisterNatives, index 215"),
+        (
+            0xf9435d08,
+            "1024  ldr  x8, [x8, #0x6b8]  ; RegisterNatives, index 215",
+        ),
         (0xb0000002, "1028  adrp x2, 0x2000"),
         (0x91010042, "102c  add  x2, x2, #0x40     ; table"),
         (0x52800023, "1030  mov  w3, #1"),
@@ -1482,10 +1494,8 @@ mod tests {
         (0x17fffffe, "100c  b    0x1004"),
     ];
 
-    const A64_CALLS_PLT: &[(u32, &str)] = &[
-        (0x94000200, "1000  bl   0x1800"),
-        (0xd65f03c0, "1004  ret"),
-    ];
+    const A64_CALLS_PLT: &[(u32, &str)] =
+        &[(0x94000200, "1000  bl   0x1800"), (0xd65f03c0, "1004  ret")];
 
     /// Stub PLT AArch64 : GOT en 0x3000.
     const A64_PLT: &[(u32, &str)] = &[
@@ -1500,7 +1510,10 @@ mod tests {
         (0xb510, "1000  push {r4, lr}"),
         (0x4604, "1002  mov  r4, r0"),
         (0x4903, "1004  ldr  r1, [pc, #12]    ; 0x1014"),
-        (0x4479, "1006  add  r1, pc           ; 0xff6 + 0x100a = 0x2000"),
+        (
+            0x4479,
+            "1006  add  r1, pc           ; 0xff6 + 0x100a = 0x2000",
+        ),
         (0x6822, "1008  ldr  r2, [r4]"),
         (0x6992, "100a  ldr  r2, [r2, #24]    ; FindClass, index 6"),
         (0x4620, "100c  mov  r0, r4"),
@@ -1514,12 +1527,21 @@ mod tests {
         (&[0x53], "1000  push rbx"),
         (&[0x48, 0x89, 0xfb], "1001  mov  rbx, rdi"),
         (&[0x48, 0x8b, 0x07], "1004  mov  rax, [rdi]"),
-        (&[0x48, 0x8d, 0x35, 0xf2, 0x0f, 0, 0], "1007  lea  rsi, [rip+0xff2]"),
+        (
+            &[0x48, 0x8d, 0x35, 0xf2, 0x0f, 0, 0],
+            "1007  lea  rsi, [rip+0xff2]",
+        ),
         (&[0xff, 0x50, 0x30], "100e  call [rax+0x30]   ; FindClass"),
         (&[0x48, 0x8b, 0x03], "1011  mov  rax, [rbx]"),
         (&[0x48, 0x89, 0xdf], "1014  mov  rdi, rbx"),
-        (&[0x48, 0x8d, 0x35, 0x02, 0x10, 0, 0], "1017  lea  rsi, [rip+0x1002]"),
-        (&[0xff, 0x90, 0x38, 0x05, 0, 0], "101e  call [rax+0x538]  ; NewStringUTF"),
+        (
+            &[0x48, 0x8d, 0x35, 0x02, 0x10, 0, 0],
+            "1017  lea  rsi, [rip+0x1002]",
+        ),
+        (
+            &[0xff, 0x90, 0x38, 0x05, 0, 0],
+            "101e  call [rax+0x538]  ; NewStringUTF",
+        ),
         (&[0x5b], "1024  pop  rbx"),
         (&[0xc3], "1025  ret"),
     ];
@@ -1883,14 +1905,7 @@ mod tests {
         assert_eq!(keys(&function["calls"][0]), call);
         let find_class = ["class", "index", "name", "resolved"];
         assert_eq!(keys(&function["jni_calls"][0]), find_class);
-        let get_method_id = [
-            "class",
-            "index",
-            "method",
-            "name",
-            "resolved",
-            "signature",
-        ];
+        let get_method_id = ["class", "index", "method", "name", "resolved", "signature"];
         assert_eq!(keys(&function["jni_calls"][1]), get_method_id);
         assert_eq!(keys(&json["upcalls"][0]), ["class", "name", "signature"]);
         let refs = ["address", "encoding", "target", "value"];

@@ -337,7 +337,8 @@ fn a64_other(inst: &a64::Instruction, address: u64, insn: &mut Insn) {
         if let Some((addr, wback)) = a64_addr(ops[2], address) {
             for (slot, op) in [(0, ops[0]), (1, ops[1])] {
                 if let Some(rt) = a64_dst(&op) {
-                    insn.ops.push(Op::Load(rt, shifted(addr, slot * width), width));
+                    insn.ops
+                        .push(Op::Load(rt, shifted(addr, slot * width), width));
                 }
             }
             a64_writeback(wback, insn);
@@ -777,7 +778,8 @@ fn arm_push(list: u16, insn: &mut Insn) {
     let mut slot = 0;
     for reg in 0..16u8 {
         if list & (1 << reg) != 0 {
-            insn.ops.push(Op::Store(Expr::Reg(reg), Addr::Base(13, slot)));
+            insn.ops
+                .push(Op::Store(Expr::Reg(reg), Addr::Base(13, slot)));
             slot += 4;
         }
     }
