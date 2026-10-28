@@ -93,11 +93,15 @@ appel direct à une fonction sans retour (`__stack_chk_fail`, `abort`,
 `__cxa_throw`… liste dans la légende) ; le code qui suit n'est jamais lu en
 séquence. Les stubs PLT AArch64, ARM et x86 sont reconnus, l'import nommé par
 la relocation `JUMP_SLOT`. Une instruction que le décodeur refuse, ou sur
-laquelle il panique, coupe son chemin : `truncated_reason` vaut alors
-`invalid_instruction` ou `decoder_panic`, et `truncated_at` donne son adresse
-et ses octets. Les instructions VFP et Advanced SIMD (ARM, Thumb-2), que
-yaxpeax-arm ne décode pas, sont sautées à leur longueur sous le mnémonique
-`coproc`.
+laquelle il panique, n'abandonne que son chemin : elle va dans `invalid_paths`
+(adresse, octets, raison, branchement qui y mène) et les autres chemins sont
+parcourus ; la fonction reste `ok`. C'est la trace typique d'un code aplati
+(OLLVM) : prédicats opaques menant à des octets poubelle. Quand au moins trois
+fonctions d'un ELF butent sur les mêmes octets, l'anomalie `opaque_dead_code`
+le signale. `truncated` ne marque plus qu'un plafond atteint
+(`--disasm-max-insns`), `truncated_at` donnant alors la première instruction
+non lue. Les instructions VFP et Advanced SIMD (ARM, Thumb-2), que yaxpeax-arm
+ne décode pas, sont sautées à leur longueur sous le mnémonique `coproc`.
 
 Ce qu'il ne fait pas :
 

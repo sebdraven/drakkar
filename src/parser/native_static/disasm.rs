@@ -48,6 +48,7 @@ const MAX_STRING_BYTES: usize = 256;
 const MAX_REGISTER_ENTRIES: u64 = 512;
 const MAX_INIT_ARRAY: u64 = 4096;
 const PLT_STUB_INSNS: usize = 6;
+const OPAQUE_DEAD_CODE_MIN: usize = 3;
 
 /// Imports qui ne rendent jamais la main : un appel direct vers l'un d'eux
 /// termine le chemin. `_ZSt9terminatev` = `std::terminate()`.
@@ -96,6 +97,7 @@ pub struct ElfDisasm {
     pub upcalls: Vec<JavaMember>,
     pub registered_by_code: Vec<JavaMember>,
     pub imports_called: BTreeMap<&'static str, Vec<String>>,
+    pub invalid_paths_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -105,9 +107,10 @@ pub struct DisasmFunction {
     pub disasm_status: &'static str,
     pub truncated: bool,
     pub truncated_reason: Option<&'static str>,
-    /// Instruction refusée par le décodeur qui a coupé un chemin.
+    /// Première instruction non lue quand un plafond a interrompu le parcours.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated_at: Option<TruncatedAt>,
+    pub invalid_paths: Vec<InvalidPath>,
     pub instructions: Vec<DisasmInsn>,
     pub calls: Vec<DisasmCall>,
     pub string_refs: Vec<StringRef>,
@@ -119,6 +122,15 @@ pub struct DisasmFunction {
 pub struct TruncatedAt {
     pub address: String,
     pub bytes: String,
+}
+
+/// Chemin abandonné sur une instruction que le décodeur refuse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InvalidPath {
+    pub address: String,
+    pub bytes: String,
+    pub reason: &'static str,
+    pub reached_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -183,6 +195,7 @@ impl DisasmFunction {
             truncated: false,
             truncated_reason: None,
             truncated_at: None,
+            invalid_paths: Vec::new(),
             instructions: Vec::new(),
             calls: Vec::new(),
             string_refs: Vec::new(),
@@ -209,7 +222,12 @@ pub(super) fn silence_panics(job: impl FnOnce()) {
 pub(super) fn run(bytes: &[u8], report: &mut ElfReport, options: &DisasmOptions) {
     let job = AssertUnwindSafe(|| disassemble(bytes, report, options));
     match std::panic::catch_unwind(job) {
-        Ok(disasm) => report.disasm = Some(disasm),
+        Ok(disasm) => {
+            if let Some(anomaly) = opaque_dead_code(&disasm.functions) {
+                report.anomalies.push(anomaly);
+            }
+            report.disasm = Some(disasm);
+        }
         Err(_) => {
             let anomaly = "disasm_failed: panique pendant le désassemblage".to_string();
             report.anomalies.push(anomaly);
@@ -959,38 +977,52 @@ fn pc_thunk(ctx: &Ctx, target: u64) -> Option<u8> {
 struct Explored {
     insns: Vec<Insn>,
     targets: HashSet<u64>,
+    /// Plafond atteint : max_insns.
     reason: Option<&'static str>,
     truncated_at: Option<TruncatedAt>,
+    invalid_paths: Vec<InvalidPath>,
     /// Un chemin au moins rend la main à l'appelant, ou peut le faire.
     returns: bool,
 }
 
 impl Explored {
-    /// La première cause de troncature est gardée.
-    fn cut(&mut self, reason: &'static str, at: Option<TruncatedAt>) {
-        if self.reason.is_none() {
-            self.reason = Some(reason);
-            self.truncated_at = at;
-        }
+    fn abandon(&mut self, at: u64, raw: &[u8], reason: &'static str, from: Option<u64>) {
+        let path = InvalidPath {
+            address: hex(at),
+            bytes: hex_bytes(raw),
+            reason,
+            reached_from: from.map(hex),
+        };
+        self.invalid_paths.push(path);
     }
 }
 
 /// Descente récursive : seuls les successeurs explicites sont suivis. Après un
 /// retour, un saut, un tail-call ou un appel sans retour, rien n'est lu en
-/// séquence.
+/// séquence. Un chemin qui tombe sur des octets indécodables est abandonné
+/// seul ; les autres successeurs en attente sont parcourus.
 fn explore(ctx: &Ctx, arch: Arch, entry: &Entry, max_insns: usize) -> Explored {
     let mut out = Explored::default();
     let mut seen = HashSet::new();
-    let mut work = vec![(entry.address, entry.thumb)];
-    'paths: while let Some((start, thumb)) = work.pop() {
+    let mut work = vec![(entry.address, entry.thumb, None)];
+    'paths: while let Some((start, thumb, origin)) = work.pop() {
         let mut at = start;
+        // Dernier branchement qui mène à l'instruction courante.
+        let mut from = origin;
         while seen.insert(at) {
+            let code = ctx.image.code_window(at);
             if out.insns.len() >= max_insns {
+                let raw = code.unwrap_or_default();
+                let place = TruncatedAt {
+                    address: hex(at),
+                    bytes: hex_bytes(&raw[..undecoded_len(arch, raw, thumb)]),
+                };
                 out.reason = Some(REASON_MAX_INSNS);
+                out.truncated_at = Some(place);
                 break 'paths;
             }
-            let Some(code) = ctx.image.code_window(at) else {
-                out.cut(REASON_OUTSIDE_EXEC, None);
+            let Some(code) = code else {
+                out.abandon(at, &[], REASON_OUTSIDE_EXEC, from);
                 break;
             };
             let insn = match decode(arch, code, at, thumb) {
@@ -1001,11 +1033,7 @@ fn explore(ctx: &Ctx, arch: Arch, entry: &Entry, max_insns: usize) -> Explored {
                         Failure::Panic => REASON_DECODER_PANIC,
                     };
                     let raw = &code[..undecoded_len(arch, code, thumb)];
-                    let place = TruncatedAt {
-                        address: hex(at),
-                        bytes: hex_bytes(raw),
-                    };
-                    out.cut(reason, Some(place));
+                    out.abandon(at, raw, reason, from);
                     break;
                 }
             };
@@ -1022,13 +1050,14 @@ fn explore(ctx: &Ctx, arch: Arch, entry: &Entry, max_insns: usize) -> Explored {
                 Flow::Branch(target, mode) => {
                     if in_function(ctx, entry.address, target) {
                         out.targets.insert(target);
-                        work.push((target, mode));
+                        work.push((target, mode, Some(at)));
                     }
+                    from = Some(at);
                 }
                 Flow::Jump(target, mode) => {
                     if is_internal(ctx, entry.address, target, mode) {
                         out.targets.insert(target);
-                        work.push((target, mode));
+                        work.push((target, mode, Some(at)));
                     } else if !is_noreturn(ctx, target, mode) {
                         out.returns = true;
                     }
@@ -1076,12 +1105,13 @@ fn analyze_function(ctx: &Ctx, entry: &Entry, max_insns: usize) -> Analyzed {
         return out;
     };
     let explored = explore(ctx, arch, entry, max_insns);
+    out.function.invalid_paths = explored.invalid_paths;
     if explored.insns.is_empty() {
         out.function.disasm_status = STATUS_INVALID_ENTRY;
-        out.function.truncated_at = explored.truncated_at;
         return out;
     }
-    let noreturn = !explored.returns && explored.reason.is_none();
+    let complete = explored.reason.is_none() && out.function.invalid_paths.is_empty();
+    let noreturn = !explored.returns && complete;
     ctx.noreturn.borrow_mut().insert(entry.address, noreturn);
     if explored.reason.is_some() {
         out.function.disasm_status = STATUS_TRUNCATED;
@@ -1494,7 +1524,36 @@ fn walk_functions(ctx: &Ctx, entries: Vec<Entry>, options: &DisasmOptions) -> El
         level = next;
     }
     out.imports_called = imports_called(&out.functions);
+    out.invalid_paths_count = out.functions.iter().map(|f| f.invalid_paths.len()).sum();
     out
+}
+
+/// Anomalie `opaque_dead_code` : mêmes octets invalides dans au moins
+/// [`OPAQUE_DEAD_CODE_MIN`] fonctions.
+fn opaque_dead_code(functions: &[DisasmFunction]) -> Option<String> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for function in functions {
+        let mut distinct: Vec<&str> = Vec::new();
+        for path in &function.invalid_paths {
+            let bytes = path.bytes.as_str();
+            if !bytes.is_empty() && !distinct.contains(&bytes) {
+                distinct.push(bytes);
+            }
+        }
+        for bytes in distinct {
+            *counts.entry(bytes).or_default() += 1;
+        }
+    }
+    let mut repeated = Vec::new();
+    for (bytes, count) in counts {
+        if count >= OPAQUE_DEAD_CODE_MIN {
+            repeated.push(format!("{bytes} dans {count} fonctions"));
+        }
+    }
+    if repeated.is_empty() {
+        return None;
+    }
+    Some(format!("opaque_dead_code: {}", repeated.join(" ; ")))
 }
 
 fn push_unique(into: &mut Vec<JavaMember>, members: Vec<JavaMember>) {
@@ -1961,6 +2020,9 @@ mod tests {
         assert!(out.function.truncated);
         assert_eq!(out.function.disasm_status, STATUS_TRUNCATED);
         assert_eq!(out.function.truncated_reason, Some(REASON_MAX_INSNS));
+        assert!(out.function.invalid_paths.is_empty());
+        let at = out.function.truncated_at.map(|at| at.address);
+        assert_eq!(at.as_deref(), Some("0x1008"));
     }
 
     #[test]
@@ -1989,6 +2051,7 @@ mod tests {
         let top = [
             "functions",
             "imports_called",
+            "invalid_paths_count",
             "registered_by_code",
             "upcalls",
         ];
@@ -1999,6 +2062,7 @@ mod tests {
             "calls",
             "disasm_status",
             "instructions",
+            "invalid_paths",
             "jni_calls",
             "origin",
             "string_refs",
@@ -2219,7 +2283,7 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_instruction_on_a_reached_path_is_located() {
+    fn an_invalid_instruction_abandons_only_its_path() {
         let mut data = vec![0u8; 0x2000];
         // 1000 je 0x1003 ; 1002 ret ; 1003 : 06, invalide en 64 bits
         put(&mut data, CODE, &[0x74, 0x01, 0xc3, 0x06]);
@@ -2227,12 +2291,64 @@ mod tests {
         let out = analyze(&ctx, CODE, false);
         let f = &out.function;
         assert_eq!(f.instructions.len(), 2);
-        assert_eq!(f.truncated_reason, Some(REASON_INVALID_INSTRUCTION));
-        let at = TruncatedAt {
+        assert_eq!((f.disasm_status, f.truncated), (STATUS_OK, false));
+        let path = InvalidPath {
             address: "0x1003".to_string(),
             bytes: "06000000".to_string(),
+            reason: REASON_INVALID_INSTRUCTION,
+            reached_from: Some("0x1000".to_string()),
         };
-        assert_eq!(f.truncated_at, Some(at));
+        assert_eq!(f.invalid_paths, [path]);
+    }
+
+    /// Prédicat opaque d'un code aplati (libbash.so arm64-v8a, 0x17254) : la
+    /// branche mène à un bloc mort qui finit sur des octets poubelle.
+    const A64_OPAQUE: &[(u32, &str)] = &[
+        (0xb4000060, "1000  cbz  x0, 0x100c"),
+        (0xd2800020, "1004  mov  x0, #1"),
+        (0xd65f03c0, "1008  ret"),
+        (0x58ffffc1, "100c  ldr  x1, $-8"),
+        (0xd63f0020, "1010  blr  x1"),
+        (0xaa0103e0, "1014  mov  x0, x1"),
+        (0xa2f2fff1, "1018  octets poubelle"),
+    ];
+
+    #[test]
+    fn an_opaque_dead_block_leaves_the_function_complete() {
+        let mut data = vec![0u8; 0x2000];
+        assemble(&mut data, CODE, A64_OPAQUE);
+        let ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        let out = analyze(&ctx, CODE, false);
+        let f = &out.function;
+        assert_eq!((f.disasm_status, f.truncated), (STATUS_OK, false));
+        assert_eq!(f.truncated_at, None);
+        assert_eq!(f.instructions.len(), 6);
+        let path = InvalidPath {
+            address: "0x1018".to_string(),
+            bytes: "f1fff2a2".to_string(),
+            reason: REASON_INVALID_INSTRUCTION,
+            reached_from: Some("0x1000".to_string()),
+        };
+        assert_eq!(f.invalid_paths, [path]);
+        // Le blr du bloc mort reste rattaché à la fonction.
+        assert_eq!(f.calls.len(), 1);
+
+        let entries = vec![jni_entry(CODE, false)];
+        let disasm = walk_functions(&ctx, entries, &DisasmOptions::default());
+        assert_eq!(disasm.invalid_paths_count, 1);
+    }
+
+    #[test]
+    fn repeated_invalid_bytes_are_reported_as_opaque_dead_code() {
+        let mut data = vec![0u8; 0x2000];
+        assemble(&mut data, CODE, A64_OPAQUE);
+        let ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        let function = analyze(&ctx, CODE, false).function;
+        let two = [function.clone(), function.clone()];
+        assert_eq!(opaque_dead_code(&two), None);
+        let three = [function.clone(), function.clone(), function];
+        let expected = "opaque_dead_code: f1fff2a2 dans 3 fonctions";
+        assert_eq!(opaque_dead_code(&three).as_deref(), Some(expected));
     }
 
     #[test]
@@ -2256,6 +2372,10 @@ mod tests {
             REASON_PANIC,
             REASON_DECODER_PANIC,
             "truncated_at",
+            "invalid_paths",
+            "invalid_paths_count",
+            "reached_from",
+            "opaque_dead_code",
             COPROCESSOR,
             CALL_INTERNAL,
             CALL_PLT,

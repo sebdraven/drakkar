@@ -42,8 +42,8 @@ mod disasm;
 mod jni_table;
 
 pub use self::disasm::{
-    DisasmCall, DisasmFunction, DisasmInsn, DisasmOptions, ElfDisasm, JavaMember, JniCall,
-    StringRef, Syscall, TruncatedAt,
+    DisasmCall, DisasmFunction, DisasmInsn, DisasmOptions, ElfDisasm, InvalidPath, JavaMember,
+    JniCall, StringRef, Syscall, TruncatedAt,
 };
 
 /// Catégories d'imports : noms exacts, ou préfixes quand ils finissent par `*`.
@@ -1929,20 +1929,29 @@ DÉSASSEMBLAGE (elfs[].disasm) — avec --native-disasm seulement, absent sinon
                   désassemblée, jusqu'à --disasm-depth niveaux (0 = points d'entrée
                   seuls).
     address       Adresse virtuelle de la fonction, bit Thumb effacé.
-    disasm_status ok ; truncated = au moins un chemin interrompu, voir
-                  truncated_reason ; arch_unsupported = autre machine ou ELF
+    disasm_status ok = tous les chemins atteints ont été parcourus, invalid_paths
+                  éventuels compris ; truncated = un plafond a interrompu le parcours,
+                  voir truncated_reason ; arch_unsupported = autre machine ou ELF
                   gros-boutiste, aucune instruction ; invalid_entry = adresse hors
                   segment exécutable ou première instruction indécodable.
     truncated, truncated_reason
-                  max_insns = --disasm-max-insns atteint ; invalid_instruction = octets
-                  indécodables, atteints par un chemin ; decoder_panic = le décodeur a
-                  paniqué sur une instruction, traitée comme invalide ; outside_exec =
-                  chemin sorti des segments exécutables ; panic = panique ailleurs dans
-                  la fonction, rendue vide. Pendant --native-disasm, un hook de panique
-                  muet remplace celui du programme : ces paniques rattrapées n'écrivent
+                  Plafonds seulement : max_insns = --disasm-max-insns atteint ; panic =
+                  panique pendant l'analyse de la fonction, rendue vide.
+    truncated_at  {address, bytes} : pour max_insns, première instruction non lue ;
+                  absent sinon.
+    invalid_paths[]
+                  Chemins abandonnés, l'exploration continuant avec les autres
+                  successeurs : {address, bytes, reason, reached_from}. reason :
+                  invalid_instruction = octets indécodables atteints par un chemin ;
+                  decoder_panic = le décodeur a paniqué sur l'instruction, traitée comme
+                  invalide ; outside_exec = chemin sorti des segments exécutables (bytes
+                  vide). reached_from = adresse du dernier branchement qui mène à ce
+                  bloc, null si c'est le chemin de l'entrée. Un code aplati (type OLLVM)
+                  y laisse ses blocs morts : prédicats opaques menant à des octets
+                  poubelle. Les instructions lues avant l'abandon restent listées, avec
+                  leurs appels et chaînes. Pendant --native-disasm, un hook de panique
+                  muet remplace celui du programme : les paniques rattrapées n'écrivent
                   rien sur stderr ; le hook d'origine est rétabli ensuite.
-    truncated_at  {address, bytes} : adresse et octets bruts de l'instruction refusée
-                  (invalid_instruction, decoder_panic) ; absent sinon.
     instructions[]
                   address, bytes (hexadécimal), mnemonic, operands, triées par adresse.
                   mnemonic coproc = instruction coprocesseur, VFP ou Advanced SIMD (ARM,
@@ -1993,6 +2002,8 @@ DÉSASSEMBLAGE (elfs[].disasm) — avec --native-disasm seulement, absent sinon
                   (voir disambiguated_by).
   imports_called  Imports appelés par les fonctions désassemblées, par catégorie de la
                   table des imports ; other = hors table.
+  invalid_paths_count
+                  Somme des invalid_paths des fonctions de l'ELF.
   Suivi de valeurs : registres oubliés à chaque cible de branche, sauf sp et les
   registres callee-saved écrits une seule fois dans la fonction ; mémoire suivie pour
   la pile et les adresses connues ; rien ne passe d'une fonction à l'autre, sauf l'env
@@ -2034,6 +2045,11 @@ ANOMALIES (elfs[].anomalies, code avant « : », détail après)
                   la donne) ; les autres champs gardent leur valeur par défaut (false, 0,
                   vide, null).
   disasm_failed   Panique pendant --native-disasm : disasm est vide pour cet ELF.
+  opaque_dead_code
+                  Informative, --native-disasm : au moins 3 fonctions abandonnent un
+                  chemin sur les mêmes octets (détail : octets et nombre de fonctions).
+                  Un motif répété désigne des octets poubelle derrière des prédicats
+                  opaques plutôt que du code, signe d'obfuscation par aplatissement.
 ";
 
 /// Légende autonome : chaque champ, statut, catégorie et anomalie de `--native`.
