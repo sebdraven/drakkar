@@ -1707,7 +1707,8 @@ fn file_sha256(path: &Path) -> Result<String> {
 
 const LEGEND: &str = "\
 --native : analyse statique de TOUS les ELF de l'APK et liaison avec les méthodes
-`native` du DEX. Ni désassemblage, ni exécution, ni émulation.
+`native` du DEX. Ni exécution, ni émulation ; désassemblage seulement avec
+--native-disasm (section DÉSASSEMBLAGE).
 
 RAPPORT
   sha256          SHA-256 complet du fichier APK.
@@ -1836,6 +1837,11 @@ LIAISON (binding[]) — seuls les ELF d'origine lib sont liés
                   null pour declared_unbound. Une méthode liée dans plusieurs ELF (une .so
                   par ABI) produit une ligne par ELF.
   candidates      Rempli pour registered_ambiguous seulement.
+  disambiguated_by / class
+                  Avec --native-disasm, sur une ligne registered_ambiguous seulement :
+                  find_class = un RegisterNatives dont la classe vient d'un FindClass de
+                  la même fonction enregistre cette fonction ; class = la classe retenue.
+                  Le statut ne change pas. Absents sinon.
 
 SUMMARY
   elf_count       Nombre d'ELF inventoriés, toutes origines.
@@ -1845,6 +1851,74 @@ SUMMARY
                   Une méthode compte une fois, sous son meilleur statut :
                   static > registered > registered_ambiguous > declared_unbound.
   unclaimed       Nombre de lignes native_unclaimed.
+
+DÉSASSEMBLAGE (elfs[].disasm) — avec --native-disasm seulement, absent sinon
+  Désassemblage statique, sans exécution ni émulation, des fonctions qui portent la
+  frontière Java↔natif. AArch64, ARM et Thumb-2 (yaxpeax-arm), x86 et x86_64
+  (iced-x86) ; ELF petit-boutiste seulement. --disasm-depth N (défaut 1) ;
+  --disasm-max-insns N (défaut 4000) ; --disasm-full ajoute les instructions à la
+  sortie texte, le JSON les porte toujours.
+  functions[]     Une par adresse ; la première origine trouvée est gardée.
+    origin        jni_static = export Java_* ; jni_registered = entrée de table
+                  JNINativeMethod ; jni_onload, jni_onunload = JNI_OnLoad, JNI_OnUnload
+                  exportés ; init = DT_INIT ; init_array = entrée de DT_INIT_ARRAY, lue à
+                  travers les relocations relatives ; entry = e_entry d'un ELF exec ;
+                  callee = fonction interne appelée directement par une fonction déjà
+                  désassemblée, jusqu'à --disasm-depth niveaux (0 = points d'entrée
+                  seuls).
+    address       Adresse virtuelle de la fonction, bit Thumb effacé.
+    disasm_status ok ; truncated = au moins un chemin interrompu, voir
+                  truncated_reason ; arch_unsupported = autre machine ou ELF
+                  gros-boutiste, aucune instruction ; invalid_entry = adresse hors
+                  segment exécutable ou première instruction indécodable.
+    truncated, truncated_reason
+                  max_insns = --disasm-max-insns atteint ; invalid_instruction = octets
+                  indécodables sur un chemin ; outside_exec = chemin sorti des segments
+                  exécutables ; panic = panique pendant la fonction, rendue vide.
+    instructions[]
+                  address, bytes (hexadécimal), mnemonic, operands, triées par adresse.
+                  Délimitation par descente récursive depuis l'entrée : branches internes
+                  suivies ; arrêt sur retour, saut indirect, tail-call, instruction
+                  invalide ; st_size borne la fonction quand un symbole le donne, sinon
+                  le début d'une autre fonction connue arrête le parcours.
+    calls[]       Appels et tail-calls distincts. kind : internal = cible dans l'ELF,
+                  symbol = symbole de .dynsym ou .symtab à cette adresse, null sinon ;
+                  plt = import appelé par un stub PLT ou par un emplacement de GOT,
+                  import = nom résolu par R_*_JUMP_SLOT ou R_*_GLOB_DAT de PT_DYNAMIC,
+                  target null si l'appel passe par la GOT ; indirect = cible non résolue,
+                  target null. Les appels par la table de JNIEnv y figurent en indirect.
+    string_refs[] address = instruction qui forme l'adresse ; target = adresse de la
+                  chaîne ; value = octets jusqu'au premier nul, 256 au plus ; encoding =
+                  utf8, ou hex pour des octets non UTF-8 d'une section en lecture seule.
+                  Adresses formées par ADRP+ADD, ADR, LDR littéral, ADD pc, LEA rip ou
+                  sur base connue (GOT x86), MOV immédiat x86.
+    jni_calls[]   Appels par la table de fonctions de JNIEnv. name = fonction de
+                  JNINativeInterface ; index = sa position, emplacements réservés compris
+                  (source en fin de légende). resolved = true : l'env est suivi, premier
+                  argument d'une fonction JNI ou écrit par GetEnv / AttachCurrentThread ;
+                  resolved = false : même motif (table lue au premier argument, appel
+                  indirect à un décalage de cette table) sans env prouvé, ce qui est
+                  aussi la forme d'un appel virtuel C++. class (forme L…;), method,
+                  signature : chaînes passées en argument dans la même fonction pour
+                  FindClass, Get[Static]MethodID, Get[Static]FieldID, RegisterNatives ;
+                  absents sinon.
+    syscalls[]    svc, swi, syscall, sysenter, int 0x80 ; number = valeur de x8, r7, rax
+                  ou eax si elle est connue à cet endroit, null sinon.
+  upcalls[]       {class, name, signature} des Get[Static]MethodID / Get[Static]FieldID
+                  dont la classe vient d'un FindClass suivi.
+  registered_by_code[]
+                  {class, name, signature} des entrées JNINativeMethod passées à
+                  RegisterNatives quand la classe vient d'un FindClass de la même fonction
+                  (voir disambiguated_by).
+  imports_called  Imports appelés par les fonctions désassemblées, par catégorie de la
+                  table des imports ; other = hors table.
+  Suivi de valeurs : registres oubliés à chaque cible de branche, sauf sp et les
+  registres callee-saved écrits une seule fois dans la fonction ; mémoire suivie pour
+  la pile et les adresses connues ; rien ne passe d'une fonction à l'autre, sauf l'env
+  ou la JavaVM en premier argument d'un callee.
+  Invisible : chaînes construites ou déchiffrées à l'exécution, code natif absent de
+  l'APK, cibles des tables de sauts ; les instructions des blocs IT (Thumb) sont lues
+  comme inconditionnelles.
 
 ANOMALIES (elfs[].anomalies, code avant « : », détail après)
   abi_mismatch    ELF incompatible avec son répertoire lib/<abi>/.
@@ -1878,6 +1952,7 @@ ANOMALIES (elfs[].anomalies, code avant « : », détail après)
                   inventorié (chemin, origine, sha256, taille, architecture si l'en-tête
                   la donne) ; les autres champs gardent leur valeur par défaut (false, 0,
                   vide, null).
+  disasm_failed   Panique pendant --native-disasm : disasm est vide pour cet ELF.
 ";
 
 /// Légende autonome : chaque champ, statut, catégorie et anomalie de `--native`.
@@ -1890,6 +1965,9 @@ pub fn legend() -> String {
     out.push_str(&format!("  jni             {JNI_EXPORTS} (exports)\n"));
     out.push_str(&format!("\nCOMMANDES SHELL\n  {SHELL_COMMANDS}\n"));
     out.push_str(&format!("\nRACINES JAVA\n  {JAVA_PACKAGE_ROOTS}\n"));
+    let source = jni_table::JNI_SOURCE;
+    let jni = format!("\nTABLE JNIEnv (jni_calls[].index)\n  {source}\n");
+    out.push_str(&jni);
     out
 }
 
