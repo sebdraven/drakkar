@@ -89,10 +89,33 @@ struct Cli {
     /// ailleurs), reconnus au contenu : sections, segments, imports classés,
     /// chaînes, exports Java_*, tables JNINativeMethod reconstruites à travers
     /// les relocations relatives, puis liaison avec les méthodes `native` du DEX.
-    /// Ni désassemblage ni exécution. Texte par défaut, --format json|both
-    /// disponible ; --native --legend définit chaque champ. Mode single.
+    /// Aucune exécution ; désassemblage seulement avec --native-disasm. Texte par
+    /// défaut, --format json|both disponible ; --native --legend définit chaque
+    /// champ. Mode single.
     #[arg(long, conflicts_with = "native_arch")]
     native: bool,
+
+    /// (--native) Désassemble statiquement, dans chaque ELF, les fonctions liées
+    /// au DEX, JNI_OnLoad / JNI_OnUnload, DT_INIT, DT_INIT_ARRAY et e_entry, et
+    /// décode leurs appels JNIEnv, imports appelés, chaînes référencées et appels
+    /// système. Rien n'est exécuté ni émulé.
+    #[arg(long)]
+    native_disasm: bool,
+
+    /// (--native-disasm) Profondeur des fonctions internes suivies depuis les
+    /// points d'entrée : 0 = points d'entrée seuls. Défaut 1.
+    #[arg(long, value_name = "N")]
+    disasm_depth: Option<u8>,
+
+    /// (--native-disasm) Plafond d'instructions par fonction ; atteint, la
+    /// fonction est marquée truncated. Défaut 4000.
+    #[arg(long, value_name = "N")]
+    disasm_max_insns: Option<usize>,
+
+    /// (--native-disasm) Instructions dans la sortie texte. Le JSON les porte
+    /// toujours.
+    #[arg(long)]
+    disasm_full: bool,
 
     /// Extrait toutes les bibliothèques natives (.so ELF) de l'APK — y compris
     /// hors lib/ (assets/libjiagu*.so des packers) — vers --out, puis sort
@@ -529,6 +552,22 @@ fn main() -> Result<()> {
         );
     }
 
+    // Même règle pour --native-disasm : un réglage ignoré ferait passer un rapport
+    // sans désassemblage pour le résultat demandé.
+    if cli.native_disasm && !cli.native {
+        bail!("--native-disasm requiert --native : drakkar <APK> --native --native-disasm");
+    }
+    let disasm_tuning = cli.disasm_depth.is_some() || cli.disasm_max_insns.is_some();
+    if (disasm_tuning || cli.disasm_full) && !cli.native_disasm {
+        bail!(
+            "--disasm-depth, --disasm-max-insns et --disasm-full n'ont d'effet qu'avec \
+             --native --native-disasm"
+        );
+    }
+    if cli.disasm_max_insns == Some(0) {
+        bail!("--disasm-max-insns doit valoir au moins 1");
+    }
+
     // Sortie rapide : audit d'architecture native seul (pas de moteur de règles,
     // pas de catalogue MITRE) — lit uniquement les en-têtes ELF, en mémoire.
     if cli.native_arch {
@@ -556,13 +595,27 @@ fn main() -> Result<()> {
         if cli.format == Format::Csv {
             bail!("--format csv n'existe pas pour --native : passer --format json ou both");
         }
+        if cli.disasm_full && !cli.format.wants_text() {
+            bail!(
+                "--disasm-full ne concerne que la sortie texte, le JSON porte toujours les \
+                 instructions : retirer --disasm-full, ou passer --format text ou both"
+            );
+        }
         check_json_dest(cli.format, cli.json_out.as_deref())?;
         let Some(apk) = &cli.apk else {
             bail!("--native requiert un APK (mode single)");
         };
-        let report = parser::native_static::analyze_apk(apk)?;
+        let mut options = parser::native_static::DisasmOptions::default();
+        if let Some(depth) = cli.disasm_depth {
+            options.depth = depth;
+        }
+        if let Some(max_insns) = cli.disasm_max_insns {
+            options.max_insns = max_insns;
+        }
+        let disasm = cli.native_disasm.then_some(&options);
+        let report = parser::native_static::analyze_apk(apk, disasm)?;
         if cli.format.wants_text() {
-            print_native(&report);
+            print_native(&report, cli.disasm_full);
         }
         if cli.format.wants_json() {
             emit_json(&report, cli.json_out.as_deref())?;
@@ -1610,8 +1663,9 @@ fn print_native_arch(s: &drakkar::parser::native_arch::NativeArchSummary) {
     }
 }
 
-/// Affiche l'analyse native statique (mode `--native`).
-fn print_native(r: &drakkar::parser::native_static::NativeReport) {
+/// Affiche l'analyse native statique (mode `--native`). `full` : instructions
+/// désassemblées (`--disasm-full`).
+fn print_native(r: &drakkar::parser::native_static::NativeReport, full: bool) {
     println!("== Analyse native statique ==\n");
     println!("APK       {}", r.sha256);
     println!("Légende   drakkar --native --legend");
@@ -1620,7 +1674,7 @@ fn print_native(r: &drakkar::parser::native_static::NativeReport) {
         println!("\nAucun ELF dans l'APK.");
     }
     for e in &r.elfs {
-        print_native_elf(e);
+        print_native_elf(e, full);
     }
 
     println!("\nLiaison DEX ↔ natif (ELF de lib/ seulement) :");
@@ -1636,6 +1690,9 @@ fn print_native(r: &drakkar::parser::native_static::NativeReport) {
         if !b.candidates.is_empty() {
             let candidates = b.candidates.join(", ");
             println!("                         candidats : {candidates}");
+        }
+        if let (Some(by), Some(class)) = (b.disambiguated_by, &b.class) {
+            println!("                         classe retenue ({by}) : {class}");
         }
     }
 
@@ -1657,7 +1714,7 @@ fn print_native(r: &drakkar::parser::native_static::NativeReport) {
     }
 }
 
-fn print_native_elf(e: &drakkar::parser::native_static::ElfReport) {
+fn print_native_elf(e: &drakkar::parser::native_static::ElfReport, full: bool) {
     let abi = e.declared_abi.as_deref().unwrap_or("-");
     let interp = e.interp.as_deref().unwrap_or("-");
     let init = e.init.as_deref().unwrap_or("-");
@@ -1726,11 +1783,72 @@ fn print_native_elf(e: &drakkar::parser::native_static::ElfReport) {
         println!("    {kind:<14} {flags} {vaddr:>12} {size:>10}");
     }
 
+    if let Some(d) = &e.disasm {
+        print_native_disasm(d, full);
+    }
+
     if !e.anomalies.is_empty() {
         println!("  anomalies");
         for a in &e.anomalies {
             println!("    - {a}");
         }
+    }
+}
+
+/// Un bloc par fonction désassemblée (`--native-disasm`), puis la synthèse de
+/// l'ELF.
+fn print_native_disasm(d: &drakkar::parser::native_static::ElfDisasm, full: bool) {
+    println!("  désassemblage ({} fonctions)", d.functions.len());
+    for f in &d.functions {
+        let (address, origin, status) = (&f.address, f.origin, f.disasm_status);
+        let count = f.instructions.len();
+        println!("    {address}  {origin}  {status}  {count} instructions");
+        if let Some(reason) = f.truncated_reason {
+            println!("      tronquée : {reason}");
+        }
+        for c in &f.calls {
+            let (kind, target) = (c.kind, c.target.as_deref().unwrap_or("?"));
+            let name = match (&c.import, &c.symbol) {
+                (Some(name), _) | (None, Some(name)) => name.as_str(),
+                (None, None) => "",
+            };
+            println!("      call     {kind:<9} {target}  {name}");
+        }
+        for j in &f.jni_calls {
+            let (name, index) = (j.name, j.index);
+            let class = j.class.as_deref().unwrap_or("");
+            let method = j.method.as_deref().unwrap_or("");
+            let signature = j.signature.as_deref().unwrap_or("");
+            let tracked = if j.resolved { "" } else { "  (env non suivi)" };
+            println!("      jni      {name} #{index}  {class} {method}{signature}{tracked}");
+        }
+        for s in &f.string_refs {
+            let (address, target, value) = (&s.address, &s.target, &s.value);
+            println!("      chaîne   {address}  {target}  {value}");
+        }
+        for s in &f.syscalls {
+            let number = s.number.map_or_else(|| "?".to_string(), |n| n.to_string());
+            println!("      syscall  {}  {number}", s.address);
+        }
+        if full {
+            for i in &f.instructions {
+                let (address, bytes) = (&i.address, &i.bytes);
+                let (mnemonic, operands) = (&i.mnemonic, &i.operands);
+                println!("      {address}  {bytes:<20} {mnemonic} {operands}");
+            }
+        }
+    }
+    for m in &d.upcalls {
+        let (class, name, signature) = (&m.class, &m.name, &m.signature);
+        println!("    upcall           {class}->{name}{signature}");
+    }
+    for m in &d.registered_by_code {
+        let (class, name, signature) = (&m.class, &m.name, &m.signature);
+        println!("    RegisterNatives  {class}->{name}{signature}");
+    }
+    for (category, names) in &d.imports_called {
+        let names = names.join(", ");
+        println!("    import appelé {category:<14} {names}");
     }
 }
 
