@@ -1,9 +1,10 @@
 //! Analyse statique de tous les ELF d'un APK et liaison JNI avec les méthodes
 //! `native` du DEX (mode `--native`).
 //!
-//! Lecture seule : ni désassemblage, ni exécution. Sont lus les en-têtes, les
-//! sections, les segments, la table dynamique, les symboles dynamiques, les
-//! relocations relatives et les chaînes des sections de données.
+//! Lecture seule, sans exécution. Sont lus les en-têtes, les sections, les
+//! segments, la table dynamique, les symboles dynamiques, les relocations
+//! relatives et les chaînes des sections de données. Le désassemblage n'a lieu
+//! qu'avec `--native-disasm` (module `disasm`).
 //!
 //! Est retenue toute entrée dont les quatre premiers octets DÉCOMPRESSÉS valent
 //! `\x7FELF`, quel que soit le chemin : un packer range son stub dans `assets/`,
@@ -22,7 +23,7 @@
 
 use anyhow::{Context, Result};
 use object::elf;
-use object::read::elf::{Dyn, FileHeader, ProgramHeader, SectionHeader, Sym};
+use object::read::elf::{Dyn, FileHeader, ProgramHeader, SectionHeader, SectionTable, Sym};
 use object::Endianness;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -35,6 +36,15 @@ use std::path::Path;
 use super::apkzip::TolerantZip;
 use super::dex_facade::DexBin;
 use super::native_arch::{expected_arch, parse_elf_header, Abi, Bits, ElfArch, Endian, Machine};
+
+mod decode;
+mod disasm;
+mod jni_table;
+
+pub use self::disasm::{
+    DisasmCall, DisasmFunction, DisasmInsn, DisasmOptions, ElfDisasm, JavaMember, JniCall,
+    StringRef, Syscall,
+};
 
 /// Catégories d'imports : noms exacts, ou préfixes quand ils finissent par `*`.
 pub const IMPORT_CATEGORIES: &[(&str, &str)] = &[
@@ -140,6 +150,9 @@ pub struct ElfReport {
     pub jni: JniInfo,
     pub strings: Strings,
     pub anomalies: Vec<String>,
+    /// Présent avec `--native-disasm` seulement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disasm: Option<ElfDisasm>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -303,6 +316,12 @@ pub struct Binding {
     pub elf_sha256: Option<String>,
     pub fn_offset: Option<String>,
     pub candidates: Vec<String>,
+    /// Avec `--native-disasm`, sur une ligne registered_ambiguous levée par un
+    /// RegisterNatives dont la classe vient de FindClass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disambiguated_by: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
 }
 
 impl Binding {
@@ -320,6 +339,8 @@ impl Binding {
             elf_sha256: Some(elf.sha256.clone()),
             fn_offset: Some(fn_offset),
             candidates,
+            disambiguated_by: None,
+            class: None,
         }
     }
 
@@ -331,6 +352,8 @@ impl Binding {
             elf_sha256: None,
             fn_offset: None,
             candidates: Vec::new(),
+            disambiguated_by: None,
+            class: None,
         }
     }
 }
@@ -375,11 +398,13 @@ impl NativeMethod {
 
 /// Analyse un APK sur disque. Seule une archive illisible fait échouer le mode :
 /// un ELF illisible devient une anomalie, une entrée illisible une erreur.
-pub fn analyze_apk(path: &Path) -> Result<NativeReport> {
+/// `disasm` active `--native-disasm`.
+pub fn analyze_apk(path: &Path, disasm: Option<&DisasmOptions>) -> Result<NativeReport> {
     let sha256 = file_sha256(path)?;
     let zip = TolerantZip::open(path)?;
     let mut errors = Vec::new();
     let mut elfs = Vec::new();
+    let mut kept = Vec::new();
     for (index, entry) in zip.entries().iter().enumerate() {
         let bytes = match zip.read(index) {
             Ok(bytes) => bytes,
@@ -390,14 +415,23 @@ pub fn analyze_apk(path: &Path) -> Result<NativeReport> {
         };
         if bytes.starts_with(ELF_MAGIC) {
             elfs.push(analyze_elf(&entry.name, &bytes));
+            if disasm.is_some() {
+                kept.push(bytes);
+            }
         }
     }
 
     let natives = declared_natives(path, &mut errors);
-    let binding = match &natives {
+    let mut binding = match &natives {
         Some(natives) => bind(natives, &elfs),
         None => Vec::new(),
     };
+    if let Some(options) = disasm {
+        for (elf, bytes) in elfs.iter_mut().zip(&kept) {
+            self::disasm::run(bytes, elf, options);
+        }
+        self::disasm::disambiguate(&elfs, &mut binding);
+    }
     let declared = natives.as_ref().map_or(0, Vec::len);
     let summary = summarize(&binding, declared, elfs.len());
     Ok(NativeReport {
@@ -480,6 +514,7 @@ impl ElfReport {
             jni: JniInfo::default(),
             strings: Strings::default(),
             anomalies,
+            disasm: None,
         }
     }
 }
