@@ -65,6 +65,40 @@ Ce qu'il ne fait pas :
   signalées en anomalie ;
 - seuls les ELF de `lib/` sont liés au DEX ; les autres sont inventoriés.
 
+### Désassemblage de la frontière JNI (`--native-disasm`)
+
+```sh
+drakkar app.apk --native --native-disasm                       # texte, sans les instructions
+drakkar app.apk --native --native-disasm --disasm-full         # texte, avec les instructions
+drakkar app.apk --native --native-disasm --disasm-depth 0 \
+  --disasm-max-insns 2000 --format json --json-out reports/app.native.json
+```
+
+Désassemble statiquement, dans chaque ELF (AArch64, ARM, Thumb-2, x86,
+x86_64), les fonctions qui portent la frontière Java↔natif : celles des lignes
+de liaison et les exports `Java_*`, les entrées de tables `JNINativeMethod`,
+`JNI_OnLoad` / `JNI_OnUnload`, `DT_INIT`, `DT_INIT_ARRAY`, `e_entry` d'un
+exécutable, puis les fonctions internes qu'elles appellent jusqu'à
+`--disasm-depth` (défaut 1). Pour chaque fonction : instructions, appels
+(internes, imports par PLT ou GOT, indirects), chaînes référencées, appels par
+la table de `JNIEnv` (`FindClass`, `GetMethodID`, `RegisterNatives`…, avec
+classe, nom et signature quand les chaînes sont dans la fonction) et appels
+système. Par ELF : les upcalls vers Java, les méthodes enregistrées par
+`RegisterNatives` (qui lèvent, quand c'est possible, l'ambiguïté d'une ligne
+`registered_ambiguous`) et les imports appelés par catégorie.
+`drakkar --native --legend` définit chaque champ.
+
+Ce qu'il ne fait pas :
+
+- aucune exécution, aucune émulation, aucune exécution symbolique ;
+- l'env n'est pas suivi d'une fonction à l'autre au-delà du premier argument
+  d'un callee, ni au-delà de `--disasm-depth` ;
+- un appel par la table de `JNIEnv` dont le registre n'est pas suivi sort avec
+  `resolved = false` : la même forme est celle d'un appel virtuel C++ ;
+- les chaînes construites ou déchiffrées à l'exécution sont invisibles ;
+- le code natif absent de l'APK (téléchargé, déchiffré au chargement) est
+  invisible.
+
 ## Architecture
 
 | Module        | Rôle                                             |
