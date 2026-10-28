@@ -81,6 +81,8 @@ pub(super) const NORETURN_IMPORTS: &[&str] = &[
     "__libc_fatal",
     "__android_log_assert",
     "_ZSt9terminatev",
+    "__libc_init",
+    "__libc_start_main",
 ];
 
 /// Réglages de `--native-disasm`.
