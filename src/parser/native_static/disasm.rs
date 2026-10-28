@@ -2408,6 +2408,91 @@ mod tests {
         }
     }
 
+    /// Point d'entrée ARM d'un exécutable : main (0x1100) par ldr littéral en r2,
+    /// puis __libc_init par la PLT.
+    const ARM_LIBC_INIT: &[(u32, &str)] = &[
+        (0xe59f2004, "1000  ldr  r2, [pc, #4]   ; 0x100c"),
+        (0xeb0001fd, "1004  bl   0x1800         ; __libc_init@plt"),
+        (0xe12fff1e, "1008  bx   lr"),
+        (0x00001100, "100c  littéral : main"),
+    ];
+
+    /// r2 jamais écrit avant l'appel.
+    const ARM_LIBC_INIT_UNKNOWN: &[(u32, &str)] = &[
+        (0xeb0001fe, "1000  bl   0x1800         ; __libc_init@plt"),
+        (0xe12fff1e, "1004  bx   lr"),
+    ];
+
+    /// Point d'entrée AArch64 : main (0x2100) par adrp + add en x2.
+    const A64_LIBC_INIT: &[(u32, &str)] = &[
+        (0xb0000002, "1000  adrp x2, 0x2000"),
+        (0x91040042, "1004  add  x2, x2, #0x100"),
+        (0x940001fe, "1008  bl   0x1800         ; __libc_init@plt"),
+        (0xd65f03c0, "100c  ret"),
+    ];
+
+    fn exec_entry(address: u64) -> Entry {
+        entry(address, false, ORIGIN_ENTRY, Val::Opaque(0))
+    }
+
+    fn origins(disasm: &ElfDisasm) -> Vec<(&str, &'static str, &'static str)> {
+        let mut origins = Vec::new();
+        for f in &disasm.functions {
+            origins.push((f.address.as_str(), f.origin, f.disasm_status));
+        }
+        origins
+    }
+
+    #[test]
+    fn arm_libc_init_adds_main_from_its_third_argument() {
+        let mut data = vec![0u8; 0x4000];
+        assemble(&mut data, CODE, ARM_LIBC_INIT);
+        put(&mut data, 0x1100, &0xe12fff1eu32.to_le_bytes());
+        assemble(&mut data, 0x1800, ARM_PLT);
+        let dynamic = jump_slot(&mut data, 0x348c, "__libc_init", true);
+        let mut ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        let disasm = walk_functions(&ctx, vec![exec_entry(CODE)], &options(0, 100));
+        let expected = [
+            ("0x1000", ORIGIN_ENTRY, STATUS_OK),
+            ("0x1100", ORIGIN_MAIN, STATUS_OK),
+        ];
+        assert_eq!(origins(&disasm), expected);
+        let import = disasm.functions[0].calls[0].import.as_deref();
+        assert_eq!(import, Some("__libc_init"));
+    }
+
+    #[test]
+    fn aarch64_libc_init_adds_main_from_x2() {
+        let mut data = vec![0u8; 0x4000];
+        assemble(&mut data, CODE, A64_LIBC_INIT);
+        put(&mut data, 0x2100, &0xd65f03c0u32.to_le_bytes());
+        assemble(&mut data, 0x1800, A64_PLT);
+        let dynamic = jump_slot(&mut data, 0x3000, "__libc_init", false);
+        let mut ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        let disasm = walk_functions(&ctx, vec![exec_entry(CODE)], &options(0, 100));
+        let expected = [
+            ("0x1000", ORIGIN_ENTRY, STATUS_OK),
+            ("0x2100", ORIGIN_MAIN, STATUS_OK),
+        ];
+        assert_eq!(origins(&disasm), expected);
+    }
+
+    #[test]
+    fn an_unknown_main_adds_no_function() {
+        let mut data = vec![0u8; 0x4000];
+        assemble(&mut data, CODE, ARM_LIBC_INIT_UNKNOWN);
+        assemble(&mut data, 0x1800, ARM_PLT);
+        let dynamic = jump_slot(&mut data, 0x348c, "__libc_init", true);
+        let mut ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        let disasm = walk_functions(&ctx, vec![exec_entry(CODE)], &options(0, 100));
+        assert_eq!(origins(&disasm), [("0x1000", ORIGIN_ENTRY, STATUS_OK)]);
+        let import = disasm.functions[0].calls[0].import.as_deref();
+        assert_eq!(import, Some("__libc_init"));
+    }
+
     /// AArch64 : FindClass par le wrapper C++ de jni.h, appelé par sa PLT.
     const A64_CXX_FIND_CLASS: &[(u32, &str)] = &[
         (0xb0000001, "1000  adrp x1, 0x2000"),
@@ -2723,6 +2808,9 @@ mod tests {
             ORIGIN_INIT_ARRAY,
             ORIGIN_ENTRY,
             ORIGIN_CALLEE,
+            ORIGIN_MAIN,
+            "__libc_init",
+            "__libc_start_main",
             STATUS_TRUNCATED,
             STATUS_ARCH_UNSUPPORTED,
             STATUS_INVALID_ENTRY,
