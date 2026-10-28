@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 
 use super::*;
 
-use super::decode::{decode, hex_bytes, Addr, Arch, Expr, Flow, Insn, Op, Via};
+use super::decode::{
+    decode, hex_bytes, undecoded_len, Addr, Arch, Expr, Failure, Flow, Insn, Op, Via,
+};
 use super::jni_table as jni;
 
 pub const DEFAULT_DISASM_DEPTH: u8 = 1;
@@ -34,6 +36,7 @@ const REASON_MAX_INSNS: &str = "max_insns";
 const REASON_INVALID_INSTRUCTION: &str = "invalid_instruction";
 const REASON_OUTSIDE_EXEC: &str = "outside_exec";
 const REASON_PANIC: &str = "panic";
+const REASON_DECODER_PANIC: &str = "decoder_panic";
 
 const CALL_INTERNAL: &str = "internal";
 const CALL_PLT: &str = "plt";
@@ -45,6 +48,28 @@ const MAX_STRING_BYTES: usize = 256;
 const MAX_REGISTER_ENTRIES: u64 = 512;
 const MAX_INIT_ARRAY: u64 = 4096;
 const PLT_STUB_INSNS: usize = 6;
+
+/// Imports qui ne rendent jamais la main : un appel direct vers l'un d'eux
+/// termine le chemin. `_ZSt9terminatev` = `std::terminate()`.
+pub(super) const NORETURN_IMPORTS: &[&str] = &[
+    "__stack_chk_fail",
+    "abort",
+    "exit",
+    "_exit",
+    "_Exit",
+    "__assert2",
+    "__assert_fail",
+    "__fortify_fail",
+    "__cxa_throw",
+    "__cxa_rethrow",
+    "_Unwind_Resume",
+    "pthread_exit",
+    "longjmp",
+    "siglongjmp",
+    "__libc_fatal",
+    "__android_log_assert",
+    "_ZSt9terminatev",
+];
 
 /// Réglages de `--native-disasm`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,11 +105,20 @@ pub struct DisasmFunction {
     pub disasm_status: &'static str,
     pub truncated: bool,
     pub truncated_reason: Option<&'static str>,
+    /// Instruction refusée par le décodeur qui a coupé un chemin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated_at: Option<TruncatedAt>,
     pub instructions: Vec<DisasmInsn>,
     pub calls: Vec<DisasmCall>,
     pub string_refs: Vec<StringRef>,
     pub jni_calls: Vec<JniCall>,
     pub syscalls: Vec<Syscall>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TruncatedAt {
+    pub address: String,
+    pub bytes: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -148,12 +182,25 @@ impl DisasmFunction {
             disasm_status: STATUS_OK,
             truncated: false,
             truncated_reason: None,
+            truncated_at: None,
             instructions: Vec::new(),
             calls: Vec::new(),
             string_refs: Vec::new(),
             jni_calls: Vec::new(),
             syscalls: Vec::new(),
         }
+    }
+}
+
+/// Le temps de `job`, les paniques (rattrapées plus bas, instruction par
+/// instruction) n'écrivent rien sur stderr ; le hook précédent est rétabli.
+pub(super) fn silence_panics(job: impl FnOnce()) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(job));
+    std::panic::set_hook(previous);
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
     }
 }
 
@@ -544,6 +591,8 @@ struct Ctx<'a> {
     starts: HashSet<u64>,
     plt_got: Option<u64>,
     plt_cache: RefCell<HashMap<u64, Option<String>>>,
+    /// Fonction déjà désassemblée → aucun de ses chemins ne revient.
+    noreturn: RefCell<HashMap<u64, bool>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -558,6 +607,7 @@ impl<'a> Ctx<'a> {
             starts: HashSet::new(),
             plt_got: None,
             plt_cache: RefCell::new(HashMap::new()),
+            noreturn: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -839,12 +889,27 @@ fn in_function(ctx: &Ctx, start: u64, at: u64) -> bool {
     ctx.image.is_exec(at) && (at == start || !ctx.starts.contains(&at))
 }
 
-fn is_internal(ctx: &Ctx, start: u64, at: u64) -> bool {
-    in_function(ctx, start, at) && plt_import(ctx, at).is_none()
+fn is_internal(ctx: &Ctx, start: u64, at: u64, thumb: bool) -> bool {
+    in_function(ctx, start, at) && plt_import(ctx, at, thumb).is_none()
 }
 
-fn plt_import(ctx: &Ctx, at: u64) -> Option<String> {
-    if ctx.got.is_empty() {
+/// Appel direct sans retour : import de [`NORETURN_IMPORTS`], ou fonction
+/// interne déjà désassemblée dont aucun chemin ne revient. Rien n'est deviné
+/// pour une fonction pas encore vue.
+fn is_noreturn(ctx: &Ctx, target: u64, thumb: bool) -> bool {
+    if ctx.noreturn.borrow().get(&target) == Some(&true) {
+        return true;
+    }
+    match plt_import(ctx, target, thumb) {
+        Some(name) => NORETURN_IMPORTS.contains(&name.as_str()),
+        None => false,
+    }
+}
+
+/// Les entrées PLT sont en ARM sur ARM 32 bits : une cible Thumb n'en est pas
+/// une, et la décoder en ARM ferait lire du Thumb comme de l'ARM.
+fn plt_import(ctx: &Ctx, at: u64, thumb: bool) -> Option<String> {
+    if ctx.got.is_empty() || thumb {
         return None;
     }
     if let Some(found) = ctx.plt_cache.borrow().get(&at) {
@@ -865,7 +930,7 @@ fn resolve_plt(ctx: &Ctx, at: u64) -> Option<String> {
     }
     let mut pc = at;
     for _ in 0..PLT_STUB_INSNS {
-        let insn = decode(arch, ctx.image.code_window(pc)?, pc, false)?;
+        let insn = decode(arch, ctx.image.code_window(pc)?, pc, false).ok()?;
         machine.apply(ctx, &insn);
         match insn.flow {
             Flow::Next => pc = pc.wrapping_add(insn.len),
@@ -890,65 +955,100 @@ fn pc_thunk(ctx: &Ctx, target: u64) -> Option<u8> {
     }
 }
 
+#[derive(Default)]
 struct Explored {
     insns: Vec<Insn>,
     targets: HashSet<u64>,
     reason: Option<&'static str>,
+    truncated_at: Option<TruncatedAt>,
+    /// Un chemin au moins rend la main à l'appelant, ou peut le faire.
+    returns: bool,
 }
 
+impl Explored {
+    /// La première cause de troncature est gardée.
+    fn cut(&mut self, reason: &'static str, at: Option<TruncatedAt>) {
+        if self.reason.is_none() {
+            self.reason = Some(reason);
+            self.truncated_at = at;
+        }
+    }
+}
+
+/// Descente récursive : seuls les successeurs explicites sont suivis. Après un
+/// retour, un saut, un tail-call ou un appel sans retour, rien n'est lu en
+/// séquence.
 fn explore(ctx: &Ctx, arch: Arch, entry: &Entry, max_insns: usize) -> Explored {
-    let mut insns: Vec<Insn> = Vec::new();
-    let mut targets = HashSet::new();
+    let mut out = Explored::default();
     let mut seen = HashSet::new();
-    let mut reason = None;
     let mut work = vec![(entry.address, entry.thumb)];
     'paths: while let Some((start, thumb)) = work.pop() {
         let mut at = start;
         while seen.insert(at) {
-            if insns.len() >= max_insns {
-                reason = Some(REASON_MAX_INSNS);
+            if out.insns.len() >= max_insns {
+                out.reason = Some(REASON_MAX_INSNS);
                 break 'paths;
             }
             let Some(code) = ctx.image.code_window(at) else {
-                reason = reason.or(Some(REASON_OUTSIDE_EXEC));
+                out.cut(REASON_OUTSIDE_EXEC, None);
                 break;
             };
-            let Some(insn) = decode(arch, code, at, thumb) else {
-                reason = reason.or(Some(REASON_INVALID_INSTRUCTION));
-                break;
+            let insn = match decode(arch, code, at, thumb) {
+                Ok(insn) => insn,
+                Err(failure) => {
+                    let reason = match failure {
+                        Failure::Invalid => REASON_INVALID_INSTRUCTION,
+                        Failure::Panic => REASON_DECODER_PANIC,
+                    };
+                    let raw = &code[..undecoded_len(arch, code, thumb)];
+                    let place = TruncatedAt {
+                        address: hex(at),
+                        bytes: hex_bytes(raw),
+                    };
+                    out.cut(reason, Some(place));
+                    break;
+                }
             };
             let next = at.wrapping_add(insn.len);
             let flow = insn.flow;
-            insns.push(insn);
+            out.insns.push(insn);
             match flow {
-                Flow::Next | Flow::Call(..) | Flow::CallVia(_) => {}
+                Flow::Next | Flow::CallVia(_) => {}
+                Flow::Call(target, mode) => {
+                    if is_noreturn(ctx, target, mode) {
+                        break;
+                    }
+                }
                 Flow::Branch(target, mode) => {
                     if in_function(ctx, entry.address, target) {
-                        targets.insert(target);
+                        out.targets.insert(target);
                         work.push((target, mode));
                     }
                 }
                 Flow::Jump(target, mode) => {
-                    if is_internal(ctx, entry.address, target) {
-                        targets.insert(target);
+                    if is_internal(ctx, entry.address, target, mode) {
+                        out.targets.insert(target);
                         work.push((target, mode));
+                    } else if !is_noreturn(ctx, target, mode) {
+                        out.returns = true;
                     }
                     break;
                 }
-                Flow::JumpVia(_) | Flow::Return | Flow::Stop => break,
+                Flow::JumpVia(_) | Flow::Return => {
+                    out.returns = true;
+                    break;
+                }
+                Flow::Stop => break,
             }
             if !in_function(ctx, entry.address, next) {
+                out.returns = true;
                 break;
             }
             at = next;
         }
     }
-    insns.sort_by_key(|insn| insn.address);
-    Explored {
-        insns,
-        targets,
-        reason,
-    }
+    out.insns.sort_by_key(|insn| insn.address);
+    out
 }
 
 struct Analyzed {
@@ -978,12 +1078,16 @@ fn analyze_function(ctx: &Ctx, entry: &Entry, max_insns: usize) -> Analyzed {
     let explored = explore(ctx, arch, entry, max_insns);
     if explored.insns.is_empty() {
         out.function.disasm_status = STATUS_INVALID_ENTRY;
+        out.function.truncated_at = explored.truncated_at;
         return out;
     }
+    let noreturn = !explored.returns && explored.reason.is_none();
+    ctx.noreturn.borrow_mut().insert(entry.address, noreturn);
     if explored.reason.is_some() {
         out.function.disasm_status = STATUS_TRUNCATED;
         out.function.truncated = true;
         out.function.truncated_reason = explored.reason;
+        out.function.truncated_at = explored.truncated_at;
     }
 
     let mut walk = Walk {
@@ -1056,7 +1160,7 @@ impl Walk<'_, '_> {
         }
         match insn.flow {
             Flow::Call(target, mode) => self.direct_call(insn, target, mode),
-            Flow::Jump(target, mode) if !is_internal(ctx, self.start, target) => {
+            Flow::Jump(target, mode) if !is_internal(ctx, self.start, target, mode) => {
                 let arg0 = self.arg(0);
                 self.record_direct(target, mode, arg0);
             }
@@ -1130,7 +1234,7 @@ impl Walk<'_, '_> {
 
     fn record_direct(&mut self, target: u64, mode: bool, arg0: Val) {
         let ctx = self.ctx;
-        if let Some(name) = plt_import(ctx, target) {
+        if let Some(name) = plt_import(ctx, target, mode) {
             self.calls.push(DisasmCall {
                 target: Some(hex(target)),
                 import: Some(name),
@@ -1424,6 +1528,8 @@ fn imports_called(functions: &[DisasmFunction]) -> BTreeMap<&'static str, Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use super::super::decode::COPROCESSOR;
 
     const CODE: u64 = 0x1000;
 
@@ -1929,6 +2035,206 @@ mod tests {
         assert_eq!(lifted["class"], "Lcom/a/B;");
     }
 
+    /// Une relocation JUMP_SLOT en 0x2800 vers le symbole dynamique 1, nommé
+    /// `name` ; rend la table dynamique qui les décrit.
+    fn jump_slot(data: &mut [u8], slot: u64, name: &str, arm: bool) -> [(u64, u64); 6] {
+        put(data, 0x2a01, name.as_bytes());
+        let (pltrel, size, syment) = if arm {
+            put(data, 0x2800, &(slot as u32).to_le_bytes());
+            let info = (1u32 << 8) | elf::R_ARM_JUMP_SLOT;
+            put(data, 0x2804, &info.to_le_bytes());
+            put(data, 0x2910, &1u32.to_le_bytes());
+            (elf::DT_REL, 8, 16)
+        } else {
+            put(data, 0x2800, &slot.to_le_bytes());
+            let info = (1u64 << 32) | u64::from(elf::R_AARCH64_JUMP_SLOT);
+            put(data, 0x2808, &info.to_le_bytes());
+            put(data, 0x2918, &1u32.to_le_bytes());
+            (elf::DT_RELA, 24, 24)
+        };
+        [
+            (u64::from(elf::DT_JMPREL), 0x2800),
+            (u64::from(elf::DT_PLTRELSZ), size),
+            (u64::from(elf::DT_PLTREL), u64::from(pltrel)),
+            (u64::from(elf::DT_SYMTAB), 0x2900),
+            (u64::from(elf::DT_STRTAB), 0x2a00),
+            (u64::from(elf::DT_SYMENT), syment),
+        ]
+    }
+
+    /// AArch64 : la branche mène à un appel sans retour, suivi d'une voisine.
+    const A64_NORETURN: &[(u32, &str)] = &[
+        (0xb4000040, "1000  cbz  x0, 0x1008"),
+        (0xd65f03c0, "1004  ret"),
+        (0x940001fe, "1008  bl   0x1800  ; __stack_chk_fail@plt"),
+        (0xd2800020, "100c  mov  x0, #1  ; fonction voisine"),
+        (0xd65f03c0, "1010  ret"),
+    ];
+
+    /// 0x1100 n'appelle qu'un import sans retour.
+    const A64_NORETURN_CHAIN: &[(u32, &str)] = &[
+        (0x940001c0, "1100  bl   0x1800"),
+        (0xd2800020, "1104  mov  x0, #1"),
+    ];
+
+    const A64_CALLS_NORETURN: &[(u32, &str)] = &[
+        (0x97ffffc0, "1200  bl   0x1100"),
+        (0xd2800020, "1204  mov  x0, #1"),
+        (0xd65f03c0, "1208  ret"),
+    ];
+
+    #[test]
+    fn a_call_to_a_noreturn_import_ends_the_path() {
+        let mut data = vec![0u8; 0x4000];
+        assemble(&mut data, CODE, A64_NORETURN);
+        assemble(&mut data, 0x1800, A64_PLT);
+        let dynamic = jump_slot(&mut data, 0x3000, "__stack_chk_fail", false);
+        let mut ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        let out = analyze(&ctx, CODE, false);
+        let f = &out.function;
+        assert_eq!(f.instructions.len(), 3);
+        assert_eq!((f.disasm_status, f.truncated), (STATUS_OK, false));
+        assert_eq!(f.calls[0].import.as_deref(), Some("__stack_chk_fail"));
+    }
+
+    #[test]
+    fn a_known_noreturn_function_ends_the_path_of_its_callers() {
+        let mut data = vec![0u8; 0x4000];
+        assemble(&mut data, 0x1100, A64_NORETURN_CHAIN);
+        assemble(&mut data, 0x1200, A64_CALLS_NORETURN);
+        assemble(&mut data, 0x1800, A64_PLT);
+        let dynamic = jump_slot(&mut data, 0x3000, "abort", false);
+        let mut ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        // 0x1100 pas encore vue : rien n'est supposé.
+        let unknown = analyze(&ctx, 0x1200, false);
+        assert_eq!(unknown.function.instructions.len(), 3);
+        let callee = analyze(&ctx, 0x1100, false);
+        assert_eq!(callee.function.instructions.len(), 1);
+        let caller = analyze(&ctx, 0x1200, false);
+        assert_eq!(caller.function.instructions.len(), 1);
+        assert_eq!(caller.function.disasm_status, STATUS_OK);
+    }
+
+    /// Entrée PLT ARM de libbash.so (armeabi-v7a, .plt + 0x20), déplacée en
+    /// 0x1800 : GOT = 0x1808 + 0x1000 + 0xc84 = 0x348c.
+    const ARM_PLT: &[(u32, &str)] = &[
+        (0xe28fc600, "1800  add  ip, pc, #0, 12"),
+        (0xe28cca01, "1804  add  ip, ip, #1, 20"),
+        (0xe5bcfc84, "1808  ldr  pc, [ip, #0xc84]!"),
+        (0xd4d4d4d4, "180c  remplissage"),
+    ];
+
+    const ARM_CALLS_PLT: &[(u32, &str)] = &[
+        (0xeb0001fe, "1000  bl   0x1800"),
+        (0xe12fff1e, "1004  bx   lr"),
+    ];
+
+    /// blx 0x1800 depuis 0x1100 : cible ARM = Align(0x1104, 4) + 0x6fc.
+    const THUMB_CALLS_PLT: &[(u16, &str)] = &[
+        (0xf000, "1100  blx  0x1800"),
+        (0xeb7e, ""),
+        (0x4770, "1104  bx   lr"),
+    ];
+
+    #[test]
+    fn arm_plt_entry_resolves_its_jump_slot_from_arm_and_thumb() {
+        let mut data = vec![0u8; 0x4000];
+        assemble(&mut data, CODE, ARM_CALLS_PLT);
+        assemble_thumb(&mut data, 0x1100, THUMB_CALLS_PLT);
+        assemble(&mut data, 0x1800, ARM_PLT);
+        let dynamic = jump_slot(&mut data, 0x348c, "dlopen", true);
+        let mut ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        let plt = DisasmCall {
+            target: Some("0x1800".to_string()),
+            import: Some("dlopen".to_string()),
+            symbol: None,
+            kind: CALL_PLT,
+        };
+        let expected = std::slice::from_ref(&plt);
+        for (address, thumb) in [(CODE, false), (0x1100, true)] {
+            let out = analyze(&ctx, address, thumb);
+            assert_eq!(out.function.calls, expected, "{address:#x}");
+            assert!(out.callees.is_empty(), "{address:#x}");
+        }
+    }
+
+    /// Prologue et épilogue Thumb-2 de libbash.so (armeabi-v7a), le bl visant
+    /// 0x1100. Les deux demi-mots qui suivent le pop sont un littéral.
+    const THUMB_FRAME: &[(u16, &str)] = &[
+        (0xb5f0, "1000  push   {r4-r7, lr}"),
+        (0xaf03, "1002  add    r7, sp, #12"),
+        (0xe92d, "1004  push.w {r8-r11}"),
+        (0x0f00, ""),
+        (0xb081, "1008  sub    sp, #4"),
+        (0xf000, "100a  bl     0x1100"),
+        (0xf879, ""),
+        (0xb001, "100e  add    sp, #4"),
+        (0xe8bd, "1010  pop.w  {r8-r11}"),
+        (0x0f00, ""),
+        (0xbdf0, "1014  pop    {r4-r7, pc}"),
+        (0xffff, "1016  littéral"),
+        (0xffff, ""),
+    ];
+
+    #[test]
+    fn thumb2_frame_is_one_function_and_its_literal_is_not_code() {
+        let mut data = vec![0u8; 0x2000];
+        assemble_thumb(&mut data, CODE, THUMB_FRAME);
+        put(&mut data, 0x1100, &0x4770u16.to_le_bytes());
+        let ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        let out = analyze(&ctx, CODE, true);
+        let f = &out.function;
+        assert_eq!(f.disasm_status, STATUS_OK);
+        assert_eq!(f.instructions.len(), 8);
+        assert_eq!(f.instructions[7].address, "0x1014");
+        assert_eq!(f.calls[0].target.as_deref(), Some("0x1100"));
+        let callee = out.callees[0];
+        assert_eq!((callee.address, callee.thumb), (0x1100, true));
+    }
+
+    /// vpush / vpop {d8-d9}, absents de yaxpeax-arm 0.5.0.
+    const THUMB_VFP: &[(u16, &str)] = &[
+        (0xb5f0, "1000  push   {r4-r7, lr}"),
+        (0xed2d, "1002  vpush  {d8-d9}"),
+        (0x8b04, ""),
+        (0xecbd, "1006  vpop   {d8-d9}"),
+        (0x8b04, ""),
+        (0xbdf0, "100a  pop    {r4-r7, pc}"),
+    ];
+
+    #[test]
+    fn vfp_instructions_do_not_cut_a_thumb_function() {
+        let mut data = vec![0u8; 0x2000];
+        assemble_thumb(&mut data, CODE, THUMB_VFP);
+        let ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        let out = analyze(&ctx, CODE, true);
+        let f = &out.function;
+        assert_eq!(f.disasm_status, STATUS_OK);
+        assert_eq!(f.instructions.len(), 4);
+        assert_eq!(f.instructions[1].mnemonic, COPROCESSOR);
+        assert_eq!(f.instructions[3].address, "0x100a");
+    }
+
+    #[test]
+    fn an_invalid_instruction_on_a_reached_path_is_located() {
+        let mut data = vec![0u8; 0x2000];
+        // 1000 je 0x1003 ; 1002 ret ; 1003 : 06, invalide en 64 bits
+        put(&mut data, CODE, &[0x74, 0x01, 0xc3, 0x06]);
+        let ctx = Ctx::new(image(&data, elf::EM_X86_64, 8));
+        let out = analyze(&ctx, CODE, false);
+        let f = &out.function;
+        assert_eq!(f.instructions.len(), 2);
+        assert_eq!(f.truncated_reason, Some(REASON_INVALID_INSTRUCTION));
+        let at = TruncatedAt {
+            address: "0x1003".to_string(),
+            bytes: "06000000".to_string(),
+        };
+        assert_eq!(f.truncated_at, Some(at));
+    }
+
     #[test]
     fn legend_defines_every_disasm_label() {
         let legend = legend();
@@ -1948,6 +2254,9 @@ mod tests {
             REASON_INVALID_INSTRUCTION,
             REASON_OUTSIDE_EXEC,
             REASON_PANIC,
+            REASON_DECODER_PANIC,
+            "truncated_at",
+            COPROCESSOR,
             CALL_INTERNAL,
             CALL_PLT,
             CALL_INDIRECT,
@@ -1963,7 +2272,7 @@ mod tests {
             "imports_called",
             jni::JNI_SOURCE,
         ];
-        for label in labels {
+        for label in labels.iter().chain(NORETURN_IMPORTS) {
             assert!(legend.contains(label), "{label}");
         }
         assert!(legend.contains(&format!("(défaut {DEFAULT_DISASM_DEPTH})")));

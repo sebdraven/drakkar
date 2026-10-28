@@ -7,6 +7,7 @@
 //! x86 rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8 à r15 (0 à 15).
 
 use iced_x86::{Formatter, Mnemonic, OpKind, Register};
+use std::panic::AssertUnwindSafe;
 use yaxpeax_arch::{Decoder, LengthedInstruction, U8Reader};
 use yaxpeax_arm::armv7::{self, Opcode as ArmOp, Operand as ArmOperand};
 use yaxpeax_arm::armv8::a64::{self, Opcode as A64Op, Operand as A64Operand};
@@ -117,15 +118,43 @@ pub(super) fn hex_bytes(bytes: &[u8]) -> String {
     out
 }
 
-/// `code` commence à `address` ; `None` si les octets ne forment pas une
-/// instruction valide.
-pub(super) fn decode(arch: Arch, code: &[u8], address: u64, thumb: bool) -> Option<Insn> {
+/// Mnémonique d'une instruction coprocesseur, VFP ou Advanced SIMD que
+/// yaxpeax-arm ne décode pas : seule sa longueur est connue.
+pub(super) const COPROCESSOR: &str = "coproc";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Failure {
+    Invalid,
+    /// Le décodeur a paniqué sur ces octets.
+    Panic,
+}
+
+/// `code` commence à `address`. Une panique du décodeur est rattrapée ici,
+/// instruction par instruction.
+pub(super) fn decode(arch: Arch, code: &[u8], address: u64, thumb: bool) -> Result<Insn, Failure> {
+    let job = AssertUnwindSafe(|| decode_one(arch, code, address, thumb));
+    match std::panic::catch_unwind(job) {
+        Ok(Some(insn)) => Ok(insn),
+        Ok(None) => Err(Failure::Invalid),
+        Err(_) => Err(Failure::Panic),
+    }
+}
+
+fn decode_one(arch: Arch, code: &[u8], address: u64, thumb: bool) -> Option<Insn> {
     match arch {
         Arch::Aarch64 => decode_a64(code, address),
         Arch::Arm => decode_arm(code, address, thumb),
         Arch::X86 => decode_x86(code, address, 32),
         Arch::X86_64 => decode_x86(code, address, 64),
     }
+}
+
+/// Octets à rapporter pour une instruction refusée : sa longueur en Thumb, un
+/// mot ailleurs (sur x86, la longueur réelle est inconnue).
+pub(super) fn undecoded_len(arch: Arch, code: &[u8], thumb: bool) -> usize {
+    let narrow = arch == Arch::Arm && thumb && code.get(1).is_some_and(|&b| b < 0xe8);
+    let len = if narrow { 2 } else { 4 };
+    len.min(code.len())
 }
 
 fn sext(value: u64, bits: u32) -> i64 {
@@ -476,8 +505,13 @@ impl Site<'_> {
 fn decode_arm(code: &[u8], address: u64, thumb: bool) -> Option<Insn> {
     let mut decoder = armv7::InstDecoder::default();
     decoder.set_thumb_mode(thumb);
+    // Strict : sinon un ldrd/strd ARM avec Rt = 15 atteint Reg::from_u8(16) et
+    // panique (yaxpeax-arm 0.5.0, armv7.rs:585).
+    decoder.set_allow_nonconforming(false);
     let mut reader = U8Reader::new(code);
-    let inst = decoder.decode(&mut reader).ok()?;
+    let Ok(inst) = decoder.decode(&mut reader) else {
+        return coprocessor(code, address, thumb);
+    };
     let len = usize::try_from(inst.len().to_const()).ok()?;
     let raw = code.get(..len)?;
     let mut insn = Insn::from_text(address, raw, &inst.to_string());
@@ -491,6 +525,34 @@ fn decode_arm(code: &[u8], address: u64, thumb: bool) -> Option<Insn> {
         conditional(&mut insn);
     }
     Some(insn)
+}
+
+/// Espace coprocesseur, VFP et Advanced SIMD (ARMv7-A, A5.7, A6.3 et A7) :
+/// instruction sans effet suivi, de longueur 4.
+fn coprocessor(code: &[u8], address: u64, thumb: bool) -> Option<Insn> {
+    let raw = code.get(..4)?;
+    let found = if thumb {
+        let hw1 = u16::from_le_bytes([raw[0], raw[1]]);
+        (hw1 & 0xec00) == 0xec00 || (hw1 & 0xff10) == 0xf900
+    } else {
+        arm_coprocessor(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+    };
+    if !found {
+        return None;
+    }
+    Some(Insn::new(
+        address,
+        raw,
+        COPROCESSOR.to_string(),
+        String::new(),
+    ))
+}
+
+fn arm_coprocessor(word: u32) -> bool {
+    if word >> 28 == 0xf {
+        return word >> 25 == 0x79 || (word >> 24 == 0xf4 && word & 0x0010_0000 == 0);
+    }
+    (word >> 26) & 0b11 == 0b11 && (word >> 24) & 0xf != 0xf
 }
 
 /// Une instruction conditionnelle peut ne pas s'exécuter : ses écritures
@@ -747,9 +809,16 @@ fn arm_load(ops: &[ArmOperand; 4], site: Site, width: u64, insn: &mut Insn) {
     };
     let rt = rt.number();
     if rt == 15 {
+        // La réécriture de la base est appliquée avant la lecture de la cible.
+        let target = match (addr, wback) {
+            (Addr::Base(base, off), Some((reg, delta))) if base == reg => {
+                Addr::Base(base, off.wrapping_sub(delta))
+            }
+            _ => addr,
+        };
         insn.flow = match (addr, wback) {
             (Addr::Base(13, 0), Some((13, _))) => Flow::Return,
-            _ => Flow::JumpVia(Via::Mem(addr)),
+            _ => Flow::JumpVia(Via::Mem(target)),
         };
     } else {
         insn.ops.push(Op::Load(rt, addr, width));
@@ -1042,8 +1111,8 @@ mod tests {
 
     #[test]
     fn thumb_branch_targets_are_read_from_the_encoding() {
-        // 0x1000: bl 0x2000 = f000 f800 + offset 0xffc
-        //   imm32 = 0xffc = S 0, I1 1, I2 1, imm10 0x000, imm11 0x7fe -> J1 = J2 = 1
+        // 0x1000: bl 0x2000 = f000 fffe
+        //   imm32 = 0xffc = S 0, I1 0, I2 0, imm10 0x000, imm11 0x7fe -> J1 = J2 = 1
         let code = [0x00, 0xf0, 0xfe, 0xff];
         let site = Site {
             code: &code,
@@ -1071,5 +1140,48 @@ mod tests {
             thumb: false,
         };
         assert_eq!(site.branch_target(4), Some((0x1100, false)));
+    }
+
+    /// Flot d'une instruction Thumb décodée à 0x1000 (yaxpeax, puis cible relue
+    /// dans l'encodage, pc = 0x1004).
+    fn thumb_flow(code: &[u8]) -> Flow {
+        decode(Arch::Arm, code, 0x1000, true).unwrap().flow
+    }
+
+    #[test]
+    fn thumb2_branches_decode_with_their_targets() {
+        // b.w 0x1100 : f000 b87e (T4, imm32 = 0xfc)
+        let b_w = [0x00, 0xf0, 0x7e, 0xb8];
+        assert_eq!(thumb_flow(&b_w), Flow::Jump(0x1100, true));
+        // beq.w 0x1100 : f000 807e (T3)
+        let beq_w = [0x00, 0xf0, 0x7e, 0x80];
+        assert_eq!(thumb_flow(&beq_w), Flow::Branch(0x1100, true));
+        // bl 0x2000 : f000 fffe
+        let bl = [0x00, 0xf0, 0xfe, 0xff];
+        assert_eq!(thumb_flow(&bl), Flow::Call(0x2000, true));
+        // blx 0x1800 : f000 ebfe, cible ARM = Align(0x1004, 4) + 0x7fc
+        let blx = [0x00, 0xf0, 0xfe, 0xeb];
+        assert_eq!(thumb_flow(&blx), Flow::Call(0x1800, false));
+        // cbz r1, 0x1008 : b111
+        assert_eq!(thumb_flow(&[0x11, 0xb1]), Flow::Branch(0x1008, true));
+    }
+
+    #[test]
+    fn arm_ldrd_into_pc_is_invalid_not_a_panic() {
+        // ldrd pc, [r0, r1] : e180f0d1. Avec Rt = 15, un décodeur non strict
+        // atteint Reg::from_u8(16) (yaxpeax-arm 0.5.0, armv7.rs:2034 puis 585).
+        let code = 0xe180_f0d1u32.to_le_bytes();
+        let decoded = decode(Arch::Arm, &code, 0x1000, false);
+        assert_eq!(decoded.err(), Some(Failure::Invalid));
+    }
+
+    #[test]
+    fn vfp_and_simd_are_skipped_by_length() {
+        // vpush {d8-d9} : ed2d 8b04 (Thumb-2), absent de yaxpeax-arm 0.5.0.
+        let vpush = [0x2d, 0xed, 0x04, 0x8b];
+        let insn = decode(Arch::Arm, &vpush, 0x1000, true).unwrap();
+        assert_eq!((insn.mnemonic.as_str(), insn.len), (COPROCESSOR, 4));
+        assert_eq!(insn.flow, Flow::Next);
+        assert!(insn.ops.is_empty());
     }
 }

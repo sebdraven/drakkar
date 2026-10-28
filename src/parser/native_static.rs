@@ -43,7 +43,7 @@ mod jni_table;
 
 pub use self::disasm::{
     DisasmCall, DisasmFunction, DisasmInsn, DisasmOptions, ElfDisasm, JavaMember, JniCall,
-    StringRef, Syscall,
+    StringRef, Syscall, TruncatedAt,
 };
 
 /// Catégories d'imports : noms exacts, ou préfixes quand ils finissent par `*`.
@@ -427,9 +427,11 @@ pub fn analyze_apk(path: &Path, disasm: Option<&DisasmOptions>) -> Result<Native
         None => Vec::new(),
     };
     if let Some(options) = disasm {
-        for (elf, bytes) in elfs.iter_mut().zip(&kept) {
-            self::disasm::run(bytes, elf, options);
-        }
+        self::disasm::silence_panics(|| {
+            for (elf, bytes) in elfs.iter_mut().zip(&kept) {
+                self::disasm::run(bytes, elf, options);
+            }
+        });
         self::disasm::disambiguate(&elfs, &mut binding);
     }
     let declared = natives.as_ref().map_or(0, Vec::len);
@@ -1933,20 +1935,39 @@ DÉSASSEMBLAGE (elfs[].disasm) — avec --native-disasm seulement, absent sinon
                   segment exécutable ou première instruction indécodable.
     truncated, truncated_reason
                   max_insns = --disasm-max-insns atteint ; invalid_instruction = octets
-                  indécodables sur un chemin ; outside_exec = chemin sorti des segments
-                  exécutables ; panic = panique pendant la fonction, rendue vide.
+                  indécodables, atteints par un chemin ; decoder_panic = le décodeur a
+                  paniqué sur une instruction, traitée comme invalide ; outside_exec =
+                  chemin sorti des segments exécutables ; panic = panique ailleurs dans
+                  la fonction, rendue vide. Pendant --native-disasm, un hook de panique
+                  muet remplace celui du programme : ces paniques rattrapées n'écrivent
+                  rien sur stderr ; le hook d'origine est rétabli ensuite.
+    truncated_at  {address, bytes} : adresse et octets bruts de l'instruction refusée
+                  (invalid_instruction, decoder_panic) ; absent sinon.
     instructions[]
                   address, bytes (hexadécimal), mnemonic, operands, triées par adresse.
-                  Délimitation par descente récursive depuis l'entrée : branches internes
-                  suivies ; arrêt sur retour, saut indirect, tail-call, instruction
-                  invalide ; st_size borne la fonction quand un symbole le donne, sinon
-                  le début d'une autre fonction connue arrête le parcours.
+                  mnemonic coproc = instruction coprocesseur, VFP ou Advanced SIMD (ARM,
+                  Thumb-2) que yaxpeax-arm ne décode pas : seule sa longueur est connue,
+                  ses écritures éventuelles dans les registres généraux ne sont pas
+                  suivies. Délimitation par descente récursive depuis l'entrée : seuls
+                  les successeurs explicites sont suivis (instruction suivante, cible de
+                  branche), jamais la suite d'un retour, d'un saut, d'un tail-call ou
+                  d'un appel sans retour. Appel sans retour : appel direct vers un
+                  import de la table IMPORTS SANS RETOUR, ou vers une fonction interne
+                  déjà désassemblée dont aucun chemin ne revient (rien n'est supposé
+                  d'une fonction pas encore vue). st_size borne la fonction quand un
+                  symbole le donne, sinon le début d'une autre fonction connue arrête le
+                  parcours.
     calls[]       Appels et tail-calls distincts. kind : internal = cible dans l'ELF,
                   symbol = symbole de .dynsym ou .symtab à cette adresse, null sinon ;
                   plt = import appelé par un stub PLT ou par un emplacement de GOT,
                   import = nom résolu par R_*_JUMP_SLOT ou R_*_GLOB_DAT de PT_DYNAMIC,
                   target null si l'appel passe par la GOT ; indirect = cible non résolue,
                   target null. Les appels par la table de JNIEnv y figurent en indirect.
+                  Stub PLT reconnu en évaluant ses instructions jusqu'au saut indirect :
+                  AArch64 adrp / ldr / br ; ARM add ip, pc / add ip, ip / ldr pc, [ip]!
+                  (forme courte à 3 mots ou longue à 4) ou movw / movt / add ip, pc ;
+                  x86_64 jmp [rip+…] ; x86 jmp [ebx+…]. Sur ARM, seule une cible en mode
+                  ARM peut être une entrée PLT.
     string_refs[] address = instruction qui forme l'adresse ; target = adresse de la
                   chaîne ; value = octets jusqu'au premier nul, 256 au plus ; encoding =
                   utf8, ou hex pour des octets non UTF-8 d'une section en lecture seule.
@@ -2028,6 +2049,9 @@ pub fn legend() -> String {
     let source = jni_table::JNI_SOURCE;
     let jni = format!("\nTABLE JNIEnv (jni_calls[].index)\n  {source}\n");
     out.push_str(&jni);
+    let noreturn = disasm::NORETURN_IMPORTS.join(" ");
+    let section = format!("\nIMPORTS SANS RETOUR (--native-disasm)\n  {noreturn}\n");
+    out.push_str(&section);
     out
 }
 

@@ -88,6 +88,17 @@ système. Par ELF : les upcalls vers Java, les méthodes enregistrées par
 `registered_ambiguous`) et les imports appelés par catégorie.
 `drakkar --native --legend` définit chaque champ.
 
+Une fonction s'arrête où ses chemins s'arrêtent : retour, saut, tail-call, ou
+appel direct à une fonction sans retour (`__stack_chk_fail`, `abort`,
+`__cxa_throw`… liste dans la légende) ; le code qui suit n'est jamais lu en
+séquence. Les stubs PLT AArch64, ARM et x86 sont reconnus, l'import nommé par
+la relocation `JUMP_SLOT`. Une instruction que le décodeur refuse, ou sur
+laquelle il panique, coupe son chemin : `truncated_reason` vaut alors
+`invalid_instruction` ou `decoder_panic`, et `truncated_at` donne son adresse
+et ses octets. Les instructions VFP et Advanced SIMD (ARM, Thumb-2), que
+yaxpeax-arm ne décode pas, sont sautées à leur longueur sous le mnémonique
+`coproc`.
+
 Ce qu'il ne fait pas :
 
 - aucune exécution, aucune émulation, aucune exécution symbolique ;
