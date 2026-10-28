@@ -70,6 +70,8 @@ pub struct DexMethod<'a> {
     pub return_type: &'a str,
     /// `ACC_STATIC` du `encoded_method`. Décide s'il y a un `this`.
     pub is_static: bool,
+    /// `ACC_NATIVE` du `encoded_method` : le corps est lié par JNI.
+    pub is_native: bool,
     /// `None` pour abstract et native.
     pub code: Option<Code<'a>>,
 }
@@ -357,6 +359,7 @@ impl DexBin {
             params: proto.map_or(NO_PARAMS, |p| p.params.as_slice()),
             return_type: proto.map_or("", |p| p.return_type.as_str()),
             is_static: access_flags & ACC_STATIC != 0,
+            is_native: access_flags & ACC_NATIVE != 0,
             code,
         })
     }
@@ -568,6 +571,7 @@ fn subst(s: &str, subs: &[(String, String)]) -> String {
 }
 
 const ACC_STATIC: u32 = 0x8;
+const ACC_NATIVE: u32 = 0x100;
 
 const NO_PARAMS: &[String] = &[];
 

@@ -75,6 +75,12 @@ dex-bytecode = { git = "https://github.com/androguard/dex-bytecode" }
 # Consommé UNIQUEMENT par parser::decompile.
 dex-decompiler = { git = "https://github.com/androguard/dex-decompiler", rev = "f7fa4a4853d957ebc3c54355d128a3835ef5ae22" }
 
+# Lecture des ELF (--native, parser::native_static) : en-têtes, sections,
+# segments, table dynamique, symboles. Pur Rust, lecture seule. `unaligned` :
+# sans elle, `object` exige que chaque structure soit alignée en mémoire, ce que
+# ni un Vec décompressé ni un ELF trafiqué ne garantissent.
+object = { version = "0.37", default-features = false, features = ["read_core", "elf", "std", "unaligned"] }
+
 # LIEF: réservé au parsing ELF natif (lib/*/*.so). Build C++ lourd, activé à la
 # demande -> `cargo build --features lief-backend`.
 lief = { version = "0.16", optional = true }
