@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Couvre les commits qui ne passent pas par pre-commit (rebase, outils).
+# Commandes recopiées de .github/workflows/ci.yml (jobs fmt et clippy) : les
+# garder identiques.
+if ! cargo fmt --all --check; then
+    echo "pre-push : formatage non conforme. Lancer \`cargo fmt --all\`, puis recommiter avant de pousser." >&2
+    exit 1
+fi
+cargo clippy --locked --all-targets -- -D warnings
