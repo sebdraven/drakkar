@@ -41,6 +41,16 @@ const REASON_DECODER_PANIC: &str = "decoder_panic";
 const CALL_INTERNAL: &str = "internal";
 const CALL_PLT: &str = "plt";
 const CALL_INDIRECT: &str = "indirect";
+const CALL_UNRESOLVED: &str = "unresolved";
+
+const FORM_VTABLE: &str = "vtable";
+const FORM_CXX_WRAPPER: &str = "cxx_wrapper";
+
+const UNRESOLVED_ENV: &str = "env_unproven";
+const UNRESOLVED_CLASS: &str = "class_unresolved";
+const UNRESOLVED_NAME: &str = "name_unresolved";
+const UNRESOLVED_SIGNATURE: &str = "signature_unresolved";
+const UNRESOLVED_TABLE: &str = "table_unresolved";
 
 pub(super) const DISAMBIGUATED_BY_FIND_CLASS: &str = "find_class";
 
@@ -161,13 +171,31 @@ pub struct StringRef {
 pub struct JniCall {
     pub name: &'static str,
     pub index: usize,
+    pub form: &'static str,
     pub resolved: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unresolved_reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+}
+
+impl JniCall {
+    fn new(name: &'static str, index: usize, form: &'static str) -> Self {
+        JniCall {
+            name,
+            index,
+            form,
+            resolved: false,
+            unresolved_reason: None,
+            class: None,
+            method: None,
+            signature: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
