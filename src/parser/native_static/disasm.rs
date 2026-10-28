@@ -1755,7 +1755,7 @@ mod tests {
         let class = out.function.jni_calls[1].class.as_deref();
         assert_eq!(class, Some("Lcom/foo/Bar;"));
         let run = member("Lcom/foo/Bar;", "run", "()V", Some(0x1100));
-        assert_eq!(out.registered, [run.clone()]);
+        assert_eq!(out.registered, std::slice::from_ref(&run));
 
         let mut elf = ElfReport::new("lib/arm64-v8a/libx.so", &[]);
         let disasm = ElfDisasm {
