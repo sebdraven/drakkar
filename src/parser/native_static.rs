@@ -598,6 +598,8 @@ struct DynSymbol {
     defined: bool,
     bind: u8,
     value: u64,
+    size: u64,
+    func: bool,
 }
 
 struct Region<'a> {
@@ -695,6 +697,8 @@ struct Parsed<'a> {
     entry: u64,
     dynamic: Option<Vec<(u64, u64)>>,
     symbols: Vec<DynSymbol>,
+    /// `.symtab`, quand l'ELF n'est pas strippé.
+    local_symbols: Vec<DynSymbol>,
     anomalies: Vec<String>,
 }
 
@@ -735,6 +739,7 @@ where
 
     let mut sections = Vec::new();
     let mut symbols = Vec::new();
+    let mut local_symbols = Vec::new();
     match header.sections(endian, data) {
         Ok(table) if table.is_empty() => {
             note(&mut anomalies, "section_headers_absent", "table vide");
@@ -751,24 +756,12 @@ where
                     size: sh.sh_size(endian).into(),
                 });
             }
-            match table.symbols(endian, data, elf::SHT_DYNSYM) {
-                Ok(dynsym) => {
-                    for sym in dynsym.iter() {
-                        let Ok(name) = dynsym.symbol_name(endian, sym) else {
-                            continue;
-                        };
-                        if name.is_empty() {
-                            continue;
-                        }
-                        symbols.push(DynSymbol {
-                            name: String::from_utf8_lossy(name).into_owned(),
-                            defined: !sym.is_undefined(endian),
-                            bind: sym.st_bind(),
-                            value: sym.st_value(endian).into(),
-                        });
-                    }
-                }
+            match read_symbols(&table, endian, data, elf::SHT_DYNSYM) {
+                Ok(list) => symbols = list,
                 Err(e) => note(&mut anomalies, "section_headers_incoherent", e),
+            }
+            if let Ok(list) = read_symbols(&table, endian, data, elf::SHT_SYMTAB) {
+                local_symbols = list;
             }
         }
         Err(e) => note(&mut anomalies, "section_headers_invalid", e),
@@ -789,8 +782,39 @@ where
         entry: header.e_entry(endian).into(),
         dynamic,
         symbols,
+        local_symbols,
         anomalies,
     })
+}
+
+fn read_symbols<'data, Elf>(
+    table: &SectionTable<'data, Elf>,
+    endian: Endianness,
+    data: &'data [u8],
+    sh_type: u32,
+) -> object::read::Result<Vec<DynSymbol>>
+where
+    Elf: FileHeader<Endian = Endianness>,
+{
+    let symtab = table.symbols(endian, data, sh_type)?;
+    let mut symbols = Vec::new();
+    for sym in symtab.iter() {
+        let Ok(name) = symtab.symbol_name(endian, sym) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        symbols.push(DynSymbol {
+            name: String::from_utf8_lossy(name).into_owned(),
+            defined: !sym.is_undefined(endian),
+            bind: sym.st_bind(),
+            value: sym.st_value(endian).into(),
+            size: sym.st_size(endian).into(),
+            func: sym.st_type() == elf::STT_FUNC,
+        });
+    }
+    Ok(symbols)
 }
 
 fn dyn_pairs<Elf>(entries: &[Elf::Dyn], endian: Elf::Endian) -> Vec<(u64, u64)>
@@ -816,6 +840,7 @@ fn inspect(bytes: &[u8], report: &mut ElfReport) -> object::read::Result<()> {
         dynamic,
         symbols,
         anomalies,
+        ..
     } = parse_elf(bytes)?;
     report.anomalies.extend(anomalies);
     report.elf_type = match e_type {
