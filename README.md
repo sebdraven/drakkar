@@ -21,6 +21,22 @@ drakkar app.apk --rules rules/mitre \
   --kharon kharon_summary.json
 ```
 
+## Hooks git
+
+```sh
+git config core.hooksPath .githooks
+```
+
+Les deux hooks lancent les mêmes commandes que la CI (`.github/workflows/ci.yml`) :
+`cargo fmt --all --check`, puis `cargo clippy --locked --all-targets -- -D warnings`.
+
+- `pre-commit` bloque un commit mal formaté ou qui déclenche un avertissement clippy.
+- `pre-push` refait les mêmes vérifications avant de pousser. Il couvre les commits
+  créés par un rebase ou par un outil, qui ne passent pas par `pre-commit`.
+
+Aucun hook ne reformate. En cas d'échec de fmt, lancer `cargo fmt --all`, puis
+recommiter.
+
 ## Architecture
 
 | Module        | Rôle                                             |
