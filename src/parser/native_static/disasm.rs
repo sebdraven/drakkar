@@ -1366,7 +1366,7 @@ impl Walk<'_, '_> {
 
     /// Appel par la table de JNIEnv au décalage `off`. `None` si ce décalage ne
     /// désigne aucune fonction de la table ; sinon la valeur rendue.
-    fn jni_call(&mut self, off: u64, resolved: bool) -> Option<Val> {
+    fn jni_call(&mut self, off: u64, env_proven: bool) -> Option<Val> {
         let ptr = self.ctx.image.ptr_size;
         if !off.is_multiple_of(ptr) {
             return None;
@@ -1376,23 +1376,47 @@ impl Walk<'_, '_> {
             return None;
         }
         let name = *jni::JNI_NATIVE_INTERFACE.get(index)?;
-        let mut call = JniCall {
-            name,
-            index,
-            resolved,
-            class: None,
-            method: None,
-            signature: None,
-        };
+        Some(self.env_call(name, index, FORM_VTABLE, env_proven))
+    }
+
+    /// Wrapper C++ : `this` est l'env ou la JavaVM, si bien que les arguments
+    /// de jni.h occupent les mêmes registres que dans l'appel par la table.
+    fn wrapper_call(&mut self, wrapper: Wrapper) -> Val {
+        match wrapper {
+            Wrapper::Env(name, index) => self.env_call(name, index, FORM_CXX_WRAPPER, true),
+            Wrapper::Vm(name, index) => {
+                self.writes_env(index);
+                let mut call = JniCall::new(name, index, FORM_CXX_WRAPPER);
+                call.resolved = true;
+                self.out.function.jni_calls.push(call);
+                self.machine.fresh()
+            }
+        }
+    }
+
+    /// Fonction `index` de JNINativeInterface, sous l'une ou l'autre forme ;
+    /// rend la valeur produite par l'appel.
+    fn env_call(
+        &mut self,
+        name: &'static str,
+        index: usize,
+        form: &'static str,
+        env_proven: bool,
+    ) -> Val {
+        let ctx = self.ctx;
+        let mut call = JniCall::new(name, index, form);
         let mut ret = None;
+        let mut missing = None;
         match index {
             jni::FIND_CLASS => {
                 let value = self.arg(1);
-                if let Some(at) = self.machine.materialize(self.ctx, value) {
-                    if let Some(name) = utf8_at(self.ctx, at) {
+                let at = self.machine.materialize(ctx, value);
+                match at.and_then(|at| utf8_at(ctx, at).map(|name| (at, name))) {
+                    Some((at, name)) => {
                         call.class = Some(class_descriptor(&name));
                         ret = Some(Val::Class(at));
                     }
+                    None => missing = Some(UNRESOLVED_CLASS),
                 }
             }
             jni::GET_METHOD_ID
@@ -1402,15 +1426,25 @@ impl Walk<'_, '_> {
                 call.class = self.class_arg(1);
                 call.method = self.string_arg(2);
                 call.signature = self.string_arg(3);
+                missing = if call.class.is_none() {
+                    Some(UNRESOLVED_CLASS)
+                } else if call.method.is_none() {
+                    Some(UNRESOLVED_NAME)
+                } else if call.signature.is_none() {
+                    Some(UNRESOLVED_SIGNATURE)
+                } else {
+                    None
+                };
                 if let Some(member) = upcall(&call) {
                     self.out.upcalls.push(member);
                 }
             }
             jni::REGISTER_NATIVES => {
                 call.class = self.class_arg(1);
-                if let Some(class) = call.class.clone() {
-                    self.registered_by_code(&class);
-                }
+                missing = match call.class.clone() {
+                    Some(class) => (!self.registered_by_code(&class)).then_some(UNRESOLVED_TABLE),
+                    None => Some(UNRESOLVED_CLASS),
+                };
             }
             jni::NEW_GLOBAL_REF | jni::NEW_LOCAL_REF | jni::NEW_WEAK_GLOBAL_REF => {
                 if let Val::Class(at) = self.arg(1) {
@@ -1419,24 +1453,32 @@ impl Walk<'_, '_> {
             }
             _ => {}
         }
+        let reason = if env_proven {
+            missing
+        } else {
+            Some(UNRESOLVED_ENV)
+        };
+        call.resolved = reason.is_none();
+        call.unresolved_reason = reason;
         self.out.function.jni_calls.push(call);
-        Some(ret.unwrap_or_else(|| self.machine.fresh()))
+        ret.unwrap_or_else(|| self.machine.fresh())
     }
 
     /// Entrées JNINativeMethod passées à RegisterNatives : table en troisième
-    /// argument, nombre en quatrième.
-    fn registered_by_code(&mut self, class: &str) {
+    /// argument, nombre en quatrième. Faux si aucune entrée n'a pu être lue.
+    fn registered_by_code(&mut self, class: &str) -> bool {
         let ctx = self.ctx;
         let table = self.arg(2);
         let count = self.arg(3);
         let Some(mut at) = self.machine.materialize(ctx, table) else {
-            return;
+            return false;
         };
         let limit = match self.machine.materialize(ctx, count) {
             Some(count) => count.min(MAX_REGISTER_ENTRIES),
             None => MAX_REGISTER_ENTRIES,
         };
         let stride = 3 * ctx.image.ptr_size;
+        let before = self.out.registered.len();
         for _ in 0..limit {
             let Some(method) = jni_entry_at(&ctx.image, &ctx.slots, at) else {
                 break;
@@ -1450,19 +1492,28 @@ impl Walk<'_, '_> {
             self.out.registered.push(member);
             at = at.wrapping_add(stride);
         }
+        self.out.registered.len() > before
+    }
+
+    fn invoke_call(&mut self, off: u64) {
+        let ptr = self.ctx.image.ptr_size;
+        if !off.is_multiple_of(ptr) {
+            return;
+        }
+        if let Ok(index) = usize::try_from(off / ptr) {
+            self.writes_env(index);
+        }
     }
 
     /// GetEnv et AttachCurrentThread écrivent un JNIEnv* à l'adresse passée en
     /// deuxième argument.
-    fn invoke_call(&mut self, off: u64) {
-        let ptr = self.ctx.image.ptr_size;
-        let index = off / ptr;
+    fn writes_env(&mut self, index: usize) {
         let writes_env = [
             jni::INVOKE_ATTACH_CURRENT_THREAD,
             jni::INVOKE_GET_ENV,
             jni::INVOKE_ATTACH_CURRENT_THREAD_AS_DAEMON,
         ];
-        if off.is_multiple_of(ptr) && writes_env.iter().any(|&i| i as u64 == index) {
+        if writes_env.contains(&index) {
             let place = self.arg(1);
             self.machine.store_at(self.ctx, place, Val::Env);
         }
