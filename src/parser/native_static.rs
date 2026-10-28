@@ -1957,21 +1957,30 @@ DÉSASSEMBLAGE (elfs[].disasm) — avec --native-disasm seulement, absent sinon
                   mnemonic coproc = instruction coprocesseur, VFP ou Advanced SIMD (ARM,
                   Thumb-2) que yaxpeax-arm ne décode pas : seule sa longueur est connue,
                   ses écritures éventuelles dans les registres généraux ne sont pas
-                  suivies. Délimitation par descente récursive depuis l'entrée : seuls
-                  les successeurs explicites sont suivis (instruction suivante, cible de
-                  branche), jamais la suite d'un retour, d'un saut, d'un tail-call ou
-                  d'un appel sans retour. Appel sans retour : appel direct vers un
-                  import de la table IMPORTS SANS RETOUR, ou vers une fonction interne
-                  déjà désassemblée dont aucun chemin ne revient (rien n'est supposé
-                  d'une fonction pas encore vue). st_size borne la fonction quand un
-                  symbole le donne, sinon le début d'une autre fonction connue arrête le
-                  parcours.
+                  suivies. Instructions media A32 (ARMv6/v7), que yaxpeax-arm 0.5.0
+                  refuse en bloc, décodées à la main et nommées : ubfx, sbfx, bfi, bfc,
+                  uxtb, uxth, uxtb16, sxtb, sxth, sxtb16, leurs formes à accumulation
+                  uxtab, uxtah, uxtab16, sxtab, sxtah, sxtab16, puis rev, rev16, revsh,
+                  rbit, usat, ssat, pkhbt, pkhtb, sel, usad8, usada8 ; sans effet de flot,
+                  Rd devient inconnu, Rd = pc termine le bloc. Les autres instructions
+                  media A32 (addition parallèle, multiplications, udf) restent
+                  invalid_instruction. Délimitation par descente récursive depuis
+                  l'entrée : seuls les successeurs explicites sont suivis (instruction
+                  suivante, cible de branche), jamais la suite d'un retour, d'un saut,
+                  d'un tail-call ou d'un appel sans retour. Appel sans retour : appel
+                  direct vers un import de la table IMPORTS SANS RETOUR, ou vers une
+                  fonction interne déjà désassemblée dont aucun chemin ne revient (rien
+                  n'est supposé d'une fonction pas encore vue). st_size borne la fonction
+                  quand un symbole le donne, sinon le début d'une autre fonction connue
+                  arrête le parcours.
     calls[]       Appels et tail-calls distincts. kind : internal = cible dans l'ELF,
                   symbol = symbole de .dynsym ou .symtab à cette adresse, null sinon ;
                   plt = import appelé par un stub PLT ou par un emplacement de GOT,
                   import = nom résolu par R_*_JUMP_SLOT ou R_*_GLOB_DAT de PT_DYNAMIC,
                   target null si l'appel passe par la GOT ; indirect = cible non résolue,
-                  target null. Les appels par la table de JNIEnv y figurent en indirect.
+                  target null ; unresolved = cible directe nulle ou hors des segments LOAD
+                  exécutables, target conservée, aucune fonction callee créée. Les appels
+                  par la table de JNIEnv y figurent en indirect.
                   Stub PLT reconnu en évaluant ses instructions jusqu'au saut indirect :
                   AArch64 adrp / ldr / br ; ARM add ip, pc / add ip, ip / ldr pc, [ip]!
                   (forme courte à 3 mots ou longue à 4) ou movw / movt / add ip, pc ;
@@ -1982,16 +1991,38 @@ DÉSASSEMBLAGE (elfs[].disasm) — avec --native-disasm seulement, absent sinon
                   utf8, ou hex pour des octets non UTF-8 d'une section en lecture seule.
                   Adresses formées par ADRP+ADD, ADR, LDR littéral, ADD pc, LEA rip ou
                   sur base connue (GOT x86), MOV immédiat x86.
-    jni_calls[]   Appels par la table de fonctions de JNIEnv. name = fonction de
-                  JNINativeInterface ; index = sa position, emplacements réservés compris
-                  (source en fin de légende). resolved = true : l'env est suivi, premier
-                  argument d'une fonction JNI ou écrit par GetEnv / AttachCurrentThread ;
-                  resolved = false : même motif (table lue au premier argument, appel
-                  indirect à un décalage de cette table) sans env prouvé, ce qui est
-                  aussi la forme d'un appel virtuel C++. class (forme L…;), method,
-                  signature : chaînes passées en argument dans la même fonction pour
-                  FindClass, Get[Static]MethodID, Get[Static]FieldID, RegisterNatives ;
-                  absents sinon.
+    jni_calls[]   Appels de fonctions de JNIEnv, et de JavaVM pour les wrappers C++.
+                  name = fonction de JNINativeInterface, ou de JNIInvokeInterface pour
+                  DestroyJavaVM, AttachCurrentThread, DetachCurrentThread, GetEnv,
+                  AttachCurrentThreadAsDaemon ; index = sa position dans cette table,
+                  emplacements réservés compris (sources en fin de légende).
+      form        vtable = appel indirect à un décalage de la table lue au premier
+                  argument ; cxx_wrapper = appel direct (plt, internal, ou emplacement
+                  de GOT) d'une méthode inline de jni.h émise hors ligne, reconnue à son
+                  symbole _ZN7_JNIEnv<n><Nom>E… ou _ZN7_JavaVM<n><Nom>E…. En C++ this
+                  est l'env ou la JavaVM : les arguments de jni.h occupent les mêmes
+                  registres que sous la forme vtable (FindClass : nom en x1 / r1 ;
+                  Get*ID : nom en x2 / r2, signature en x3 / r3 ; RegisterNatives :
+                  table en x2 / r2, nombre en x3 / r3).
+      resolved    true = l'appel est attribué à JNIEnv avec preuve (env suivi, premier
+                  argument d'une fonction JNI ou écrit par GetEnv / AttachCurrentThread,
+                  ou symbole de wrapper) ET tous les arguments décodés pour cette
+                  fonction sont connus ; false sinon, avec unresolved_reason.
+      unresolved_reason
+                  Présent si resolved = false, première cause dans cet ordre :
+                  env_unproven = forme vtable sans env prouvé, qui est aussi la forme
+                  d'un appel virtuel C++ ; class_unresolved = nom de classe de FindClass
+                  inconnu, ou jclass de Get*ID / RegisterNatives qui ne vient pas d'un
+                  FindClass suivi ; name_unresolved, signature_unresolved = chaîne de
+                  Get*ID inconnue ; table_unresolved = aucune entrée JNINativeMethod lue
+                  pour RegisterNatives.
+      class, method, signature
+                  Chaînes passées en argument dans la même fonction pour FindClass,
+                  Get[Static]MethodID, Get[Static]FieldID, RegisterNatives (class en
+                  forme L…;) ; absents sinon. Valeurs suivies jusqu'au site d'appel à
+                  travers adrp+add, adr, ldr littéral, mov / orr registre, add #imm,
+                  movw / movt, ldr [pc, #imm] + add pc, et la pile (str / stur puis
+                  ldr / ldur à la même adresse sp ou fp + décalage).
     syscalls[]    svc, swi, syscall, sysenter, int 0x80 ; number = valeur de x8, r7, rax
                   ou eax si elle est connue à cet endroit, null sinon.
   upcalls[]       {class, name, signature} des Get[Static]MethodID / Get[Static]FieldID
@@ -2065,6 +2096,9 @@ pub fn legend() -> String {
     let source = jni_table::JNI_SOURCE;
     let jni = format!("\nTABLE JNIEnv (jni_calls[].index)\n  {source}\n");
     out.push_str(&jni);
+    let vm = jni_table::JNI_INVOKE_INTERFACE[jni_table::INVOKE_RESERVED_SLOTS..].join(" ");
+    let vm = format!("\nTABLE JavaVM (jni_calls[].index, form cxx_wrapper)\n  {vm}\n");
+    out.push_str(&vm);
     let noreturn = disasm::NORETURN_IMPORTS.join(" ");
     let section = format!("\nIMPORTS SANS RETOUR (--native-disasm)\n  {noreturn}\n");
     out.push_str(&section);
@@ -2608,6 +2642,9 @@ mod tests {
             "relocation_unreadable",
             "jni_export_malformed",
             "elf_unreadable",
+            "form",
+            "unresolved_reason",
+            "TABLE JavaVM",
         ];
         for label in labels {
             assert!(legend.contains(label), "{label}");
