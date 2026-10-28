@@ -1349,14 +1349,20 @@ mod tests {
         assert_eq!(ubfx.ops, [Op::Set(0, Expr::Unknown)]);
         // uxtb r2, r8 : e6ef2078 (A8.8.274, Rn = 1111, rotation 0)
         let uxtb = arm_insn(0xe6ef_2078);
-        assert_eq!((uxtb.mnemonic.as_str(), uxtb.operands.as_str()), ("uxtb", "r2, r8"));
+        assert_eq!(
+            (uxtb.mnemonic.as_str(), uxtb.operands.as_str()),
+            ("uxtb", "r2, r8")
+        );
         assert_eq!(uxtb.ops, [Op::Set(2, Expr::Unknown)]);
         // rev r0, r1 : e6bf0f31 ; sxth r3, r4, ror #8 : e6bf3474
         assert_eq!(arm_insn(0xe6bf_0f31).mnemonic, "rev");
         assert_eq!(arm_insn(0xe6bf_3474).operands, "r3, r4, ror #8");
         // uxtbne pc, r0 : 16eff070, conditionnelle : le chemin continue.
         let to_pc = arm_insn(0x16ef_f070);
-        assert_eq!((to_pc.mnemonic.as_str(), to_pc.flow), ("uxtbne", Flow::Next));
+        assert_eq!(
+            (to_pc.mnemonic.as_str(), to_pc.flow),
+            ("uxtbne", Flow::Next)
+        );
         // uxtb pc, r0 : e6eff070 écrit pc : fin de bloc.
         assert_eq!(arm_insn(0xe6ef_f070).flow, Flow::JumpVia(Via::Unknown));
     }

@@ -2412,7 +2412,10 @@ mod tests {
     const A64_CXX_FIND_CLASS: &[(u32, &str)] = &[
         (0xb0000001, "1000  adrp x1, 0x2000"),
         (0x91000021, "1004  add  x1, x1, #0x0      ; com/foo/Bar"),
-        (0x940001fe, "1008  bl   0x1800            ; _JNIEnv::FindClass@plt"),
+        (
+            0x940001fe,
+            "1008  bl   0x1800            ; _JNIEnv::FindClass@plt",
+        ),
         (0xd65f03c0, "100c  ret"),
     ];
 
@@ -2451,7 +2454,10 @@ mod tests {
         (0x91010042, "1024  add  x2, x2, #0x40     ; table"),
         (0x52800023, "1028  mov  w3, #1"),
         (0xaa1303e0, "102c  mov  x0, x19"),
-        (0x940001f4, "1030  bl   0x1800            ; _JNIEnv::RegisterNatives@plt"),
+        (
+            0x940001f4,
+            "1030  bl   0x1800            ; _JNIEnv::RegisterNatives@plt",
+        ),
         (0xd65f03c0, "1034  ret"),
     ];
 
