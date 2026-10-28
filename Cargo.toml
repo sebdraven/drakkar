@@ -81,6 +81,14 @@ dex-decompiler = { git = "https://github.com/androguard/dex-decompiler", rev = "
 # ni un Vec décompressé ni un ELF trafiqué ne garantissent.
 object = { version = "0.37", default-features = false, features = ["read_core", "elf", "std", "unaligned"] }
 
+# Désassemblage statique (--native-disasm, parser::native_static::decode). Pur
+# Rust, aucune compilation de C. yaxpeax-arm : ARMv7 (ARM, Thumb, Thumb-2) et
+# ARMv8 (AArch64), à travers les traits Decoder et Reader de yaxpeax-arch.
+# iced-x86 : x86 et x86_64, décodeur et formateur Intel seulement.
+yaxpeax-arch = { version = "0.3.3", default-features = false, features = ["std"] }
+yaxpeax-arm = { version = "0.5.0", default-features = false, features = ["std", "fmt"] }
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "intel"] }
+
 # LIEF: réservé au parsing ELF natif (lib/*/*.so). Build C++ lourd, activé à la
 # demande -> `cargo build --features lief-backend`.
 lief = { version = "0.16", optional = true }
