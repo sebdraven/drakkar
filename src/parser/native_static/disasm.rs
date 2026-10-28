@@ -26,6 +26,7 @@ const ORIGIN_INIT: &str = "init";
 const ORIGIN_INIT_ARRAY: &str = "init_array";
 const ORIGIN_ENTRY: &str = "entry";
 const ORIGIN_CALLEE: &str = "callee";
+const ORIGIN_MAIN: &str = "main";
 
 const STATUS_OK: &str = "ok";
 const STATUS_TRUNCATED: &str = "truncated";
@@ -1157,6 +1158,8 @@ fn explore(ctx: &Ctx, arch: Arch, entry: &Entry, max_insns: usize) -> Explored {
 struct Analyzed {
     function: DisasmFunction,
     callees: Vec<Entry>,
+    /// main passé à __libc_init ou __libc_start_main : un point d'entrée de plus.
+    mains: Vec<Entry>,
     upcalls: Vec<JavaMember>,
     registered: Vec<JavaMember>,
 }
@@ -1166,6 +1169,7 @@ impl Analyzed {
         Analyzed {
             function: DisasmFunction::new(entry),
             callees: Vec::new(),
+            mains: Vec::new(),
             upcalls: Vec::new(),
             registered: Vec::new(),
         }
@@ -1351,6 +1355,7 @@ impl Walk<'_, '_> {
         }
         if let Some(name) = plt_import(ctx, target, mode) {
             let wrapper = cxx_wrapper(&name);
+            self.libc_main(&name);
             self.calls.push(DisasmCall {
                 target: Some(hex(target)),
                 import: Some(name),
@@ -1405,6 +1410,7 @@ impl Walk<'_, '_> {
         if let Val::Mem(slot) = value {
             if let Some(name) = ctx.got.get(&slot) {
                 let wrapper = cxx_wrapper(name);
+                self.libc_main(name);
                 self.calls.push(DisasmCall {
                     target: None,
                     import: Some(name.clone()),
@@ -1425,6 +1431,27 @@ impl Walk<'_, '_> {
                 None
             }
             _ => None,
+        }
+    }
+
+    /// `__libc_init(raw_args, onexit, main, structors)` (bionic) et
+    /// `__libc_start_main(main, argc, argv, …)` (glibc) : main, lu avant que
+    /// l'appel n'écrase les registres d'argument.
+    fn libc_main(&mut self, import: &str) {
+        let index = match import {
+            "__libc_init" => 2,
+            "__libc_start_main" => 0,
+            _ => return,
+        };
+        let ctx = self.ctx;
+        let value = self.arg(index);
+        let Some(target) = self.machine.materialize(ctx, value) else {
+            return;
+        };
+        let (address, thumb) = split_thumb(self.arch == Arch::Arm, target);
+        if callable(ctx, address) {
+            let main = entry(address, thumb, ORIGIN_MAIN, Val::Opaque(0));
+            self.out.mains.push(main);
         }
     }
 
