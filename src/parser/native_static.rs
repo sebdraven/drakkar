@@ -42,9 +42,15 @@ pub const IMPORT_CATEGORIES: &[(&str, &str)] = &[
     ("injection", "ptrace process_vm_writev process_vm_readv"),
     ("dynload", "dlopen dlsym android_dlopen_ext"),
     ("memory", "mmap mprotect munmap mremap"),
-    ("network", "socket connect bind listen accept send* recv* getaddrinfo"),
+    (
+        "network",
+        "socket connect bind listen accept send* recv* getaddrinfo",
+    ),
     ("crypto", "EVP_* AES_* RC4* MD5* SHA*"),
-    ("anti_analysis", "__system_property_get inotify_* prctl kill getppid"),
+    (
+        "anti_analysis",
+        "__system_property_get inotify_* prctl kill getppid",
+    ),
     ("file", "open openat fopen unlink rename chmod"),
 ];
 
@@ -442,7 +448,9 @@ impl ElfReport {
         let origin = origin_of(path);
         let mut anomalies = Vec::new();
         if abi_mismatch {
-            anomalies.push(format!("abi_mismatch: ELF {machine} {bits} bits dans {path}"));
+            anomalies.push(format!(
+                "abi_mismatch: ELF {machine} {bits} bits dans {path}"
+            ));
         }
         if origin != ORIGIN_LIB {
             anomalies.push(format!("elf_outside_lib: {origin}"));
@@ -1287,7 +1295,11 @@ fn is_internal_name_char(c: char) -> bool {
 pub fn import_category(symbol: &str) -> Option<&'static str> {
     IMPORT_CATEGORIES
         .iter()
-        .find(|(_, patterns)| patterns.split_whitespace().any(|p| symbol_matches(p, symbol)))
+        .find(|(_, patterns)| {
+            patterns
+                .split_whitespace()
+                .any(|p| symbol_matches(p, symbol))
+        })
         .map(|&(category, _)| category)
 }
 
@@ -2363,11 +2375,7 @@ mod tests {
             );
             assert_eq!(row.fn_offset.as_deref(), Some("0x2100"));
         }
-        for java in [
-            "Lcom/foo/Bar;->ov(J)",
-            "Lcom/foo/Gone;->x",
-            "?->orphan(J)J",
-        ] {
+        for java in ["Lcom/foo/Bar;->ov(J)", "Lcom/foo/Gone;->x", "?->orphan(J)J"] {
             assert_eq!(statuses(&rows, java), vec![STATUS_UNCLAIMED], "{java}");
         }
 
