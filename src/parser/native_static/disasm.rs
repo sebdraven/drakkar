@@ -908,7 +908,53 @@ fn in_function(ctx: &Ctx, start: u64, at: u64) -> bool {
 }
 
 fn is_internal(ctx: &Ctx, start: u64, at: u64, thumb: bool) -> bool {
-    in_function(ctx, start, at) && plt_import(ctx, at, thumb).is_none()
+    at != 0 && in_function(ctx, start, at) && plt_import(ctx, at, thumb).is_none()
+}
+
+/// Cible d'appel direct qui peut être une fonction : non nulle, dans un segment
+/// LOAD exécutable.
+fn callable(ctx: &Ctx, at: u64) -> bool {
+    at != 0 && ctx.image.is_exec(at)
+}
+
+/// Méthode inline de jni.h émise hors ligne par un compilateur C++.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wrapper {
+    /// `_JNIEnv::<nom>` : nom et index dans JNINativeInterface.
+    Env(&'static str, usize),
+    /// `_JavaVM::<nom>` : nom et index dans JNIInvokeInterface.
+    Vm(&'static str, usize),
+}
+
+/// `_ZN7_JNIEnv<n><Nom>E…` ou `_ZN7_JavaVM<n><Nom>E…`, `<Nom>` présent dans la
+/// table correspondante, hors emplacements réservés.
+fn cxx_wrapper(symbol: &str) -> Option<Wrapper> {
+    let (vm, rest) = match symbol.strip_prefix("_ZN7_JNIEnv") {
+        Some(rest) => (false, rest),
+        None => (true, symbol.strip_prefix("_ZN7_JavaVM")?),
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let len: usize = rest[..digits].parse().ok()?;
+    let end = digits.checked_add(len)?;
+    let name = rest.get(digits..end)?;
+    if !rest[end..].starts_with('E') {
+        return None;
+    }
+    let (table, reserved): (&[&'static str], usize) = if vm {
+        (&jni::JNI_INVOKE_INTERFACE, jni::INVOKE_RESERVED_SLOTS)
+    } else {
+        (&jni::JNI_NATIVE_INTERFACE, jni::RESERVED_SLOTS)
+    };
+    let index = table.iter().position(|&n| n == name)?;
+    if index < reserved {
+        return None;
+    }
+    let name = table[index];
+    Some(if vm {
+        Wrapper::Vm(name, index)
+    } else {
+        Wrapper::Env(name, index)
+    })
 }
 
 /// Appel direct sans retour : import de [`NORETURN_IMPORTS`], ou fonction
