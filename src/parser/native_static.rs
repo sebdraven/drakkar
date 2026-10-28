@@ -1,9 +1,10 @@
 //! Analyse statique de tous les ELF d'un APK et liaison JNI avec les méthodes
 //! `native` du DEX (mode `--native`).
 //!
-//! Lecture seule : ni désassemblage, ni exécution. Sont lus les en-têtes, les
-//! sections, les segments, la table dynamique, les symboles dynamiques, les
-//! relocations relatives et les chaînes des sections de données.
+//! Lecture seule, sans exécution. Sont lus les en-têtes, les sections, les
+//! segments, la table dynamique, les symboles dynamiques, les relocations
+//! relatives et les chaînes des sections de données. Le désassemblage n'a lieu
+//! qu'avec `--native-disasm` (module `disasm`).
 //!
 //! Est retenue toute entrée dont les quatre premiers octets DÉCOMPRESSÉS valent
 //! `\x7FELF`, quel que soit le chemin : un packer range son stub dans `assets/`,
@@ -22,7 +23,7 @@
 
 use anyhow::{Context, Result};
 use object::elf;
-use object::read::elf::{Dyn, FileHeader, ProgramHeader, SectionHeader, Sym};
+use object::read::elf::{Dyn, FileHeader, ProgramHeader, SectionHeader, SectionTable, Sym};
 use object::Endianness;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -35,6 +36,15 @@ use std::path::Path;
 use super::apkzip::TolerantZip;
 use super::dex_facade::DexBin;
 use super::native_arch::{expected_arch, parse_elf_header, Abi, Bits, ElfArch, Endian, Machine};
+
+mod decode;
+mod disasm;
+mod jni_table;
+
+pub use self::disasm::{
+    DisasmCall, DisasmFunction, DisasmInsn, DisasmOptions, ElfDisasm, InvalidPath, JavaMember,
+    JniCall, StringRef, Syscall, TruncatedAt,
+};
 
 /// Catégories d'imports : noms exacts, ou préfixes quand ils finissent par `*`.
 pub const IMPORT_CATEGORIES: &[(&str, &str)] = &[
@@ -140,6 +150,9 @@ pub struct ElfReport {
     pub jni: JniInfo,
     pub strings: Strings,
     pub anomalies: Vec<String>,
+    /// Présent avec `--native-disasm` seulement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disasm: Option<ElfDisasm>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -303,6 +316,12 @@ pub struct Binding {
     pub elf_sha256: Option<String>,
     pub fn_offset: Option<String>,
     pub candidates: Vec<String>,
+    /// Avec `--native-disasm`, sur une ligne registered_ambiguous levée par un
+    /// RegisterNatives dont la classe vient de FindClass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disambiguated_by: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
 }
 
 impl Binding {
@@ -320,6 +339,8 @@ impl Binding {
             elf_sha256: Some(elf.sha256.clone()),
             fn_offset: Some(fn_offset),
             candidates,
+            disambiguated_by: None,
+            class: None,
         }
     }
 
@@ -331,6 +352,8 @@ impl Binding {
             elf_sha256: None,
             fn_offset: None,
             candidates: Vec::new(),
+            disambiguated_by: None,
+            class: None,
         }
     }
 }
@@ -375,11 +398,13 @@ impl NativeMethod {
 
 /// Analyse un APK sur disque. Seule une archive illisible fait échouer le mode :
 /// un ELF illisible devient une anomalie, une entrée illisible une erreur.
-pub fn analyze_apk(path: &Path) -> Result<NativeReport> {
+/// `disasm` active `--native-disasm`.
+pub fn analyze_apk(path: &Path, disasm: Option<&DisasmOptions>) -> Result<NativeReport> {
     let sha256 = file_sha256(path)?;
     let zip = TolerantZip::open(path)?;
     let mut errors = Vec::new();
     let mut elfs = Vec::new();
+    let mut kept = Vec::new();
     for (index, entry) in zip.entries().iter().enumerate() {
         let bytes = match zip.read(index) {
             Ok(bytes) => bytes,
@@ -390,14 +415,25 @@ pub fn analyze_apk(path: &Path) -> Result<NativeReport> {
         };
         if bytes.starts_with(ELF_MAGIC) {
             elfs.push(analyze_elf(&entry.name, &bytes));
+            if disasm.is_some() {
+                kept.push(bytes);
+            }
         }
     }
 
     let natives = declared_natives(path, &mut errors);
-    let binding = match &natives {
+    let mut binding = match &natives {
         Some(natives) => bind(natives, &elfs),
         None => Vec::new(),
     };
+    if let Some(options) = disasm {
+        self::disasm::silence_panics(|| {
+            for (elf, bytes) in elfs.iter_mut().zip(&kept) {
+                self::disasm::run(bytes, elf, options);
+            }
+        });
+        self::disasm::disambiguate(&elfs, &mut binding);
+    }
     let declared = natives.as_ref().map_or(0, Vec::len);
     let summary = summarize(&binding, declared, elfs.len());
     Ok(NativeReport {
@@ -480,6 +516,7 @@ impl ElfReport {
             jni: JniInfo::default(),
             strings: Strings::default(),
             anomalies,
+            disasm: None,
         }
     }
 }
@@ -563,6 +600,8 @@ struct DynSymbol {
     defined: bool,
     bind: u8,
     value: u64,
+    size: u64,
+    func: bool,
 }
 
 struct Region<'a> {
@@ -660,6 +699,8 @@ struct Parsed<'a> {
     entry: u64,
     dynamic: Option<Vec<(u64, u64)>>,
     symbols: Vec<DynSymbol>,
+    /// `.symtab`, quand l'ELF n'est pas strippé.
+    local_symbols: Vec<DynSymbol>,
     anomalies: Vec<String>,
 }
 
@@ -700,6 +741,7 @@ where
 
     let mut sections = Vec::new();
     let mut symbols = Vec::new();
+    let mut local_symbols = Vec::new();
     match header.sections(endian, data) {
         Ok(table) if table.is_empty() => {
             note(&mut anomalies, "section_headers_absent", "table vide");
@@ -716,24 +758,12 @@ where
                     size: sh.sh_size(endian).into(),
                 });
             }
-            match table.symbols(endian, data, elf::SHT_DYNSYM) {
-                Ok(dynsym) => {
-                    for sym in dynsym.iter() {
-                        let Ok(name) = dynsym.symbol_name(endian, sym) else {
-                            continue;
-                        };
-                        if name.is_empty() {
-                            continue;
-                        }
-                        symbols.push(DynSymbol {
-                            name: String::from_utf8_lossy(name).into_owned(),
-                            defined: !sym.is_undefined(endian),
-                            bind: sym.st_bind(),
-                            value: sym.st_value(endian).into(),
-                        });
-                    }
-                }
+            match read_symbols(&table, endian, data, elf::SHT_DYNSYM) {
+                Ok(list) => symbols = list,
                 Err(e) => note(&mut anomalies, "section_headers_incoherent", e),
+            }
+            if let Ok(list) = read_symbols(&table, endian, data, elf::SHT_SYMTAB) {
+                local_symbols = list;
             }
         }
         Err(e) => note(&mut anomalies, "section_headers_invalid", e),
@@ -754,8 +784,39 @@ where
         entry: header.e_entry(endian).into(),
         dynamic,
         symbols,
+        local_symbols,
         anomalies,
     })
+}
+
+fn read_symbols<'data, Elf>(
+    table: &SectionTable<'data, Elf>,
+    endian: Endianness,
+    data: &'data [u8],
+    sh_type: u32,
+) -> object::read::Result<Vec<DynSymbol>>
+where
+    Elf: FileHeader<Endian = Endianness>,
+{
+    let symtab = table.symbols(endian, data, sh_type)?;
+    let mut symbols = Vec::new();
+    for sym in symtab.iter() {
+        let Ok(name) = symtab.symbol_name(endian, sym) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        symbols.push(DynSymbol {
+            name: String::from_utf8_lossy(name).into_owned(),
+            defined: !sym.is_undefined(endian),
+            bind: sym.st_bind(),
+            value: sym.st_value(endian).into(),
+            size: sym.st_size(endian).into(),
+            func: sym.st_type() == elf::STT_FUNC,
+        });
+    }
+    Ok(symbols)
 }
 
 fn dyn_pairs<Elf>(entries: &[Elf::Dyn], endian: Elf::Endian) -> Vec<(u64, u64)>
@@ -781,6 +842,7 @@ fn inspect(bytes: &[u8], report: &mut ElfReport) -> object::read::Result<()> {
         dynamic,
         symbols,
         anomalies,
+        ..
     } = parse_elf(bytes)?;
     report.anomalies.extend(anomalies);
     report.elf_type = match e_type {
@@ -1707,7 +1769,8 @@ fn file_sha256(path: &Path) -> Result<String> {
 
 const LEGEND: &str = "\
 --native : analyse statique de TOUS les ELF de l'APK et liaison avec les méthodes
-`native` du DEX. Ni désassemblage, ni exécution, ni émulation.
+`native` du DEX. Ni exécution, ni émulation ; désassemblage seulement avec
+--native-disasm (section DÉSASSEMBLAGE).
 
 RAPPORT
   sha256          SHA-256 complet du fichier APK.
@@ -1836,6 +1899,11 @@ LIAISON (binding[]) — seuls les ELF d'origine lib sont liés
                   null pour declared_unbound. Une méthode liée dans plusieurs ELF (une .so
                   par ABI) produit une ligne par ELF.
   candidates      Rempli pour registered_ambiguous seulement.
+  disambiguated_by / class
+                  Avec --native-disasm, sur une ligne registered_ambiguous seulement :
+                  find_class = un RegisterNatives dont la classe vient d'un FindClass de
+                  la même fonction enregistre cette fonction ; class = la classe retenue.
+                  Le statut ne change pas. Absents sinon.
 
 SUMMARY
   elf_count       Nombre d'ELF inventoriés, toutes origines.
@@ -1845,6 +1913,104 @@ SUMMARY
                   Une méthode compte une fois, sous son meilleur statut :
                   static > registered > registered_ambiguous > declared_unbound.
   unclaimed       Nombre de lignes native_unclaimed.
+
+DÉSASSEMBLAGE (elfs[].disasm) — avec --native-disasm seulement, absent sinon
+  Désassemblage statique, sans exécution ni émulation, des fonctions qui portent la
+  frontière Java↔natif. AArch64, ARM et Thumb-2 (yaxpeax-arm), x86 et x86_64
+  (iced-x86) ; ELF petit-boutiste seulement. --disasm-depth N (défaut 1) ;
+  --disasm-max-insns N (défaut 4000) ; --disasm-full ajoute les instructions à la
+  sortie texte, le JSON les porte toujours.
+  functions[]     Une par adresse ; la première origine trouvée est gardée.
+    origin        jni_static = export Java_* ; jni_registered = entrée de table
+                  JNINativeMethod ; jni_onload, jni_onunload = JNI_OnLoad, JNI_OnUnload
+                  exportés ; init = DT_INIT ; init_array = entrée de DT_INIT_ARRAY, lue à
+                  travers les relocations relatives ; entry = e_entry d'un ELF exec ;
+                  callee = fonction interne appelée directement par une fonction déjà
+                  désassemblée, jusqu'à --disasm-depth niveaux (0 = points d'entrée
+                  seuls).
+    address       Adresse virtuelle de la fonction, bit Thumb effacé.
+    disasm_status ok = tous les chemins atteints ont été parcourus, invalid_paths
+                  éventuels compris ; truncated = un plafond a interrompu le parcours,
+                  voir truncated_reason ; arch_unsupported = autre machine ou ELF
+                  gros-boutiste, aucune instruction ; invalid_entry = adresse hors
+                  segment exécutable ou première instruction indécodable.
+    truncated, truncated_reason
+                  Plafonds seulement : max_insns = --disasm-max-insns atteint ; panic =
+                  panique pendant l'analyse de la fonction, rendue vide.
+    truncated_at  {address, bytes} : pour max_insns, première instruction non lue ;
+                  absent sinon.
+    invalid_paths[]
+                  Chemins abandonnés, l'exploration continuant avec les autres
+                  successeurs : {address, bytes, reason, reached_from}. reason :
+                  invalid_instruction = octets indécodables atteints par un chemin ;
+                  decoder_panic = le décodeur a paniqué sur l'instruction, traitée comme
+                  invalide ; outside_exec = chemin sorti des segments exécutables (bytes
+                  vide). reached_from = adresse du dernier branchement qui mène à ce
+                  bloc, null si c'est le chemin de l'entrée. Un code aplati (type OLLVM)
+                  y laisse ses blocs morts : prédicats opaques menant à des octets
+                  poubelle. Les instructions lues avant l'abandon restent listées, avec
+                  leurs appels et chaînes. Pendant --native-disasm, un hook de panique
+                  muet remplace celui du programme : les paniques rattrapées n'écrivent
+                  rien sur stderr ; le hook d'origine est rétabli ensuite.
+    instructions[]
+                  address, bytes (hexadécimal), mnemonic, operands, triées par adresse.
+                  mnemonic coproc = instruction coprocesseur, VFP ou Advanced SIMD (ARM,
+                  Thumb-2) que yaxpeax-arm ne décode pas : seule sa longueur est connue,
+                  ses écritures éventuelles dans les registres généraux ne sont pas
+                  suivies. Délimitation par descente récursive depuis l'entrée : seuls
+                  les successeurs explicites sont suivis (instruction suivante, cible de
+                  branche), jamais la suite d'un retour, d'un saut, d'un tail-call ou
+                  d'un appel sans retour. Appel sans retour : appel direct vers un
+                  import de la table IMPORTS SANS RETOUR, ou vers une fonction interne
+                  déjà désassemblée dont aucun chemin ne revient (rien n'est supposé
+                  d'une fonction pas encore vue). st_size borne la fonction quand un
+                  symbole le donne, sinon le début d'une autre fonction connue arrête le
+                  parcours.
+    calls[]       Appels et tail-calls distincts. kind : internal = cible dans l'ELF,
+                  symbol = symbole de .dynsym ou .symtab à cette adresse, null sinon ;
+                  plt = import appelé par un stub PLT ou par un emplacement de GOT,
+                  import = nom résolu par R_*_JUMP_SLOT ou R_*_GLOB_DAT de PT_DYNAMIC,
+                  target null si l'appel passe par la GOT ; indirect = cible non résolue,
+                  target null. Les appels par la table de JNIEnv y figurent en indirect.
+                  Stub PLT reconnu en évaluant ses instructions jusqu'au saut indirect :
+                  AArch64 adrp / ldr / br ; ARM add ip, pc / add ip, ip / ldr pc, [ip]!
+                  (forme courte à 3 mots ou longue à 4) ou movw / movt / add ip, pc ;
+                  x86_64 jmp [rip+…] ; x86 jmp [ebx+…]. Sur ARM, seule une cible en mode
+                  ARM peut être une entrée PLT.
+    string_refs[] address = instruction qui forme l'adresse ; target = adresse de la
+                  chaîne ; value = octets jusqu'au premier nul, 256 au plus ; encoding =
+                  utf8, ou hex pour des octets non UTF-8 d'une section en lecture seule.
+                  Adresses formées par ADRP+ADD, ADR, LDR littéral, ADD pc, LEA rip ou
+                  sur base connue (GOT x86), MOV immédiat x86.
+    jni_calls[]   Appels par la table de fonctions de JNIEnv. name = fonction de
+                  JNINativeInterface ; index = sa position, emplacements réservés compris
+                  (source en fin de légende). resolved = true : l'env est suivi, premier
+                  argument d'une fonction JNI ou écrit par GetEnv / AttachCurrentThread ;
+                  resolved = false : même motif (table lue au premier argument, appel
+                  indirect à un décalage de cette table) sans env prouvé, ce qui est
+                  aussi la forme d'un appel virtuel C++. class (forme L…;), method,
+                  signature : chaînes passées en argument dans la même fonction pour
+                  FindClass, Get[Static]MethodID, Get[Static]FieldID, RegisterNatives ;
+                  absents sinon.
+    syscalls[]    svc, swi, syscall, sysenter, int 0x80 ; number = valeur de x8, r7, rax
+                  ou eax si elle est connue à cet endroit, null sinon.
+  upcalls[]       {class, name, signature} des Get[Static]MethodID / Get[Static]FieldID
+                  dont la classe vient d'un FindClass suivi.
+  registered_by_code[]
+                  {class, name, signature} des entrées JNINativeMethod passées à
+                  RegisterNatives quand la classe vient d'un FindClass de la même fonction
+                  (voir disambiguated_by).
+  imports_called  Imports appelés par les fonctions désassemblées, par catégorie de la
+                  table des imports ; other = hors table.
+  invalid_paths_count
+                  Somme des invalid_paths des fonctions de l'ELF.
+  Suivi de valeurs : registres oubliés à chaque cible de branche, sauf sp et les
+  registres callee-saved écrits une seule fois dans la fonction ; mémoire suivie pour
+  la pile et les adresses connues ; rien ne passe d'une fonction à l'autre, sauf l'env
+  ou la JavaVM en premier argument d'un callee.
+  Invisible : chaînes construites ou déchiffrées à l'exécution, code natif absent de
+  l'APK, cibles des tables de sauts ; les instructions des blocs IT (Thumb) sont lues
+  comme inconditionnelles.
 
 ANOMALIES (elfs[].anomalies, code avant « : », détail après)
   abi_mismatch    ELF incompatible avec son répertoire lib/<abi>/.
@@ -1878,6 +2044,12 @@ ANOMALIES (elfs[].anomalies, code avant « : », détail après)
                   inventorié (chemin, origine, sha256, taille, architecture si l'en-tête
                   la donne) ; les autres champs gardent leur valeur par défaut (false, 0,
                   vide, null).
+  disasm_failed   Panique pendant --native-disasm : disasm est vide pour cet ELF.
+  opaque_dead_code
+                  Informative, --native-disasm : au moins 3 fonctions abandonnent un
+                  chemin sur les mêmes octets (détail : octets et nombre de fonctions).
+                  Un motif répété désigne des octets poubelle derrière des prédicats
+                  opaques plutôt que du code, signe d'obfuscation par aplatissement.
 ";
 
 /// Légende autonome : chaque champ, statut, catégorie et anomalie de `--native`.
@@ -1890,6 +2062,12 @@ pub fn legend() -> String {
     out.push_str(&format!("  jni             {JNI_EXPORTS} (exports)\n"));
     out.push_str(&format!("\nCOMMANDES SHELL\n  {SHELL_COMMANDS}\n"));
     out.push_str(&format!("\nRACINES JAVA\n  {JAVA_PACKAGE_ROOTS}\n"));
+    let source = jni_table::JNI_SOURCE;
+    let jni = format!("\nTABLE JNIEnv (jni_calls[].index)\n  {source}\n");
+    out.push_str(&jni);
+    let noreturn = disasm::NORETURN_IMPORTS.join(" ");
+    let section = format!("\nIMPORTS SANS RETOUR (--native-disasm)\n  {noreturn}\n");
+    out.push_str(&section);
     out
 }
 

@@ -466,7 +466,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
 dependencies = [
  "lazy_static",
- "windows-sys 0.48.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -475,7 +475,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -855,6 +855,7 @@ dependencies = [
  "dex-parser",
  "dirs",
  "flate2",
+ "iced-x86",
  "lief",
  "md-5",
  "object",
@@ -872,6 +873,8 @@ dependencies = [
  "ureq",
  "walkdir",
  "x509-cert",
+ "yaxpeax-arch",
+ "yaxpeax-arm",
  "zip 2.4.2",
 ]
 
@@ -1270,6 +1273,15 @@ dependencies = [
  "rustls 0.21.12",
  "tokio",
  "tokio-rustls",
+]
+
+[[package]]
+name = "iced-x86"
+version = "1.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c447cff8c7f384a7d4f741cfcff32f75f3ad02b406432e8d6c878d56b1edf6b"
+dependencies = [
+ "lazy_static",
 ]
 
 [[package]]
@@ -3268,7 +3280,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3516,6 +3528,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
 dependencies = [
  "time",
+]
+
+[[package]]
+name = "yaxpeax-arch"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb869f86d5a365bf741d9df773f7a5347757b1c466b7383b74989324785ef36b"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "yaxpeax-arm"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79f8d9808ad0b7e434882c66e50704138e7c0bdf3408a9f3159c50603dc3168c"
+dependencies = [
+ "bitvec",
+ "yaxpeax-arch",
 ]
 
 [[package]]
