@@ -1815,12 +1815,15 @@ fn print_native_disasm(d: &drakkar::parser::native_static::ElfDisasm, full: bool
             println!("      call     {kind:<9} {target}  {name}");
         }
         for j in &f.jni_calls {
-            let (name, index) = (j.name, j.index);
+            let (name, index, form) = (j.name, j.index, j.form);
             let class = j.class.as_deref().unwrap_or("");
             let method = j.method.as_deref().unwrap_or("");
             let signature = j.signature.as_deref().unwrap_or("");
-            let tracked = if j.resolved { "" } else { "  (env non suivi)" };
-            println!("      jni      {name} #{index}  {class} {method}{signature}{tracked}");
+            let reason = match j.unresolved_reason {
+                Some(reason) => format!("  ({reason})"),
+                None => String::new(),
+            };
+            println!("      jni      {name} #{index} {form}  {class} {method}{signature}{reason}");
         }
         for s in &f.string_refs {
             let (address, target, value) = (&s.address, &s.target, &s.value);
