@@ -1925,7 +1925,12 @@ DÉSASSEMBLAGE (elfs[].disasm) — avec --native-disasm seulement, absent sinon
                   JNINativeMethod ; jni_onload, jni_onunload = JNI_OnLoad, JNI_OnUnload
                   exportés ; init = DT_INIT ; init_array = entrée de DT_INIT_ARRAY, lue à
                   travers les relocations relatives ; entry = e_entry d'un ELF exec ;
-                  callee = fonction interne appelée directement par une fonction déjà
+                  main = fonction passée à __libc_init (3e argument) ou
+                  __libc_start_main (1er argument) par le point d'entrée d'un
+                  exécutable, quand cet argument est connu au site d'appel (import par
+                  PLT ou GOT) et tombe dans un segment LOAD exécutable ; désassemblée
+                  comme un point d'entrée, même avec --disasm-depth 0 ; callee =
+                  fonction interne appelée directement par une fonction déjà
                   désassemblée, jusqu'à --disasm-depth niveaux (0 = points d'entrée
                   seuls).
     address       Adresse virtuelle de la fonction, bit Thumb effacé.
