@@ -1598,7 +1598,7 @@ pub fn summarize(binding: &[Binding], declared: usize, elf_count: usize) -> Summ
             continue;
         }
         let status = best.entry(row.java.as_str()).or_insert(row.status);
-        if rank(row.status) < rank(*status) {
+        if rank(row.status) < rank(status) {
             *status = row.status;
         }
     }
