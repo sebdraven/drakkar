@@ -132,7 +132,7 @@ impl Abi {
 
 /// (machine, bits) attendus pour une ABI — `None` = ABI non standard (pas de
 /// contrôle de cohérence possible).
-fn expected_arch(abi: &Abi) -> Option<(Machine, Bits)> {
+pub(crate) fn expected_arch(abi: &Abi) -> Option<(Machine, Bits)> {
     match abi {
         Abi::ArmeabiV7a | Abi::Armeabi => Some((Machine::Arm, Bits::B32)),
         Abi::Arm64V8a => Some((Machine::Aarch64, Bits::B64)),

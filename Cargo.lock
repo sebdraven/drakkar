@@ -857,6 +857,7 @@ dependencies = [
  "flate2",
  "lief",
  "md-5",
+ "object",
  "petgraph",
  "rayon",
  "serde",

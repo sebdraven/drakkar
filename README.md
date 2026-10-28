@@ -37,6 +37,34 @@ Les deux hooks lancent les mêmes commandes que la CI (`.github/workflows/ci.yml
 Aucun hook ne reformate. En cas d'échec de fmt, lancer `cargo fmt --all`, puis
 recommiter.
 
+## Analyse native statique (`--native`)
+
+```sh
+drakkar app.apk --native                         # texte
+drakkar app.apk --native --format json           # JSON sur stdout
+drakkar app.apk --native --format both --json-out reports/app.native.json
+drakkar --native --legend                        # définition de chaque champ
+```
+
+Inventorie **tous** les ELF de l'APK, reconnus à leurs octets (`\x7FELF`) et
+non à leur chemin : `lib/`, mais aussi `assets/`, `res/raw/` ou la racine. Pour
+chacun : SHA-256 du contenu décompressé, architecture, sections (avec
+entropie), segments, `DT_NEEDED`, imports classés par catégorie, chaînes
+classées, exports `Java_*` démanglés, et tables `JNINativeMethod` reconstruites
+à travers les relocations relatives (RELA, REL, RELR). Relie ensuite chaque
+méthode `native` du DEX à son export ou à son entrée de table, et signale les
+fonctions natives sans méthode Java. Mode single, comme `--native-arch`.
+
+Ce qu'il ne fait pas :
+
+- aucun désassemblage, aucune exécution, aucune émulation ;
+- une table `JNINativeMethod` dont les noms ou signatures sont chiffrés, ou
+  construits à l'exécution, n'est pas retrouvée : le statut est alors
+  `unresolved`, rien n'est inventé ;
+- les relocations packées Android (APS2) ne sont pas décodées, elles sont
+  signalées en anomalie ;
+- seuls les ELF de `lib/` sont liés au DEX ; les autres sont inventoriés.
+
 ## Architecture
 
 | Module        | Rôle                                             |

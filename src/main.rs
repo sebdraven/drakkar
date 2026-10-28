@@ -85,6 +85,15 @@ struct Cli {
     #[arg(long)]
     native_arch: bool,
 
+    /// Analyse statique de TOUS les ELF de l'APK (lib/, assets/, res/raw/,
+    /// ailleurs), reconnus au contenu : sections, segments, imports classés,
+    /// chaînes, exports Java_*, tables JNINativeMethod reconstruites à travers
+    /// les relocations relatives, puis liaison avec les méthodes `native` du DEX.
+    /// Ni désassemblage ni exécution. Texte par défaut, --format json|both
+    /// disponible ; --native --legend définit chaque champ. Mode single.
+    #[arg(long, conflicts_with = "native_arch")]
+    native: bool,
+
     /// Extrait toutes les bibliothèques natives (.so ELF) de l'APK — y compris
     /// hors lib/ (assets/libjiagu*.so des packers) — vers --out, puis sort
     /// (mode single). N'exécute pas le pipeline complet.
@@ -455,8 +464,8 @@ struct Cli {
     json_out: Option<PathBuf>,
 
     /// Affiche la légende des étiquettes et règles de dérivation, puis sort.
-    /// Se combine avec --manifest, --cert, --dating, --enrich, --decompile ou
-    /// --bundle.
+    /// Se combine avec --manifest, --cert, --dating, --enrich, --decompile,
+    /// --bundle ou --native.
     #[arg(long)]
     legend: bool,
 
@@ -534,6 +543,30 @@ fn main() -> Result<()> {
         };
         let summary = parser::native_arch::scan_apk_file(apk)?;
         print_native_arch(&summary);
+        return Ok(());
+    }
+
+    // Sortie rapide : analyse statique des ELF et liaison JNI avec le DEX. Ni
+    // catalogue MITRE ni moteur de règles.
+    if cli.native {
+        if cli.legend {
+            println!("{}", parser::native_static::legend());
+            return Ok(());
+        }
+        if cli.format == Format::Csv {
+            bail!("--format csv n'existe pas pour --native : passer --format json ou both");
+        }
+        check_json_dest(cli.format, cli.json_out.as_deref())?;
+        let Some(apk) = &cli.apk else {
+            bail!("--native requiert un APK (mode single)");
+        };
+        let report = parser::native_static::analyze_apk(apk)?;
+        if cli.format.wants_text() {
+            print_native(&report);
+        }
+        if cli.format.wants_json() {
+            emit_json(&report, cli.json_out.as_deref())?;
+        }
         return Ok(());
     }
 
@@ -1573,6 +1606,130 @@ fn print_native_arch(s: &drakkar::parser::native_arch::NativeArchSummary) {
         println!("\nAnomalies :");
         for a in &s.anomalies {
             println!("  - {a}");
+        }
+    }
+}
+
+/// Affiche l'analyse native statique (mode `--native`).
+fn print_native(r: &drakkar::parser::native_static::NativeReport) {
+    println!("== Analyse native statique ==\n");
+    println!("APK       {}", r.sha256);
+    println!("Légende   drakkar --native --legend");
+
+    if r.elfs.is_empty() {
+        println!("\nAucun ELF dans l'APK.");
+    }
+    for e in &r.elfs {
+        print_native_elf(e);
+    }
+
+    println!("\nLiaison DEX ↔ natif (ELF de lib/ seulement) :");
+    if r.binding.is_empty() {
+        println!("  (aucune ligne)");
+    }
+    for b in &r.binding {
+        println!("  {:<22} {}", b.status, b.java);
+        if let (Some(elf), Some(sha256)) = (&b.elf, &b.elf_sha256) {
+            let at = b.fn_offset.as_deref().unwrap_or("-");
+            println!("                         {elf}  {sha256}  {at}");
+        }
+        if !b.candidates.is_empty() {
+            let candidates = b.candidates.join(", ");
+            println!("                         candidats : {candidates}");
+        }
+    }
+
+    let s = &r.summary;
+    println!("\nSynthèse :");
+    println!("  ELF                        {}", s.elf_count);
+    println!("  méthodes natives du DEX    {}", s.native_methods_declared);
+    println!("  static                     {}", s.bound_static);
+    println!("  registered                 {}", s.bound_registered);
+    println!("  registered_ambiguous       {}", s.ambiguous);
+    println!("  declared_unbound           {}", s.unbound);
+    println!("  native_unclaimed           {}", s.unclaimed);
+
+    if !r.errors.is_empty() {
+        println!("\nNon lu ({}) :", r.errors.len());
+        for err in &r.errors {
+            println!("  - {err}");
+        }
+    }
+}
+
+fn print_native_elf(e: &drakkar::parser::native_static::ElfReport) {
+    let abi = e.declared_abi.as_deref().unwrap_or("-");
+    let interp = e.interp.as_deref().unwrap_or("-");
+    let init = e.init.as_deref().unwrap_or("-");
+    let init_array = e.init_array_count;
+
+    let (origin, size) = (e.origin, e.size);
+    let (machine, bits, endian) = (&e.machine, e.bits, e.endian);
+    let (elf_type, pie, stripped) = (e.elf_type, e.pie, e.stripped);
+
+    println!("\n{}", e.path);
+    println!("  sha256        {}", e.sha256);
+    println!("  origine       {origin}  abi {abi}  taille {size} o");
+    println!("  machine       {machine}  {bits} bits  {endian}");
+    println!("  type          {elf_type}  pie {pie}  stripped {stripped}  interp {interp}");
+    if !e.needed.is_empty() {
+        println!("  needed        {}", e.needed.join(", "));
+    }
+    if let Some(soname) = &e.soname {
+        println!("  soname        {soname}");
+    }
+    println!("  init          DT_INIT {init}  init_array {init_array}");
+
+    for (category, symbols) in e.imports.categories() {
+        if !symbols.is_empty() {
+            println!("  import {category:<14} {}", symbols.join(", "));
+        }
+    }
+    let other = e.imports.other_count;
+    let exports = e.exports_count;
+    println!("  import other         {other}   exports {exports}");
+
+    let jni = &e.jni;
+    let onload = jni.jni_onload;
+    let hint = jni.registernatives_string;
+    let registration = jni.jni_registration;
+    println!("  jni           JNI_OnLoad {onload}  RegisterNatives {hint}  {registration}");
+    for x in &jni.static_exports {
+        let args = x.signature.as_deref().unwrap_or("");
+        println!("    {}  →  {}->{}{args}", x.symbol, x.class, x.method);
+    }
+    for t in &jni.registered {
+        let (table, name, sig, at) = (&t.table_offset, &t.name, &t.signature, &t.fn_offset);
+        let thumb = if t.thumb { "  thumb" } else { "" };
+        println!("    table {table}  {name}{sig}  →  {at}{thumb}");
+    }
+
+    for (category, bucket) in e.strings.categories() {
+        if bucket.total == 0 {
+            continue;
+        }
+        let total = bucket.total;
+        println!("  chaînes {category:<14} {total}");
+        for item in &bucket.items {
+            println!("    {item}");
+        }
+    }
+
+    println!("  sections ({})", e.sections.len());
+    for s in &e.sections {
+        let (name, size, flags, entropy) = (&s.name, s.size, &s.flags, s.entropy);
+        println!("    {name:<24} {size:>10} {flags:<3} {entropy:.3}");
+    }
+    println!("  segments ({})", e.segments.len());
+    for s in &e.segments {
+        let (kind, flags, vaddr, size) = (&s.kind, &s.flags, &s.vaddr, s.size);
+        println!("    {kind:<14} {flags} {vaddr:>12} {size:>10}");
+    }
+
+    if !e.anomalies.is_empty() {
+        println!("  anomalies");
+        for a in &e.anomalies {
+            println!("    - {a}");
         }
     }
 }
