@@ -62,53 +62,77 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-latest
+            exe: ""
+            sha256: shasum -a 256
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            exe: ""
+            sha256: shasum -a 256
+          # Linux epingle sur 24.04 : ubuntu-latest suivra Ubuntu 26 et
+          # relevera sans prevenir la glibc minimale exigee par le binaire.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
+            exe: ""
+            sha256: sha256sum
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            exe: ""
+            sha256: sha256sum
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            exe: .exe
+            sha256: sha256sum
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            exe: .exe
+            sha256: sha256sum
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      STEM: drakkar-v${{ needs.guard.outputs.version }}-${{ matrix.target }}
     steps:
+      # Avant le checkout : un Cargo.lock passe en CRLF fausserait les revs
+      # extraits par build-info.
+      - name: fins de ligne LF
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
         with:
           toolchain: ${{ env.RUST_VERSION }}
           cache-key: release-${{ matrix.target }}
+          target: ${{ matrix.target }}
 
-      - run: cargo build --locked --release --target ${{ matrix.target }}
-
-      - name: contenu de l'archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          stem="drakkar-v${{ needs.guard.outputs.version }}-${{ matrix.target }}"
-          mkdir -p "dist/${stem}"
-          cp "target/${{ matrix.target }}/release/drakkar" "dist/${stem}/"
-          for f in LICENSE.md LICENSE README.md README; do
-            if [ -f "$f" ]; then cp "$f" "dist/${stem}/"; fi
-          done
+      - name: cargo build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "${TARGET}"
 
       - uses: ./.github/actions/build-info
         with:
-          dest: dist/drakkar-v${{ needs.guard.outputs.version }}-${{ matrix.target }}/BUILD-INFO.txt
+          dest: dist/${{ env.STEM }}.BUILD-INFO.txt
           target: ${{ matrix.target }}
           version: ${{ needs.guard.outputs.version }}
 
-      - name: archive et somme
-        shell: bash
+      - name: binaire et sommes
+        env:
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+          SHA256: ${{ matrix.sha256 }}
         run: |
           set -euo pipefail
-          stem="drakkar-v${{ needs.guard.outputs.version }}-${{ matrix.target }}"
-
-          tar -C dist -czf "dist/${stem}.tar.gz" "${stem}"
-          rm -rf "dist/${stem}"
-
-          # SHA-256 en entier, jamais tronque. Format compatible
-          # `sha256sum -c` et `shasum -a 256 -c`.
-          (
-            cd dist
-            case "${RUNNER_OS}" in
-              macOS) shasum -a 256 "${stem}.tar.gz" | tee "${stem}.tar.gz.sha256" ;;
-              *)     sha256sum    "${stem}.tar.gz" | tee "${stem}.tar.gz.sha256" ;;
-            esac
-          )
+          bin="${STEM}${EXE}"
+          cp "target/${TARGET}/release/drakkar${EXE}" "dist/${bin}"
+          read -r -a sum <<< "${SHA256}"
+          # SHA-256 en entier, jamais tronque. Format `sha256sum -c`.
+          cd dist
+          for f in "${bin}" "${STEM}.BUILD-INFO.txt"; do
+            "${sum[@]}" "${f}" | tee "${f}.sha256"
+          done
 
       - uses: actions/upload-artifact@v7
         with:
@@ -135,12 +159,67 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          (
-            cd dist
-            cat ./*.tar.gz.sha256 | sort -k2 > SHA256SUMS
-            rm -f ./*.tar.gz.sha256
-            cat SHA256SUMS
-          )
+          cd dist
+          # sha256sum sous Git Bash peut ecrire `<somme> *<fichier>` (mode
+          # binaire) : toutes les lignes sont ramenees a `<somme>  <fichier>`.
+          cat ./*.sha256 \
+            | tr -d '\r' \
+            | sed -E 's/^([0-9a-f]{64}) [ *]/\1  /' \
+            | LC_ALL=C sort -k2 > SHA256SUMS
+          rm -f ./*.sha256
+          cat SHA256SUMS
+          # Six cibles, deux fichiers chacune : le binaire et son BUILD-INFO.txt.
+          published=(drakkar-v*)
+          sums="$(wc -l < SHA256SUMS)"
+          if [ "${#published[@]}" -ne 12 ] || [ "${sums}" -ne 12 ]; then
+            echo "::error::attendu 12 fichiers drakkar-v* et 12 sommes, obtenu ${#published[@]} fichiers et ${sums} sommes"
+            exit 1
+          fi
+
+      - name: notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/notes.md" <<'EOF'
+          Binaires construits par la CI, un runner natif par cible, feature `lief-backend` non activee. Chaque asset est l'executable lui-meme : aucune archive.
+
+          | Cible | Binaire |
+          |---|---|
+          | `aarch64-apple-darwin` (macOS Apple Silicon) | `drakkar-v@VERSION@-aarch64-apple-darwin` |
+          | `x86_64-apple-darwin` (macOS Intel) | `drakkar-v@VERSION@-x86_64-apple-darwin` |
+          | `x86_64-unknown-linux-gnu` (Linux x86_64) | `drakkar-v@VERSION@-x86_64-unknown-linux-gnu` |
+          | `aarch64-unknown-linux-gnu` (Linux ARM64) | `drakkar-v@VERSION@-aarch64-unknown-linux-gnu` |
+          | `x86_64-pc-windows-msvc` (Windows x64) | `drakkar-v@VERSION@-x86_64-pc-windows-msvc.exe` |
+          | `aarch64-pc-windows-msvc` (Windows ARM64) | `drakkar-v@VERSION@-aarch64-pc-windows-msvc.exe` |
+
+          `SHA256SUMS` porte la somme SHA-256 complete de chaque binaire et de chaque `BUILD-INFO.txt`. Telecharger le binaire voulu et `SHA256SUMS` dans le meme repertoire, puis :
+
+          Linux :
+
+          ```sh
+          sha256sum -c --ignore-missing SHA256SUMS
+          chmod +x drakkar-v@VERSION@-<cible>
+          ```
+
+          macOS (binaire non signe, non notarise) :
+
+          ```sh
+          shasum -a 256 -c --ignore-missing SHA256SUMS
+          chmod +x drakkar-v@VERSION@-<cible>
+          xattr -d com.apple.quarantine drakkar-v@VERSION@-<cible>
+          ```
+
+          Windows (PowerShell) : comparer la somme affichee a la ligne du binaire dans `SHA256SUMS` (Get-FileHash l'ecrit en majuscules, la casse est indifferente).
+
+          ```powershell
+          Get-FileHash -Algorithm SHA256 drakkar-v@VERSION@-<cible>.exe
+          ```
+
+          Chaque binaire a son `drakkar-v@VERSION@-<cible>.BUILD-INFO.txt` : commit complet, version de rustc, et rev complet de toutes les dependances git de `Cargo.lock`.
+          EOF
+          sed -i "s/@VERSION@/${VERSION}/g" "${RUNNER_TEMP}/notes.md"
 
       - name: publier
         shell: bash
@@ -152,17 +231,6 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --title "drakkar ${GITHUB_REF_NAME}" \
             --verify-tag \
-            --notes "Binaires construits par la CI, feature \`lief-backend\` non activee.
-
-          Cibles : \`aarch64-apple-darwin\`, \`x86_64-unknown-linux-gnu\`.
-
-          \`SHA256SUMS\` porte les sommes SHA-256 completes des archives. Verification :
-
-          \`\`\`sh
-          sha256sum -c SHA256SUMS        # Linux
-          shasum -a 256 -c SHA256SUMS    # macOS
-          \`\`\`
-
-          Chaque archive contient un \`BUILD-INFO.txt\` avec le commit complet, la version de rustc et le rev complet de chaque dependance git (\`dex-parser\`, \`dex-bytecode\`)." \
+            --notes-file "${RUNNER_TEMP}/notes.md" \
             dist/SHA256SUMS \
-            dist/*.tar.gz
+            dist/drakkar-v*

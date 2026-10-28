@@ -25,6 +25,9 @@ runs:
         # `source` est recopie tel quel : il porte le rev sur 40 hex, jamais
         # tronque. C'est ce qui rattache une mesure sur corpus a un etat de
         # dependances exact.
+        # Sans `\r` : un Cargo.lock en CRLF laisserait `\r` et `"` dans les revs.
+        lock="${RUNNER_TEMP}/Cargo.lock.lf"
+        tr -d '\r' < Cargo.lock > "${lock}"
         git_deps="$(awk '
           function flush() {
             if (src != "") printf "  %-13s %-8s %s\n", name, ver, src
@@ -35,15 +38,15 @@ runs:
           /^version = "/       { ver  = $0; sub(/^version = "/, "", ver);   sub(/"$/, "", ver);  next }
           /^source = "git\+/   { src  = $0; sub(/^source = "/, "", src);    sub(/"$/, "", src);  next }
           END { flush() }
-        ' Cargo.lock)"
+        ' "${lock}")"
 
         # Une provenance partielle est pire que pas de fichier : on compte les
         # sources git d'un cote, les lignes produites de l'autre, et on refuse
         # d'ecrire si les deux ne concordent pas.
-        expected="$(grep -c '^source = "git+' Cargo.lock || true)"
+        expected="$(grep -c '^source = "git+' "${lock}" || true)"
         actual="$(printf '%s\n' "${git_deps}" | grep -c . || true)"
         if [ "${expected}" -eq 0 ]; then
-          echo "::error::aucune source git dans Cargo.lock — la provenance attendue de drakkar en compte au moins deux (dex-parser, dex-bytecode). Extraction a revoir avant de publier un artefact."
+          echo "::error::aucune source git dans Cargo.lock — drakkar en a plusieurs (dex-parser, dex-bytecode, dex-decompiler, apkparser...). Extraction a revoir avant de publier un artefact."
           exit 1
         fi
         if [ "${actual}" -ne "${expected}" ]; then
