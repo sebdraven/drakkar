@@ -1253,8 +1253,8 @@ impl Walk<'_, '_> {
             return;
         }
         let arg0 = self.arg(0);
-        self.record_direct(target, mode, arg0);
-        self.after_call(None);
+        let ret = self.record_direct(target, mode, arg0);
+        self.after_call(ret);
         if self.arch == Arch::X86 {
             if let Some(reg) = pc_thunk(ctx, target) {
                 self.machine.set(reg, Val::Const(next));
@@ -1262,18 +1262,31 @@ impl Walk<'_, '_> {
         }
     }
 
-    fn record_direct(&mut self, target: u64, mode: bool, arg0: Val) {
+    /// Appel ou tail-call direct. Rend la valeur produite quand la cible est un
+    /// wrapper C++ de jni.h.
+    fn record_direct(&mut self, target: u64, mode: bool, arg0: Val) -> Option<Val> {
         let ctx = self.ctx;
+        if !callable(ctx, target) {
+            self.calls.push(DisasmCall {
+                target: Some(hex(target)),
+                import: None,
+                symbol: None,
+                kind: CALL_UNRESOLVED,
+            });
+            return None;
+        }
         if let Some(name) = plt_import(ctx, target, mode) {
+            let wrapper = cxx_wrapper(&name);
             self.calls.push(DisasmCall {
                 target: Some(hex(target)),
                 import: Some(name),
                 symbol: None,
                 kind: CALL_PLT,
             });
-            return;
+            return wrapper.map(|w| self.wrapper_call(w));
         }
         let symbol = ctx.symbols.get(&target).map(|(name, _)| name.clone());
+        let wrapper = symbol.as_deref().and_then(cxx_wrapper);
         self.calls.push(DisasmCall {
             target: Some(hex(target)),
             import: None,
@@ -1286,6 +1299,7 @@ impl Walk<'_, '_> {
         };
         let callee = entry(target, mode, ORIGIN_CALLEE, arg0);
         self.out.callees.push(callee);
+        wrapper.map(|w| self.wrapper_call(w))
     }
 
     fn indirect(&mut self, via: Via, is_call: bool) {
@@ -1305,37 +1319,38 @@ impl Walk<'_, '_> {
                 self.calls.push(indirect_call());
                 Some(ret)
             }
-            None => {
-                self.record_value(value, arg0, is_call);
-                None
-            }
+            None => self.record_value(value, arg0, is_call),
         };
         if is_call {
             self.after_call(ret);
         }
     }
 
-    fn record_value(&mut self, value: Val, arg0: Val, is_call: bool) {
+    fn record_value(&mut self, value: Val, arg0: Val, is_call: bool) -> Option<Val> {
         let ctx = self.ctx;
         if let Val::Mem(slot) = value {
             if let Some(name) = ctx.got.get(&slot) {
+                let wrapper = cxx_wrapper(name);
                 self.calls.push(DisasmCall {
                     target: None,
                     import: Some(name.clone()),
                     symbol: None,
                     kind: CALL_PLT,
                 });
-                return;
+                return wrapper.map(|w| self.wrapper_call(w));
             }
         }
         let arm = self.arch == Arch::Arm;
         let target = self.machine.materialize(ctx, value);
         match target.map(|t| split_thumb(arm, t)) {
             Some((address, mode)) if ctx.image.is_exec(address) => {
-                self.record_direct(address, mode, arg0);
+                self.record_direct(address, mode, arg0)
             }
-            _ if is_call => self.calls.push(indirect_call()),
-            _ => {}
+            _ if is_call => {
+                self.calls.push(indirect_call());
+                None
+            }
+            _ => None,
         }
     }
 
