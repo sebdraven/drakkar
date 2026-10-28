@@ -1036,14 +1036,14 @@ fn relocated_slots(
             .collect();
         match table.format {
             RelocFormat::Rela => {
-                for entry in words.chunks_exact(3) {
+                for entry in words.as_chunks::<3>().0 {
                     if reloc_type(entry[1], image.ptr_size) == relative {
                         slots.insert(entry[0], entry[2]);
                     }
                 }
             }
             RelocFormat::Rel => {
-                for entry in words.chunks_exact(2) {
+                for entry in words.as_chunks::<2>().0 {
                     if reloc_type(entry[1], image.ptr_size) != relative {
                         continue;
                     }
