@@ -26,6 +26,7 @@ const ORIGIN_INIT: &str = "init";
 const ORIGIN_INIT_ARRAY: &str = "init_array";
 const ORIGIN_ENTRY: &str = "entry";
 const ORIGIN_CALLEE: &str = "callee";
+const ORIGIN_MAIN: &str = "main";
 
 const STATUS_OK: &str = "ok";
 const STATUS_TRUNCATED: &str = "truncated";
@@ -41,6 +42,16 @@ const REASON_DECODER_PANIC: &str = "decoder_panic";
 const CALL_INTERNAL: &str = "internal";
 const CALL_PLT: &str = "plt";
 const CALL_INDIRECT: &str = "indirect";
+const CALL_UNRESOLVED: &str = "unresolved";
+
+const FORM_VTABLE: &str = "vtable";
+const FORM_CXX_WRAPPER: &str = "cxx_wrapper";
+
+const UNRESOLVED_ENV: &str = "env_unproven";
+const UNRESOLVED_CLASS: &str = "class_unresolved";
+const UNRESOLVED_NAME: &str = "name_unresolved";
+const UNRESOLVED_SIGNATURE: &str = "signature_unresolved";
+const UNRESOLVED_TABLE: &str = "table_unresolved";
 
 pub(super) const DISAMBIGUATED_BY_FIND_CLASS: &str = "find_class";
 
@@ -70,6 +81,8 @@ pub(super) const NORETURN_IMPORTS: &[&str] = &[
     "__libc_fatal",
     "__android_log_assert",
     "_ZSt9terminatev",
+    "__libc_init",
+    "__libc_start_main",
 ];
 
 /// Réglages de `--native-disasm`.
@@ -161,13 +174,31 @@ pub struct StringRef {
 pub struct JniCall {
     pub name: &'static str,
     pub index: usize,
+    pub form: &'static str,
     pub resolved: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unresolved_reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+}
+
+impl JniCall {
+    fn new(name: &'static str, index: usize, form: &'static str) -> Self {
+        JniCall {
+            name,
+            index,
+            form,
+            resolved: false,
+            unresolved_reason: None,
+            class: None,
+            method: None,
+            signature: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -908,7 +939,53 @@ fn in_function(ctx: &Ctx, start: u64, at: u64) -> bool {
 }
 
 fn is_internal(ctx: &Ctx, start: u64, at: u64, thumb: bool) -> bool {
-    in_function(ctx, start, at) && plt_import(ctx, at, thumb).is_none()
+    at != 0 && in_function(ctx, start, at) && plt_import(ctx, at, thumb).is_none()
+}
+
+/// Cible d'appel direct qui peut être une fonction : non nulle, dans un segment
+/// LOAD exécutable.
+fn callable(ctx: &Ctx, at: u64) -> bool {
+    at != 0 && ctx.image.is_exec(at)
+}
+
+/// Méthode inline de jni.h émise hors ligne par un compilateur C++.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wrapper {
+    /// `_JNIEnv::<nom>` : nom et index dans JNINativeInterface.
+    Env(&'static str, usize),
+    /// `_JavaVM::<nom>` : nom et index dans JNIInvokeInterface.
+    Vm(&'static str, usize),
+}
+
+/// `_ZN7_JNIEnv<n><Nom>E…` ou `_ZN7_JavaVM<n><Nom>E…`, `<Nom>` présent dans la
+/// table correspondante, hors emplacements réservés.
+fn cxx_wrapper(symbol: &str) -> Option<Wrapper> {
+    let (vm, rest) = match symbol.strip_prefix("_ZN7_JNIEnv") {
+        Some(rest) => (false, rest),
+        None => (true, symbol.strip_prefix("_ZN7_JavaVM")?),
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let len: usize = rest[..digits].parse().ok()?;
+    let end = digits.checked_add(len)?;
+    let name = rest.get(digits..end)?;
+    if !rest[end..].starts_with('E') {
+        return None;
+    }
+    let (table, reserved): (&[&'static str], usize) = if vm {
+        (&jni::JNI_INVOKE_INTERFACE, jni::INVOKE_RESERVED_SLOTS)
+    } else {
+        (&jni::JNI_NATIVE_INTERFACE, jni::RESERVED_SLOTS)
+    };
+    let index = table.iter().position(|&n| n == name)?;
+    if index < reserved {
+        return None;
+    }
+    let name = table[index];
+    Some(if vm {
+        Wrapper::Vm(name, index)
+    } else {
+        Wrapper::Env(name, index)
+    })
 }
 
 /// Appel direct sans retour : import de [`NORETURN_IMPORTS`], ou fonction
@@ -1083,6 +1160,8 @@ fn explore(ctx: &Ctx, arch: Arch, entry: &Entry, max_insns: usize) -> Explored {
 struct Analyzed {
     function: DisasmFunction,
     callees: Vec<Entry>,
+    /// main passé à __libc_init ou __libc_start_main : un point d'entrée de plus.
+    mains: Vec<Entry>,
     upcalls: Vec<JavaMember>,
     registered: Vec<JavaMember>,
 }
@@ -1092,6 +1171,7 @@ impl Analyzed {
         Analyzed {
             function: DisasmFunction::new(entry),
             callees: Vec::new(),
+            mains: Vec::new(),
             upcalls: Vec::new(),
             registered: Vec::new(),
         }
@@ -1253,8 +1333,8 @@ impl Walk<'_, '_> {
             return;
         }
         let arg0 = self.arg(0);
-        self.record_direct(target, mode, arg0);
-        self.after_call(None);
+        let ret = self.record_direct(target, mode, arg0);
+        self.after_call(ret);
         if self.arch == Arch::X86 {
             if let Some(reg) = pc_thunk(ctx, target) {
                 self.machine.set(reg, Val::Const(next));
@@ -1262,18 +1342,32 @@ impl Walk<'_, '_> {
         }
     }
 
-    fn record_direct(&mut self, target: u64, mode: bool, arg0: Val) {
+    /// Appel ou tail-call direct. Rend la valeur produite quand la cible est un
+    /// wrapper C++ de jni.h.
+    fn record_direct(&mut self, target: u64, mode: bool, arg0: Val) -> Option<Val> {
         let ctx = self.ctx;
+        if !callable(ctx, target) {
+            self.calls.push(DisasmCall {
+                target: Some(hex(target)),
+                import: None,
+                symbol: None,
+                kind: CALL_UNRESOLVED,
+            });
+            return None;
+        }
         if let Some(name) = plt_import(ctx, target, mode) {
+            let wrapper = cxx_wrapper(&name);
+            self.libc_main(&name);
             self.calls.push(DisasmCall {
                 target: Some(hex(target)),
                 import: Some(name),
                 symbol: None,
                 kind: CALL_PLT,
             });
-            return;
+            return wrapper.map(|w| self.wrapper_call(w));
         }
         let symbol = ctx.symbols.get(&target).map(|(name, _)| name.clone());
+        let wrapper = symbol.as_deref().and_then(cxx_wrapper);
         self.calls.push(DisasmCall {
             target: Some(hex(target)),
             import: None,
@@ -1286,6 +1380,7 @@ impl Walk<'_, '_> {
         };
         let callee = entry(target, mode, ORIGIN_CALLEE, arg0);
         self.out.callees.push(callee);
+        wrapper.map(|w| self.wrapper_call(w))
     }
 
     fn indirect(&mut self, via: Via, is_call: bool) {
@@ -1305,37 +1400,60 @@ impl Walk<'_, '_> {
                 self.calls.push(indirect_call());
                 Some(ret)
             }
-            None => {
-                self.record_value(value, arg0, is_call);
-                None
-            }
+            None => self.record_value(value, arg0, is_call),
         };
         if is_call {
             self.after_call(ret);
         }
     }
 
-    fn record_value(&mut self, value: Val, arg0: Val, is_call: bool) {
+    fn record_value(&mut self, value: Val, arg0: Val, is_call: bool) -> Option<Val> {
         let ctx = self.ctx;
         if let Val::Mem(slot) = value {
             if let Some(name) = ctx.got.get(&slot) {
+                let wrapper = cxx_wrapper(name);
+                self.libc_main(name);
                 self.calls.push(DisasmCall {
                     target: None,
                     import: Some(name.clone()),
                     symbol: None,
                     kind: CALL_PLT,
                 });
-                return;
+                return wrapper.map(|w| self.wrapper_call(w));
             }
         }
         let arm = self.arch == Arch::Arm;
         let target = self.machine.materialize(ctx, value);
         match target.map(|t| split_thumb(arm, t)) {
             Some((address, mode)) if ctx.image.is_exec(address) => {
-                self.record_direct(address, mode, arg0);
+                self.record_direct(address, mode, arg0)
             }
-            _ if is_call => self.calls.push(indirect_call()),
-            _ => {}
+            _ if is_call => {
+                self.calls.push(indirect_call());
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// `__libc_init(raw_args, onexit, main, structors)` (bionic) et
+    /// `__libc_start_main(main, argc, argv, …)` (glibc) : main, lu avant que
+    /// l'appel n'écrase les registres d'argument.
+    fn libc_main(&mut self, import: &str) {
+        let index = match import {
+            "__libc_init" => 2,
+            "__libc_start_main" => 0,
+            _ => return,
+        };
+        let ctx = self.ctx;
+        let value = self.arg(index);
+        let Some(target) = self.machine.materialize(ctx, value) else {
+            return;
+        };
+        let (address, thumb) = split_thumb(self.arch == Arch::Arm, target);
+        if callable(ctx, address) {
+            let main = entry(address, thumb, ORIGIN_MAIN, Val::Opaque(0));
+            self.out.mains.push(main);
         }
     }
 
@@ -1366,7 +1484,7 @@ impl Walk<'_, '_> {
 
     /// Appel par la table de JNIEnv au décalage `off`. `None` si ce décalage ne
     /// désigne aucune fonction de la table ; sinon la valeur rendue.
-    fn jni_call(&mut self, off: u64, resolved: bool) -> Option<Val> {
+    fn jni_call(&mut self, off: u64, env_proven: bool) -> Option<Val> {
         let ptr = self.ctx.image.ptr_size;
         if !off.is_multiple_of(ptr) {
             return None;
@@ -1376,23 +1494,47 @@ impl Walk<'_, '_> {
             return None;
         }
         let name = *jni::JNI_NATIVE_INTERFACE.get(index)?;
-        let mut call = JniCall {
-            name,
-            index,
-            resolved,
-            class: None,
-            method: None,
-            signature: None,
-        };
+        Some(self.env_call(name, index, FORM_VTABLE, env_proven))
+    }
+
+    /// Wrapper C++ : `this` est l'env ou la JavaVM, si bien que les arguments
+    /// de jni.h occupent les mêmes registres que dans l'appel par la table.
+    fn wrapper_call(&mut self, wrapper: Wrapper) -> Val {
+        match wrapper {
+            Wrapper::Env(name, index) => self.env_call(name, index, FORM_CXX_WRAPPER, true),
+            Wrapper::Vm(name, index) => {
+                self.writes_env(index);
+                let mut call = JniCall::new(name, index, FORM_CXX_WRAPPER);
+                call.resolved = true;
+                self.out.function.jni_calls.push(call);
+                self.machine.fresh()
+            }
+        }
+    }
+
+    /// Fonction `index` de JNINativeInterface, sous l'une ou l'autre forme ;
+    /// rend la valeur produite par l'appel.
+    fn env_call(
+        &mut self,
+        name: &'static str,
+        index: usize,
+        form: &'static str,
+        env_proven: bool,
+    ) -> Val {
+        let ctx = self.ctx;
+        let mut call = JniCall::new(name, index, form);
         let mut ret = None;
+        let mut missing = None;
         match index {
             jni::FIND_CLASS => {
                 let value = self.arg(1);
-                if let Some(at) = self.machine.materialize(self.ctx, value) {
-                    if let Some(name) = utf8_at(self.ctx, at) {
+                let at = self.machine.materialize(ctx, value);
+                match at.and_then(|at| utf8_at(ctx, at).map(|name| (at, name))) {
+                    Some((at, name)) => {
                         call.class = Some(class_descriptor(&name));
                         ret = Some(Val::Class(at));
                     }
+                    None => missing = Some(UNRESOLVED_CLASS),
                 }
             }
             jni::GET_METHOD_ID
@@ -1402,15 +1544,25 @@ impl Walk<'_, '_> {
                 call.class = self.class_arg(1);
                 call.method = self.string_arg(2);
                 call.signature = self.string_arg(3);
+                missing = if call.class.is_none() {
+                    Some(UNRESOLVED_CLASS)
+                } else if call.method.is_none() {
+                    Some(UNRESOLVED_NAME)
+                } else if call.signature.is_none() {
+                    Some(UNRESOLVED_SIGNATURE)
+                } else {
+                    None
+                };
                 if let Some(member) = upcall(&call) {
                     self.out.upcalls.push(member);
                 }
             }
             jni::REGISTER_NATIVES => {
                 call.class = self.class_arg(1);
-                if let Some(class) = call.class.clone() {
-                    self.registered_by_code(&class);
-                }
+                missing = match call.class.clone() {
+                    Some(class) => (!self.registered_by_code(&class)).then_some(UNRESOLVED_TABLE),
+                    None => Some(UNRESOLVED_CLASS),
+                };
             }
             jni::NEW_GLOBAL_REF | jni::NEW_LOCAL_REF | jni::NEW_WEAK_GLOBAL_REF => {
                 if let Val::Class(at) = self.arg(1) {
@@ -1419,24 +1571,32 @@ impl Walk<'_, '_> {
             }
             _ => {}
         }
+        let reason = if env_proven {
+            missing
+        } else {
+            Some(UNRESOLVED_ENV)
+        };
+        call.resolved = reason.is_none();
+        call.unresolved_reason = reason;
         self.out.function.jni_calls.push(call);
-        Some(ret.unwrap_or_else(|| self.machine.fresh()))
+        ret.unwrap_or_else(|| self.machine.fresh())
     }
 
     /// Entrées JNINativeMethod passées à RegisterNatives : table en troisième
-    /// argument, nombre en quatrième.
-    fn registered_by_code(&mut self, class: &str) {
+    /// argument, nombre en quatrième. Faux si aucune entrée n'a pu être lue.
+    fn registered_by_code(&mut self, class: &str) -> bool {
         let ctx = self.ctx;
         let table = self.arg(2);
         let count = self.arg(3);
         let Some(mut at) = self.machine.materialize(ctx, table) else {
-            return;
+            return false;
         };
         let limit = match self.machine.materialize(ctx, count) {
             Some(count) => count.min(MAX_REGISTER_ENTRIES),
             None => MAX_REGISTER_ENTRIES,
         };
         let stride = 3 * ctx.image.ptr_size;
+        let before = self.out.registered.len();
         for _ in 0..limit {
             let Some(method) = jni_entry_at(&ctx.image, &ctx.slots, at) else {
                 break;
@@ -1450,19 +1610,28 @@ impl Walk<'_, '_> {
             self.out.registered.push(member);
             at = at.wrapping_add(stride);
         }
+        self.out.registered.len() > before
+    }
+
+    fn invoke_call(&mut self, off: u64) {
+        let ptr = self.ctx.image.ptr_size;
+        if !off.is_multiple_of(ptr) {
+            return;
+        }
+        if let Ok(index) = usize::try_from(off / ptr) {
+            self.writes_env(index);
+        }
     }
 
     /// GetEnv et AttachCurrentThread écrivent un JNIEnv* à l'adresse passée en
     /// deuxième argument.
-    fn invoke_call(&mut self, off: u64) {
-        let ptr = self.ctx.image.ptr_size;
-        let index = off / ptr;
+    fn writes_env(&mut self, index: usize) {
         let writes_env = [
             jni::INVOKE_ATTACH_CURRENT_THREAD,
             jni::INVOKE_GET_ENV,
             jni::INVOKE_ATTACH_CURRENT_THREAD_AS_DAEMON,
         ];
-        if off.is_multiple_of(ptr) && writes_env.iter().any(|&i| i as u64 == index) {
+        if writes_env.contains(&index) {
             let place = self.arg(1);
             self.machine.store_at(self.ctx, place, Val::Env);
         }
@@ -1509,11 +1678,16 @@ fn walk_functions(ctx: &Ctx, entries: Vec<Entry>, options: &DisasmOptions) -> El
     let mut level = entries;
     for depth in 0..=options.depth {
         let mut next = Vec::new();
-        for entry in level {
+        let mut queue = level;
+        let mut at = 0;
+        while let Some(&entry) = queue.get(at) {
+            at += 1;
             if !done.insert(entry.address) {
                 continue;
             }
             let analyzed = analyze_guarded(ctx, &entry, options.max_insns);
+            // main est désassemblé au niveau de l'entrée qui le passe.
+            queue.extend(analyzed.mains);
             if depth < options.depth {
                 next.extend(analyzed.callees);
             }
@@ -1829,6 +2003,41 @@ mod tests {
         ] {
             assert_eq!(table[index], name, "{index}");
         }
+        let invoke = jni::JNI_INVOKE_INTERFACE;
+        assert_eq!(&invoke[..jni::INVOKE_RESERVED_SLOTS], &reserved[..3]);
+        for (index, name) in [
+            (3, "DestroyJavaVM"),
+            (jni::INVOKE_ATTACH_CURRENT_THREAD, "AttachCurrentThread"),
+            (5, "DetachCurrentThread"),
+            (jni::INVOKE_GET_ENV, "GetEnv"),
+            (
+                jni::INVOKE_ATTACH_CURRENT_THREAD_AS_DAEMON,
+                "AttachCurrentThreadAsDaemon",
+            ),
+        ] {
+            assert_eq!(invoke[index], name, "{index}");
+        }
+    }
+
+    #[test]
+    fn cxx_wrapper_symbols_name_their_table_entry() {
+        let find_class = cxx_wrapper("_ZN7_JNIEnv9FindClassEPKc");
+        assert_eq!(find_class, Some(Wrapper::Env("FindClass", jni::FIND_CLASS)));
+        let register = "_ZN7_JNIEnv15RegisterNativesEP7_jclassPK15JNINativeMethodi";
+        let expected = Wrapper::Env("RegisterNatives", jni::REGISTER_NATIVES);
+        assert_eq!(cxx_wrapper(register), Some(expected));
+        let get_env = cxx_wrapper("_ZN7_JavaVM6GetEnvEPPvi");
+        assert_eq!(get_env, Some(Wrapper::Vm("GetEnv", jni::INVOKE_GET_ENV)));
+        for symbol in [
+            "_ZN7_JNIEnv9reserved0EPv",
+            "_ZN7_JNIEnv8FindClasEPKc",
+            "_ZN7_JNIEnv99FindClassEPKc",
+            "_ZN7_JNIEnvFindClassEPKc",
+            "_ZN7_JavaVM9FindClassEPKc",
+            "_ZN6Helper9FindClassEPKc",
+        ] {
+            assert_eq!(cxx_wrapper(symbol), None, "{symbol}");
+        }
     }
 
     #[test]
@@ -2073,9 +2282,17 @@ mod tests {
         assert_eq!(keys(function), fields);
         let call = ["import", "kind", "symbol", "target"];
         assert_eq!(keys(&function["calls"][0]), call);
-        let find_class = ["class", "index", "name", "resolved"];
+        let find_class = ["class", "form", "index", "name", "resolved"];
         assert_eq!(keys(&function["jni_calls"][0]), find_class);
-        let get_method_id = ["class", "index", "method", "name", "resolved", "signature"];
+        let get_method_id = [
+            "class",
+            "form",
+            "index",
+            "method",
+            "name",
+            "resolved",
+            "signature",
+        ];
         assert_eq!(keys(&function["jni_calls"][1]), get_method_id);
         assert_eq!(keys(&json["upcalls"][0]), ["class", "name", "signature"]);
         let refs = ["address", "encoding", "target", "value"];
@@ -2225,6 +2442,268 @@ mod tests {
         }
     }
 
+    /// Point d'entrée ARM d'un exécutable : main (0x1100) par ldr littéral en r2,
+    /// puis __libc_init par la PLT.
+    const ARM_LIBC_INIT: &[(u32, &str)] = &[
+        (0xe59f2004, "1000  ldr  r2, [pc, #4]   ; 0x100c"),
+        (0xeb0001fd, "1004  bl   0x1800         ; __libc_init@plt"),
+        (0xe12fff1e, "1008  bx   lr"),
+        (0x00001100, "100c  littéral : main"),
+    ];
+
+    /// r2 jamais écrit avant l'appel.
+    const ARM_LIBC_INIT_UNKNOWN: &[(u32, &str)] = &[
+        (0xeb0001fe, "1000  bl   0x1800         ; __libc_init@plt"),
+        (0xe12fff1e, "1004  bx   lr"),
+    ];
+
+    /// Point d'entrée AArch64 : main (0x2100) par adrp + add en x2.
+    const A64_LIBC_INIT: &[(u32, &str)] = &[
+        (0xb0000002, "1000  adrp x2, 0x2000"),
+        (0x91040042, "1004  add  x2, x2, #0x100"),
+        (0x940001fe, "1008  bl   0x1800         ; __libc_init@plt"),
+        (0xd65f03c0, "100c  ret"),
+    ];
+
+    fn exec_entry(address: u64) -> Entry {
+        entry(address, false, ORIGIN_ENTRY, Val::Opaque(0))
+    }
+
+    fn origins(disasm: &ElfDisasm) -> Vec<(&str, &'static str, &'static str)> {
+        let mut origins = Vec::new();
+        for f in &disasm.functions {
+            origins.push((f.address.as_str(), f.origin, f.disasm_status));
+        }
+        origins
+    }
+
+    #[test]
+    fn arm_libc_init_adds_main_from_its_third_argument() {
+        let mut data = vec![0u8; 0x4000];
+        assemble(&mut data, CODE, ARM_LIBC_INIT);
+        put(&mut data, 0x1100, &0xe12fff1eu32.to_le_bytes());
+        assemble(&mut data, 0x1800, ARM_PLT);
+        let dynamic = jump_slot(&mut data, 0x348c, "__libc_init", true);
+        let mut ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        let disasm = walk_functions(&ctx, vec![exec_entry(CODE)], &options(0, 100));
+        let expected = [
+            ("0x1000", ORIGIN_ENTRY, STATUS_OK),
+            ("0x1100", ORIGIN_MAIN, STATUS_OK),
+        ];
+        assert_eq!(origins(&disasm), expected);
+        let import = disasm.functions[0].calls[0].import.as_deref();
+        assert_eq!(import, Some("__libc_init"));
+    }
+
+    #[test]
+    fn aarch64_libc_init_adds_main_from_x2() {
+        let mut data = vec![0u8; 0x4000];
+        assemble(&mut data, CODE, A64_LIBC_INIT);
+        put(&mut data, 0x2100, &0xd65f03c0u32.to_le_bytes());
+        assemble(&mut data, 0x1800, A64_PLT);
+        let dynamic = jump_slot(&mut data, 0x3000, "__libc_init", false);
+        let mut ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        let disasm = walk_functions(&ctx, vec![exec_entry(CODE)], &options(0, 100));
+        let expected = [
+            ("0x1000", ORIGIN_ENTRY, STATUS_OK),
+            ("0x2100", ORIGIN_MAIN, STATUS_OK),
+        ];
+        assert_eq!(origins(&disasm), expected);
+    }
+
+    #[test]
+    fn an_unknown_main_adds_no_function() {
+        let mut data = vec![0u8; 0x4000];
+        assemble(&mut data, CODE, ARM_LIBC_INIT_UNKNOWN);
+        assemble(&mut data, 0x1800, ARM_PLT);
+        let dynamic = jump_slot(&mut data, 0x348c, "__libc_init", true);
+        let mut ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        let disasm = walk_functions(&ctx, vec![exec_entry(CODE)], &options(0, 100));
+        assert_eq!(origins(&disasm), [("0x1000", ORIGIN_ENTRY, STATUS_OK)]);
+        let import = disasm.functions[0].calls[0].import.as_deref();
+        assert_eq!(import, Some("__libc_init"));
+    }
+
+    /// AArch64 : FindClass par le wrapper C++ de jni.h, appelé par sa PLT.
+    const A64_CXX_FIND_CLASS: &[(u32, &str)] = &[
+        (0xb0000001, "1000  adrp x1, 0x2000"),
+        (0x91000021, "1004  add  x1, x1, #0x0      ; com/foo/Bar"),
+        (
+            0x940001fe,
+            "1008  bl   0x1800            ; _JNIEnv::FindClass@plt",
+        ),
+        (0xd65f03c0, "100c  ret"),
+    ];
+
+    #[test]
+    fn a_cxx_findclass_wrapper_through_the_plt_is_a_jni_call() {
+        let mut data = vec![0u8; 0x4000];
+        strings(&mut data);
+        assemble(&mut data, CODE, A64_CXX_FIND_CLASS);
+        assemble(&mut data, 0x1800, A64_PLT);
+        let dynamic = jump_slot(&mut data, 0x3000, "_ZN7_JNIEnv9FindClassEPKc", false);
+        let mut ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        let out = analyze(&ctx, CODE, false);
+        let f = &out.function;
+        let import = f.calls[0].import.as_deref();
+        assert_eq!(import, Some("_ZN7_JNIEnv9FindClassEPKc"));
+        assert_eq!(jni_names(f), [("FindClass", jni::FIND_CLASS, true)]);
+        let call = &f.jni_calls[0];
+        assert_eq!(call.form, FORM_CXX_WRAPPER);
+        assert_eq!(call.unresolved_reason, None);
+        assert_eq!(call.class.as_deref(), Some("Lcom/foo/Bar;"));
+    }
+
+    /// FindClass par la table, puis RegisterNatives par son wrapper C++ (PLT).
+    /// Table JNINativeMethod en 0x2040.
+    const A64_CXX_REGISTER: &[(u32, &str)] = &[
+        (0xaa0003f3, "1000  mov  x19, x0"),
+        (0xf9400268, "1004  ldr  x8, [x19]"),
+        (0xf9401908, "1008  ldr  x8, [x8, #0x30]   ; FindClass"),
+        (0xb0000001, "100c  adrp x1, 0x2000"),
+        (0x91000021, "1010  add  x1, x1, #0x0      ; com/foo/Bar"),
+        (0xaa1303e0, "1014  mov  x0, x19"),
+        (0xd63f0100, "1018  blr  x8"),
+        (0xaa0003e1, "101c  mov  x1, x0            ; jclass"),
+        (0xb0000002, "1020  adrp x2, 0x2000"),
+        (0x91010042, "1024  add  x2, x2, #0x40     ; table"),
+        (0x52800023, "1028  mov  w3, #1"),
+        (0xaa1303e0, "102c  mov  x0, x19"),
+        (
+            0x940001f4,
+            "1030  bl   0x1800            ; _JNIEnv::RegisterNatives@plt",
+        ),
+        (0xd65f03c0, "1034  ret"),
+    ];
+
+    #[test]
+    fn a_cxx_registernatives_wrapper_registers_its_table() {
+        let mut data = vec![0u8; 0x4000];
+        strings(&mut data);
+        assemble(&mut data, CODE, A64_CXX_REGISTER);
+        assemble(&mut data, 0x1800, A64_PLT);
+        for (i, value) in [0x2010u64, 0x2018, 0x1100].into_iter().enumerate() {
+            put(&mut data, 0x2040 + 8 * i as u64, &value.to_le_bytes());
+        }
+        put(&mut data, 0x1100, &0xd65f03c0u32.to_le_bytes());
+        let symbol = "_ZN7_JNIEnv15RegisterNativesEP7_jclassPK15JNINativeMethodi";
+        let dynamic = jump_slot(&mut data, 0x3000, symbol, false);
+        let mut ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        let out = analyze(&ctx, CODE, false);
+        let expected = [("FindClass", 6, true), ("RegisterNatives", 215, true)];
+        assert_eq!(jni_names(&out.function), expected);
+        let mut forms = Vec::new();
+        for call in &out.function.jni_calls {
+            forms.push(call.form);
+        }
+        assert_eq!(forms, [FORM_VTABLE, FORM_CXX_WRAPPER]);
+        let run = member("Lcom/foo/Bar;", "run", "()V", Some(0x1100));
+        assert_eq!(out.registered, [run]);
+    }
+
+    /// AArch64 : le nom de classe passe par la pile avant FindClass.
+    const A64_STACK_FIND_CLASS: &[(u32, &str)] = &[
+        (0xd10083ff, "1000  sub  sp, sp, #0x20"),
+        (0xaa0003f3, "1004  mov  x19, x0"),
+        (0xb0000008, "1008  adrp x8, 0x2000"),
+        (0x91000108, "100c  add  x8, x8, #0x0      ; com/foo/Bar"),
+        (0xf90007e8, "1010  str  x8, [sp, #8]"),
+        (0xf9400268, "1014  ldr  x8, [x19]"),
+        (0xf9401908, "1018  ldr  x8, [x8, #0x30]   ; FindClass"),
+        (0xf94007e1, "101c  ldr  x1, [sp, #8]"),
+        (0xaa1303e0, "1020  mov  x0, x19"),
+        (0xd63f0100, "1024  blr  x8"),
+        (0x910083ff, "1028  add  sp, sp, #0x20"),
+        (0xd65f03c0, "102c  ret"),
+    ];
+
+    #[test]
+    fn a_class_name_spilled_to_the_stack_still_resolves_findclass() {
+        let mut data = vec![0u8; 0x3000];
+        strings(&mut data);
+        assemble(&mut data, CODE, A64_STACK_FIND_CLASS);
+        let ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        let out = analyze(&ctx, CODE, false);
+        let f = &out.function;
+        assert_eq!(f.instructions.len(), A64_STACK_FIND_CLASS.len());
+        assert_eq!(jni_names(f), [("FindClass", jni::FIND_CLASS, true)]);
+        assert_eq!(f.jni_calls[0].form, FORM_VTABLE);
+        assert_eq!(f.jni_calls[0].class.as_deref(), Some("Lcom/foo/Bar;"));
+    }
+
+    /// AArch64 : FindClass dont le nom est un paramètre (x1 jamais écrit).
+    const A64_PARAM_FIND_CLASS: &[(u32, &str)] = &[
+        (0xf9400008, "1000  ldr  x8, [x0]"),
+        (0xf9401908, "1004  ldr  x8, [x8, #0x30]   ; FindClass"),
+        (0xd63f0100, "1008  blr  x8"),
+        (0xd65f03c0, "100c  ret"),
+    ];
+
+    #[test]
+    fn an_unknown_class_name_leaves_findclass_unresolved_with_its_reason() {
+        let mut data = vec![0u8; 0x2000];
+        assemble(&mut data, CODE, A64_PARAM_FIND_CLASS);
+        let ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        let out = analyze(&ctx, CODE, false);
+        let call = &out.function.jni_calls[0];
+        assert_eq!((call.name, call.resolved), ("FindClass", false));
+        assert_eq!(call.unresolved_reason, Some(UNRESOLVED_CLASS));
+        assert_eq!(call.class, None);
+    }
+
+    /// ARM : ubfx et uxtb, que yaxpeax-arm 0.5.0 refuse.
+    const ARM_MEDIA: &[(u32, &str)] = &[
+        (0xe7e000d0, "1000  ubfx r0, r0, #1, #1"),
+        (0xe6ef2078, "1004  uxtb r2, r8"),
+        (0xe12fff1e, "1008  bx   lr"),
+    ];
+
+    #[test]
+    fn arm_media_instructions_do_not_cut_a_function() {
+        let mut data = vec![0u8; 0x2000];
+        assemble(&mut data, CODE, ARM_MEDIA);
+        let ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        let function = analyze(&ctx, CODE, false).function;
+        assert_eq!(function.disasm_status, STATUS_OK);
+        assert!(function.invalid_paths.is_empty());
+        let mut mnemonics = Vec::new();
+        for insn in &function.instructions {
+            mnemonics.push(insn.mnemonic.as_str());
+        }
+        assert_eq!(mnemonics, ["ubfx", "uxtb", "bx"]);
+        let three = [function.clone(), function.clone(), function];
+        assert_eq!(opaque_dead_code(&three), None);
+    }
+
+    const A64_CALLS_ZERO: &[(u32, &str)] =
+        &[(0x97fffc00, "1000  bl   0x0"), (0xd65f03c0, "1004  ret")];
+
+    #[test]
+    fn a_call_to_address_zero_is_unresolved_and_creates_no_callee() {
+        let mut data = vec![0u8; 0x2000];
+        assemble(&mut data, CODE, A64_CALLS_ZERO);
+        let ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        let out = analyze(&ctx, CODE, false);
+        let unresolved = DisasmCall {
+            target: Some("0x0".to_string()),
+            import: None,
+            symbol: None,
+            kind: CALL_UNRESOLVED,
+        };
+        assert_eq!(out.function.calls, [unresolved]);
+        assert!(out.callees.is_empty());
+
+        let entries = vec![jni_entry(CODE, false)];
+        let disasm = walk_functions(&ctx, entries, &DisasmOptions::default());
+        assert_eq!(disasm.functions.len(), 1);
+        assert_eq!(disasm.functions[0].address, "0x1000");
+    }
+
     /// Prologue et épilogue Thumb-2 de libbash.so (armeabi-v7a), le bl visant
     /// 0x1100. Les deux demi-mots qui suivent le pop sont un littéral.
     const THUMB_FRAME: &[(u16, &str)] = &[
@@ -2363,6 +2842,9 @@ mod tests {
             ORIGIN_INIT_ARRAY,
             ORIGIN_ENTRY,
             ORIGIN_CALLEE,
+            ORIGIN_MAIN,
+            "__libc_init",
+            "__libc_start_main",
             STATUS_TRUNCATED,
             STATUS_ARCH_UNSUPPORTED,
             STATUS_INVALID_ENTRY,
@@ -2380,6 +2862,20 @@ mod tests {
             CALL_INTERNAL,
             CALL_PLT,
             CALL_INDIRECT,
+            CALL_UNRESOLVED,
+            FORM_VTABLE,
+            FORM_CXX_WRAPPER,
+            "form",
+            "unresolved_reason",
+            UNRESOLVED_ENV,
+            UNRESOLVED_CLASS,
+            UNRESOLVED_NAME,
+            UNRESOLVED_SIGNATURE,
+            UNRESOLVED_TABLE,
+            "_ZN7_JNIEnv",
+            "_ZN7_JavaVM",
+            "ubfx",
+            "uxtb",
             DISAMBIGUATED_BY_FIND_CLASS,
             "disambiguated_by",
             "disasm_failed",
@@ -2394,6 +2890,9 @@ mod tests {
         ];
         for label in labels.iter().chain(NORETURN_IMPORTS) {
             assert!(legend.contains(label), "{label}");
+        }
+        for name in &jni::JNI_INVOKE_INTERFACE[jni::INVOKE_RESERVED_SLOTS..] {
+            assert!(legend.contains(name), "{name}");
         }
         assert!(legend.contains(&format!("(défaut {DEFAULT_DISASM_DEPTH})")));
         assert!(legend.contains(&format!("(défaut {DEFAULT_DISASM_MAX_INSNS})")));

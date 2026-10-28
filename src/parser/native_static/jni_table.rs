@@ -26,6 +26,20 @@ pub(super) const INVOKE_ATTACH_CURRENT_THREAD: usize = 4;
 pub(super) const INVOKE_GET_ENV: usize = 6;
 pub(super) const INVOKE_ATTACH_CURRENT_THREAD_AS_DAEMON: usize = 7;
 
+/// Emplacements `reserved0` à `reserved2` de `JNIInvokeInterface`.
+pub(super) const INVOKE_RESERVED_SLOTS: usize = 3;
+
+pub(super) const JNI_INVOKE_INTERFACE: [&str; 8] = [
+    "reserved0",
+    "reserved1",
+    "reserved2",
+    "DestroyJavaVM",
+    "AttachCurrentThread",
+    "DetachCurrentThread",
+    "GetEnv",
+    "AttachCurrentThreadAsDaemon",
+];
+
 pub(super) const JNI_NATIVE_INTERFACE: [&str; 233] = [
     "reserved0",
     "reserved1",

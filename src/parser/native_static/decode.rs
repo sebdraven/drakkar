@@ -510,6 +510,11 @@ fn decode_arm(code: &[u8], address: u64, thumb: bool) -> Option<Insn> {
     decoder.set_allow_nonconforming(false);
     let mut reader = U8Reader::new(code);
     let Ok(inst) = decoder.decode(&mut reader) else {
+        if !thumb {
+            if let Some(insn) = arm_media(code, address) {
+                return Some(insn);
+            }
+        }
         return coprocessor(code, address, thumb);
     };
     let len = usize::try_from(inst.len().to_const()).ok()?;
@@ -553,6 +558,159 @@ fn arm_coprocessor(word: u32) -> bool {
         return word >> 25 == 0x79 || (word >> 24 == 0xf4 && word & 0x0010_0000 == 0);
     }
     (word >> 26) & 0b11 == 0b11 && (word >> 24) & 0xf != 0xf
+}
+
+const ARM_CONDITIONS: [&str; 15] = [
+    "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "",
+];
+
+/// Noms de yaxpeax-arm (armv7/display.rs, REG_NAMES).
+fn arm_reg_name(reg: u32) -> String {
+    match reg & 0xf {
+        9 => "sb".to_string(),
+        11 => "fp".to_string(),
+        12 => "ip".to_string(),
+        13 => "sp".to_string(),
+        14 => "lr".to_string(),
+        15 => "pc".to_string(),
+        n => format!("r{n}"),
+    }
+}
+
+/// Instructions media A32 (ARMv7-A, A5.4) : yaxpeax-arm 0.5.0 refuse tout cet
+/// espace (bits 27:25 = 011 et bit 4 = 1, `DecodeError::Incomplete`). Seules
+/// l'écriture de Rd et sa condition sont suivies ; Rd = pc termine le bloc.
+fn arm_media(code: &[u8], address: u64) -> Option<Insn> {
+    let raw = code.get(..4)?;
+    let word = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let cond = word >> 28;
+    if cond == 0xf || (word >> 25) & 0b111 != 0b011 || word & 0x10 == 0 {
+        return None;
+    }
+    let (name, operands, rd) = arm_media_form(word)?;
+    let mnemonic = format!("{name}{}", ARM_CONDITIONS[cond as usize]);
+    let mut insn = Insn::new(address, raw, mnemonic, operands);
+    arm_write(rd as u8, Expr::Unknown, &mut insn);
+    if cond != 0xe {
+        conditional(&mut insn);
+    }
+    Some(insn)
+}
+
+/// Mnémonique, opérandes et registre écrit (ARMv7-A, A5.4.1 à A5.4.4).
+fn arm_media_form(word: u32) -> Option<(&'static str, String, u32)> {
+    let op1 = (word >> 20) & 0x1f;
+    let op2 = (word >> 5) & 0b111;
+    let rd = (word >> 12) & 0xf;
+    let rn = (word >> 16) & 0xf;
+    let low = word & 0xf;
+    let lsb = (word >> 7) & 0x1f;
+    let high = (word >> 16) & 0x1f;
+    let r = arm_reg_name;
+    match op1 >> 3 {
+        0b01 => arm_packing(word, op1 & 0b111, op2),
+        0b11 => match op1 {
+            0b11000 if op2 == 0 => {
+                let (rd, ra, rm) = (rn, rd, (word >> 8) & 0xf);
+                if ra == 0xf {
+                    Some(("usad8", format!("{}, {}, {}", r(rd), r(low), r(rm)), rd))
+                } else {
+                    let text = format!("{}, {}, {}, {}", r(rd), r(low), r(rm), r(ra));
+                    Some(("usada8", text, rd))
+                }
+            }
+            0b11010 | 0b11011 | 0b11110 | 0b11111 if op2 & 0b11 == 0b10 => {
+                let name = if op1 & 0b00100 != 0 { "ubfx" } else { "sbfx" };
+                let width = high + 1;
+                let text = format!("{}, {}, #{lsb:#x}, #{width:#x}", r(rd), r(low));
+                Some((name, text, rd))
+            }
+            0b11100 | 0b11101 if op2 & 0b11 == 0 => {
+                let width = high.checked_sub(lsb)? + 1;
+                if low == 0xf {
+                    Some(("bfc", format!("{}, #{lsb:#x}, #{width:#x}", r(rd)), rd))
+                } else {
+                    let text = format!("{}, {}, #{lsb:#x}, #{width:#x}", r(rd), r(low));
+                    Some(("bfi", text, rd))
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Packing, unpacking, saturation et reversal (A5.4.3) : `op1` = bits 22:20.
+fn arm_packing(word: u32, op1: u32, op2: u32) -> Option<(&'static str, String, u32)> {
+    let rd = (word >> 12) & 0xf;
+    let rn = (word >> 16) & 0xf;
+    let rm = word & 0xf;
+    let imm5 = (word >> 7) & 0x1f;
+    let fixed = |mask: u32| (word >> 8) & mask == mask;
+    let r = arm_reg_name;
+    let extend = |plain: &'static str, accumulate: &'static str| {
+        if (word >> 8) & 0b11 != 0 {
+            return None;
+        }
+        let rotation = ((word >> 10) & 0b11) * 8;
+        let ror = match rotation {
+            0 => String::new(),
+            n => format!(", ror #{n}"),
+        };
+        if rn == 0xf {
+            Some((plain, format!("{}, {}{ror}", r(rd), r(rm)), rd))
+        } else {
+            let text = format!("{}, {}, {}{ror}", r(rd), r(rn), r(rm));
+            Some((accumulate, text, rd))
+        }
+    };
+    let reverse = |name: &'static str| {
+        if rn != 0xf || !fixed(0xf) {
+            return None;
+        }
+        Some((name, format!("{}, {}", r(rd), r(rm)), rd))
+    };
+    let shifted = |arithmetic: bool| match (arithmetic, imm5) {
+        (false, 0) => String::new(),
+        (false, n) => format!(", lsl #{n}"),
+        (true, 0) => ", asr #32".to_string(),
+        (true, n) => format!(", asr #{n}"),
+    };
+    let arithmetic = word & 0x40 != 0;
+    match (op1, op2) {
+        (0b000, o) if o & 1 == 0 => {
+            let name = if arithmetic { "pkhtb" } else { "pkhbt" };
+            let text = format!("{}, {}, {}{}", r(rd), r(rn), r(rm), shifted(arithmetic));
+            Some((name, text, rd))
+        }
+        (0b000, 0b011) => extend("sxtb16", "sxtab16"),
+        (0b000, 0b101) => {
+            if !fixed(0xf) {
+                return None;
+            }
+            Some(("sel", format!("{}, {}, {}", r(rd), r(rn), r(rm)), rd))
+        }
+        (0b010 | 0b011, o) if o & 1 == 0 => {
+            let saturate = ((word >> 16) & 0x1f) + 1;
+            let text = format!("{}, #{saturate}, {}{}", r(rd), r(rm), shifted(arithmetic));
+            Some(("ssat", text, rd))
+        }
+        (0b010, 0b011) => extend("sxtb", "sxtab"),
+        (0b011, 0b001) => reverse("rev"),
+        (0b011, 0b011) => extend("sxth", "sxtah"),
+        (0b011, 0b101) => reverse("rev16"),
+        (0b100, 0b011) => extend("uxtb16", "uxtab16"),
+        (0b110 | 0b111, o) if o & 1 == 0 => {
+            let saturate = (word >> 16) & 0x1f;
+            let text = format!("{}, #{saturate}, {}{}", r(rd), r(rm), shifted(arithmetic));
+            Some(("usat", text, rd))
+        }
+        (0b110, 0b011) => extend("uxtb", "uxtab"),
+        (0b111, 0b001) => reverse("rbit"),
+        (0b111, 0b011) => extend("uxth", "uxtah"),
+        (0b111, 0b101) => reverse("revsh"),
+        _ => None,
+    }
 }
 
 /// Une instruction conditionnelle peut ne pas s'exécuter : ses écritures
@@ -1172,6 +1330,47 @@ mod tests {
         // atteint Reg::from_u8(16) (yaxpeax-arm 0.5.0, armv7.rs:2034 puis 585).
         let code = 0xe180_f0d1u32.to_le_bytes();
         let decoded = decode(Arch::Arm, &code, 0x1000, false);
+        assert_eq!(decoded.err(), Some(Failure::Invalid));
+    }
+
+    fn arm_insn(word: u32) -> Insn {
+        decode(Arch::Arm, &word.to_le_bytes(), 0x1000, false).unwrap()
+    }
+
+    #[test]
+    fn arm_media_instructions_refused_by_yaxpeax_are_decoded() {
+        // ubfx r0, r0, #1, #1 : e7e000d0 (A8.8.246, lsb 1, widthm1 0)
+        let ubfx = arm_insn(0xe7e0_00d0);
+        assert_eq!(
+            (ubfx.mnemonic.as_str(), ubfx.operands.as_str()),
+            ("ubfx", "r0, r0, #0x1, #0x1")
+        );
+        assert_eq!((ubfx.len, ubfx.flow), (4, Flow::Next));
+        assert_eq!(ubfx.ops, [Op::Set(0, Expr::Unknown)]);
+        // uxtb r2, r8 : e6ef2078 (A8.8.274, Rn = 1111, rotation 0)
+        let uxtb = arm_insn(0xe6ef_2078);
+        assert_eq!(
+            (uxtb.mnemonic.as_str(), uxtb.operands.as_str()),
+            ("uxtb", "r2, r8")
+        );
+        assert_eq!(uxtb.ops, [Op::Set(2, Expr::Unknown)]);
+        // rev r0, r1 : e6bf0f31 ; sxth r3, r4, ror #8 : e6bf3474
+        assert_eq!(arm_insn(0xe6bf_0f31).mnemonic, "rev");
+        assert_eq!(arm_insn(0xe6bf_3474).operands, "r3, r4, ror #8");
+        // uxtbne pc, r0 : 16eff070, conditionnelle : le chemin continue.
+        let to_pc = arm_insn(0x16ef_f070);
+        assert_eq!(
+            (to_pc.mnemonic.as_str(), to_pc.flow),
+            ("uxtbne", Flow::Next)
+        );
+        // uxtb pc, r0 : e6eff070 écrit pc : fin de bloc.
+        assert_eq!(arm_insn(0xe6ef_f070).flow, Flow::JumpVia(Via::Unknown));
+    }
+
+    #[test]
+    fn arm_udf_is_not_taken_for_a_media_instruction() {
+        // udf #0 : e7f000f0, permanently undefined (A8.8.247).
+        let decoded = decode(Arch::Arm, &0xe7f0_00f0u32.to_le_bytes(), 0x1000, false);
         assert_eq!(decoded.err(), Some(Failure::Invalid));
     }
 
