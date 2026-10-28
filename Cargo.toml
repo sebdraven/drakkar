@@ -1,6 +1,6 @@
 [package]
 name = "drakkar"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Static MITRE ATT&CK for Mobile detection on Android APKs via inter-procedural CFG"
