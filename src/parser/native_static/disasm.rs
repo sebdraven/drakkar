@@ -1829,6 +1829,41 @@ mod tests {
         ] {
             assert_eq!(table[index], name, "{index}");
         }
+        let invoke = jni::JNI_INVOKE_INTERFACE;
+        assert_eq!(&invoke[..jni::INVOKE_RESERVED_SLOTS], &reserved[..3]);
+        for (index, name) in [
+            (3, "DestroyJavaVM"),
+            (jni::INVOKE_ATTACH_CURRENT_THREAD, "AttachCurrentThread"),
+            (5, "DetachCurrentThread"),
+            (jni::INVOKE_GET_ENV, "GetEnv"),
+            (
+                jni::INVOKE_ATTACH_CURRENT_THREAD_AS_DAEMON,
+                "AttachCurrentThreadAsDaemon",
+            ),
+        ] {
+            assert_eq!(invoke[index], name, "{index}");
+        }
+    }
+
+    #[test]
+    fn cxx_wrapper_symbols_name_their_table_entry() {
+        let find_class = cxx_wrapper("_ZN7_JNIEnv9FindClassEPKc");
+        assert_eq!(find_class, Some(Wrapper::Env("FindClass", jni::FIND_CLASS)));
+        let register = "_ZN7_JNIEnv15RegisterNativesEP7_jclassPK15JNINativeMethodi";
+        let expected = Wrapper::Env("RegisterNatives", jni::REGISTER_NATIVES);
+        assert_eq!(cxx_wrapper(register), Some(expected));
+        let get_env = cxx_wrapper("_ZN7_JavaVM6GetEnvEPPvi");
+        assert_eq!(get_env, Some(Wrapper::Vm("GetEnv", jni::INVOKE_GET_ENV)));
+        for symbol in [
+            "_ZN7_JNIEnv9reserved0EPv",
+            "_ZN7_JNIEnv8FindClasEPKc",
+            "_ZN7_JNIEnv99FindClassEPKc",
+            "_ZN7_JNIEnvFindClassEPKc",
+            "_ZN7_JavaVM9FindClassEPKc",
+            "_ZN6Helper9FindClassEPKc",
+        ] {
+            assert_eq!(cxx_wrapper(symbol), None, "{symbol}");
+        }
     }
 
     #[test]
@@ -2073,9 +2108,17 @@ mod tests {
         assert_eq!(keys(function), fields);
         let call = ["import", "kind", "symbol", "target"];
         assert_eq!(keys(&function["calls"][0]), call);
-        let find_class = ["class", "index", "name", "resolved"];
+        let find_class = ["class", "form", "index", "name", "resolved"];
         assert_eq!(keys(&function["jni_calls"][0]), find_class);
-        let get_method_id = ["class", "index", "method", "name", "resolved", "signature"];
+        let get_method_id = [
+            "class",
+            "form",
+            "index",
+            "method",
+            "name",
+            "resolved",
+            "signature",
+        ];
         assert_eq!(keys(&function["jni_calls"][1]), get_method_id);
         assert_eq!(keys(&json["upcalls"][0]), ["class", "name", "signature"]);
         let refs = ["address", "encoding", "target", "value"];
@@ -2223,6 +2266,177 @@ mod tests {
             assert_eq!(out.function.calls, expected, "{address:#x}");
             assert!(out.callees.is_empty(), "{address:#x}");
         }
+    }
+
+    /// AArch64 : FindClass par le wrapper C++ de jni.h, appelé par sa PLT.
+    const A64_CXX_FIND_CLASS: &[(u32, &str)] = &[
+        (0xb0000001, "1000  adrp x1, 0x2000"),
+        (0x91000021, "1004  add  x1, x1, #0x0      ; com/foo/Bar"),
+        (0x940001fe, "1008  bl   0x1800            ; _JNIEnv::FindClass@plt"),
+        (0xd65f03c0, "100c  ret"),
+    ];
+
+    #[test]
+    fn a_cxx_findclass_wrapper_through_the_plt_is_a_jni_call() {
+        let mut data = vec![0u8; 0x4000];
+        strings(&mut data);
+        assemble(&mut data, CODE, A64_CXX_FIND_CLASS);
+        assemble(&mut data, 0x1800, A64_PLT);
+        let dynamic = jump_slot(&mut data, 0x3000, "_ZN7_JNIEnv9FindClassEPKc", false);
+        let mut ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        let out = analyze(&ctx, CODE, false);
+        let f = &out.function;
+        let import = f.calls[0].import.as_deref();
+        assert_eq!(import, Some("_ZN7_JNIEnv9FindClassEPKc"));
+        assert_eq!(jni_names(f), [("FindClass", jni::FIND_CLASS, true)]);
+        let call = &f.jni_calls[0];
+        assert_eq!(call.form, FORM_CXX_WRAPPER);
+        assert_eq!(call.unresolved_reason, None);
+        assert_eq!(call.class.as_deref(), Some("Lcom/foo/Bar;"));
+    }
+
+    /// FindClass par la table, puis RegisterNatives par son wrapper C++ (PLT).
+    /// Table JNINativeMethod en 0x2040.
+    const A64_CXX_REGISTER: &[(u32, &str)] = &[
+        (0xaa0003f3, "1000  mov  x19, x0"),
+        (0xf9400268, "1004  ldr  x8, [x19]"),
+        (0xf9401908, "1008  ldr  x8, [x8, #0x30]   ; FindClass"),
+        (0xb0000001, "100c  adrp x1, 0x2000"),
+        (0x91000021, "1010  add  x1, x1, #0x0      ; com/foo/Bar"),
+        (0xaa1303e0, "1014  mov  x0, x19"),
+        (0xd63f0100, "1018  blr  x8"),
+        (0xaa0003e1, "101c  mov  x1, x0            ; jclass"),
+        (0xb0000002, "1020  adrp x2, 0x2000"),
+        (0x91010042, "1024  add  x2, x2, #0x40     ; table"),
+        (0x52800023, "1028  mov  w3, #1"),
+        (0xaa1303e0, "102c  mov  x0, x19"),
+        (0x940001f4, "1030  bl   0x1800            ; _JNIEnv::RegisterNatives@plt"),
+        (0xd65f03c0, "1034  ret"),
+    ];
+
+    #[test]
+    fn a_cxx_registernatives_wrapper_registers_its_table() {
+        let mut data = vec![0u8; 0x4000];
+        strings(&mut data);
+        assemble(&mut data, CODE, A64_CXX_REGISTER);
+        assemble(&mut data, 0x1800, A64_PLT);
+        for (i, value) in [0x2010u64, 0x2018, 0x1100].into_iter().enumerate() {
+            put(&mut data, 0x2040 + 8 * i as u64, &value.to_le_bytes());
+        }
+        put(&mut data, 0x1100, &0xd65f03c0u32.to_le_bytes());
+        let symbol = "_ZN7_JNIEnv15RegisterNativesEP7_jclassPK15JNINativeMethodi";
+        let dynamic = jump_slot(&mut data, 0x3000, symbol, false);
+        let mut ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        let out = analyze(&ctx, CODE, false);
+        let expected = [("FindClass", 6, true), ("RegisterNatives", 215, true)];
+        assert_eq!(jni_names(&out.function), expected);
+        let mut forms = Vec::new();
+        for call in &out.function.jni_calls {
+            forms.push(call.form);
+        }
+        assert_eq!(forms, [FORM_VTABLE, FORM_CXX_WRAPPER]);
+        let run = member("Lcom/foo/Bar;", "run", "()V", Some(0x1100));
+        assert_eq!(out.registered, [run]);
+    }
+
+    /// AArch64 : le nom de classe passe par la pile avant FindClass.
+    const A64_STACK_FIND_CLASS: &[(u32, &str)] = &[
+        (0xd10083ff, "1000  sub  sp, sp, #0x20"),
+        (0xaa0003f3, "1004  mov  x19, x0"),
+        (0xb0000008, "1008  adrp x8, 0x2000"),
+        (0x91000108, "100c  add  x8, x8, #0x0      ; com/foo/Bar"),
+        (0xf90007e8, "1010  str  x8, [sp, #8]"),
+        (0xf9400268, "1014  ldr  x8, [x19]"),
+        (0xf9401908, "1018  ldr  x8, [x8, #0x30]   ; FindClass"),
+        (0xf94007e1, "101c  ldr  x1, [sp, #8]"),
+        (0xaa1303e0, "1020  mov  x0, x19"),
+        (0xd63f0100, "1024  blr  x8"),
+        (0x910083ff, "1028  add  sp, sp, #0x20"),
+        (0xd65f03c0, "102c  ret"),
+    ];
+
+    #[test]
+    fn a_class_name_spilled_to_the_stack_still_resolves_findclass() {
+        let mut data = vec![0u8; 0x3000];
+        strings(&mut data);
+        assemble(&mut data, CODE, A64_STACK_FIND_CLASS);
+        let ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        let out = analyze(&ctx, CODE, false);
+        let f = &out.function;
+        assert_eq!(f.instructions.len(), A64_STACK_FIND_CLASS.len());
+        assert_eq!(jni_names(f), [("FindClass", jni::FIND_CLASS, true)]);
+        assert_eq!(f.jni_calls[0].form, FORM_VTABLE);
+        assert_eq!(f.jni_calls[0].class.as_deref(), Some("Lcom/foo/Bar;"));
+    }
+
+    /// AArch64 : FindClass dont le nom est un paramètre (x1 jamais écrit).
+    const A64_PARAM_FIND_CLASS: &[(u32, &str)] = &[
+        (0xf9400008, "1000  ldr  x8, [x0]"),
+        (0xf9401908, "1004  ldr  x8, [x8, #0x30]   ; FindClass"),
+        (0xd63f0100, "1008  blr  x8"),
+        (0xd65f03c0, "100c  ret"),
+    ];
+
+    #[test]
+    fn an_unknown_class_name_leaves_findclass_unresolved_with_its_reason() {
+        let mut data = vec![0u8; 0x2000];
+        assemble(&mut data, CODE, A64_PARAM_FIND_CLASS);
+        let ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        let out = analyze(&ctx, CODE, false);
+        let call = &out.function.jni_calls[0];
+        assert_eq!((call.name, call.resolved), ("FindClass", false));
+        assert_eq!(call.unresolved_reason, Some(UNRESOLVED_CLASS));
+        assert_eq!(call.class, None);
+    }
+
+    /// ARM : ubfx et uxtb, que yaxpeax-arm 0.5.0 refuse.
+    const ARM_MEDIA: &[(u32, &str)] = &[
+        (0xe7e000d0, "1000  ubfx r0, r0, #1, #1"),
+        (0xe6ef2078, "1004  uxtb r2, r8"),
+        (0xe12fff1e, "1008  bx   lr"),
+    ];
+
+    #[test]
+    fn arm_media_instructions_do_not_cut_a_function() {
+        let mut data = vec![0u8; 0x2000];
+        assemble(&mut data, CODE, ARM_MEDIA);
+        let ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        let function = analyze(&ctx, CODE, false).function;
+        assert_eq!(function.disasm_status, STATUS_OK);
+        assert!(function.invalid_paths.is_empty());
+        let mut mnemonics = Vec::new();
+        for insn in &function.instructions {
+            mnemonics.push(insn.mnemonic.as_str());
+        }
+        assert_eq!(mnemonics, ["ubfx", "uxtb", "bx"]);
+        let three = [function.clone(), function.clone(), function];
+        assert_eq!(opaque_dead_code(&three), None);
+    }
+
+    const A64_CALLS_ZERO: &[(u32, &str)] =
+        &[(0x97fffc00, "1000  bl   0x0"), (0xd65f03c0, "1004  ret")];
+
+    #[test]
+    fn a_call_to_address_zero_is_unresolved_and_creates_no_callee() {
+        let mut data = vec![0u8; 0x2000];
+        assemble(&mut data, CODE, A64_CALLS_ZERO);
+        let ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        let out = analyze(&ctx, CODE, false);
+        let unresolved = DisasmCall {
+            target: Some("0x0".to_string()),
+            import: None,
+            symbol: None,
+            kind: CALL_UNRESOLVED,
+        };
+        assert_eq!(out.function.calls, [unresolved]);
+        assert!(out.callees.is_empty());
+
+        let entries = vec![jni_entry(CODE, false)];
+        let disasm = walk_functions(&ctx, entries, &DisasmOptions::default());
+        assert_eq!(disasm.functions.len(), 1);
+        assert_eq!(disasm.functions[0].address, "0x1000");
     }
 
     /// Prologue et épilogue Thumb-2 de libbash.so (armeabi-v7a), le bl visant
@@ -2380,6 +2594,20 @@ mod tests {
             CALL_INTERNAL,
             CALL_PLT,
             CALL_INDIRECT,
+            CALL_UNRESOLVED,
+            FORM_VTABLE,
+            FORM_CXX_WRAPPER,
+            "form",
+            "unresolved_reason",
+            UNRESOLVED_ENV,
+            UNRESOLVED_CLASS,
+            UNRESOLVED_NAME,
+            UNRESOLVED_SIGNATURE,
+            UNRESOLVED_TABLE,
+            "_ZN7_JNIEnv",
+            "_ZN7_JavaVM",
+            "ubfx",
+            "uxtb",
             DISAMBIGUATED_BY_FIND_CLASS,
             "disambiguated_by",
             "disasm_failed",
@@ -2394,6 +2622,9 @@ mod tests {
         ];
         for label in labels.iter().chain(NORETURN_IMPORTS) {
             assert!(legend.contains(label), "{label}");
+        }
+        for name in &jni::JNI_INVOKE_INTERFACE[jni::INVOKE_RESERVED_SLOTS..] {
+            assert!(legend.contains(name), "{name}");
         }
         assert!(legend.contains(&format!("(défaut {DEFAULT_DISASM_DEPTH})")));
         assert!(legend.contains(&format!("(défaut {DEFAULT_DISASM_MAX_INSNS})")));
