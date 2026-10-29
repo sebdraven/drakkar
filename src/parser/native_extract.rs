@@ -257,7 +257,10 @@ sha256           SHA-256 COMPLET (64 caractères hexadécimaux) du contenu DÉCO
                  VirusTotal, MalwareBazaar ou Koodous ; un hash d'octets compressés ne se croise
                  avec rien. Et « les octets stockés » n'est pas une notion stable dès qu'un
                  lecteur tolérant entre en jeu. Jamais tronqué, jamais un préfixe.
-bytes            Octets complets du .so, en mémoire (jamais écrits sur disque).
+bytes            Octets complets du .so, en mémoire (jamais écrits sur disque, sauf
+                 --extract-libs : nom = chemin aplati, / -> __ ; au-delà de 200 octets,
+                 <préfixe>__<sha256 du chemin d'archive, 64 hex><.ext d'origine>, affiché
+                 après le chemin d'archive).
 skipped_non_elf  Entrées en .so qui ne sont pas des ELF (ressources, .so chiffré non déballé…).
 unreadable       Entrées en .so illisibles, y compris par le lecteur ZIP tolérant (repli quand
                  le crate zip refuse l'archive ou une entrée : local header abîmé, drapeau de

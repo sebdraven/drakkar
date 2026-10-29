@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::Ipv4Addr;
 use std::panic::AssertUnwindSafe;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::apkzip::TolerantZip;
 use super::dex_facade::DexBin;
@@ -125,6 +125,7 @@ const PACKED_TAGS: [(u32, &str); 2] = [
 pub struct NativeReport {
     pub sha256: String,
     pub dex_available: bool,
+    pub dex_sources: Vec<String>,
     pub elfs: Vec<ElfReport>,
     pub binding: Vec<Binding>,
     pub summary: Summary,
@@ -419,8 +420,13 @@ impl NativeMethod {
 
 /// Analyse un APK sur disque. Seule une archive illisible fait échouer le mode :
 /// un ELF illisible devient une anomalie, une entrée illisible une erreur.
-/// `disasm` active `--native-disasm`.
-pub fn analyze_apk(path: &Path, disasm: Option<&DisasmOptions>) -> Result<NativeReport> {
+/// `extra_dex` : APK ou DEX bruts dont les méthodes natives s'ajoutent à celles
+/// de l'APK. `disasm` active `--native-disasm`.
+pub fn analyze_apk(
+    path: &Path,
+    extra_dex: &[PathBuf],
+    disasm: Option<&DisasmOptions>,
+) -> Result<NativeReport> {
     let sha256 = file_sha256(path)?;
     let zip = TolerantZip::open(path)?;
     let mut errors = Vec::new();
@@ -441,14 +447,16 @@ pub fn analyze_apk(path: &Path, disasm: Option<&DisasmOptions>) -> Result<Native
             }
         }
     }
-    Ok(finish(sha256, elfs, &kept, Some(path), disasm, errors))
+    let mut sources = vec![path.to_path_buf()];
+    sources.extend_from_slice(extra_dex);
+    Ok(finish(sha256, elfs, &kept, &sources, disasm, errors))
 }
 
-/// ELF brut, reconnu à son magic. `dex` : APK ou DEX brut dont les méthodes
-/// natives sont liées à cet ELF ; sans lui, binding est vide.
+/// ELF brut, reconnu à son magic. `dex` : APK ou DEX bruts dont les méthodes
+/// natives sont liées à cet ELF ; vide, binding est vide.
 pub fn analyze_elf_file(
     path: &Path,
-    dex: Option<&Path>,
+    dex: &[PathBuf],
     disasm: Option<&DisasmOptions>,
 ) -> Result<NativeReport> {
     let bytes = std::fs::read(path).with_context(|| format!("lecture {}", path.display()))?;
@@ -478,16 +486,20 @@ pub fn is_elf_file(path: &Path) -> bool {
 
 /// Fin commune des modes APK et ELF brut : désassemblage, tables lues par le
 /// code, liaison. `kept` : octets des ELF, dans l'ordre de `elfs`, avec
-/// `disasm` seulement.
+/// `disasm` seulement. `dex` : sources de méthodes natives, dans l'ordre.
 fn finish(
     sha256: String,
     mut elfs: Vec<ElfReport>,
     kept: &[Vec<u8>],
-    dex: Option<&Path>,
+    dex: &[PathBuf],
     disasm: Option<&DisasmOptions>,
     mut errors: Vec<String>,
 ) -> NativeReport {
-    let natives = dex.and_then(|dex| declared_natives(dex, &mut errors));
+    let lists: Vec<Vec<NativeMethod>> = dex
+        .iter()
+        .filter_map(|source| declared_natives(source, &mut errors))
+        .collect();
+    let natives = (!lists.is_empty()).then(|| merge_natives(lists));
     if let Some(options) = disasm {
         self::disasm::silence_panics(|| {
             for (elf, bytes) in elfs.iter_mut().zip(kept) {
@@ -509,7 +521,8 @@ fn finish(
     let summary = summarize(&binding, declared, elfs.len());
     NativeReport {
         sha256,
-        dex_available: dex.is_some(),
+        dex_available: natives.is_some(),
+        dex_sources: dex.iter().map(|p| p.display().to_string()).collect(),
         elfs,
         binding,
         summary,
@@ -1698,14 +1711,30 @@ fn declared_natives(apk: &Path, errors: &mut Vec<String>) -> Option<Vec<NativeMe
             Some(natives)
         }
         Ok(Err(e)) => {
-            errors.push(format!("dex: {e:#} ; liaison non calculée"));
+            errors.push(format!("dex {}: {e:#} ; source ignorée", apk.display()));
             None
         }
         Err(_) => {
-            errors.push("dex: panique pendant le parsing ; liaison non calculée".to_string());
+            let source = apk.display();
+            errors.push(format!(
+                "dex {source}: panique pendant le parsing ; source ignorée"
+            ));
             None
         }
     }
+}
+
+/// Union des listes, dans l'ordre des sources ; un doublon (même classe, nom et
+/// signature) garde sa première occurrence.
+pub fn merge_natives(lists: Vec<Vec<NativeMethod>>) -> Vec<NativeMethod> {
+    let mut seen = HashSet::new();
+    let mut merged = Vec::new();
+    for native in lists.into_iter().flatten() {
+        if seen.insert(native.java()) {
+            merged.push(native);
+        }
+    }
+    merged
 }
 
 /// `apk` : APK, ou DEX brut reconnu à son magic.
@@ -1953,20 +1982,29 @@ const LEGEND: &str = "\
 `native` du DEX. Ni exécution, ni émulation ; désassemblage seulement avec
 --native-disasm (section DÉSASSEMBLAGE).
 Mode ELF brut : une entrée dont les 4 premiers octets valent 7F 45 4C 46 est
-analysée seule, quelle que soit son extension ; --native-dex <APK|DEX> fournit les
-méthodes natives à lier, sans quoi binding est vide.
+analysée seule, quelle que soit son extension ; --native-dex <APK|DEX>, répétable,
+fournit les méthodes natives à lier, sans quoi binding est vide.
+Mode APK : le DEX de l'APK est toujours lu ; chaque --native-dex <APK|DEX>, répétable
+(DEX déballé d'un packer, APK compagnon), ajoute ses méthodes natives. Les méthodes
+de toutes les sources sont fusionnées avant la liaison : même classe, même nom et
+même signature = une seule méthode.
 
 RAPPORT
   sha256          SHA-256 complet du fichier APK, ou de l'ELF en mode brut.
-  dex_available   Une source de méthodes natives a été lue ou tentée : l'APK lui-même,
-                  ou --native-dex. false en mode brut sans --native-dex : binding est
-                  alors vide et native_methods_declared vaut 0, sans rien dire du DEX.
+  dex_available   Au moins une source de dex_sources a été lue. false en mode brut sans
+                  --native-dex, ou si aucune source n'a pu être lue : binding est alors
+                  vide et native_methods_declared vaut 0, sans rien dire du DEX.
+  dex_sources     Sources de méthodes natives, dans l'ordre de lecture : l'APK lui-même
+                  en mode APK, puis chaque --native-dex dans l'ordre de la ligne de
+                  commande. Vide en mode brut sans --native-dex. Une source illisible
+                  reste listée, avec sa raison dans errors.
   listings[]      --native-listing seulement, absent sinon (section LISTING).
   errors          Ce qui n'a pas pu être lu : entrée d'archive illisible (on ignore alors
                   si c'était un ELF), DEX illisible, classes sautées, panique du parseur
                   DEX, listing impossible. Une méthode native manquante peut faire
-                  apparaître à tort son export en native_unclaimed. Si le DEX n'a pas pu
-                  être lu du tout, binding est vide et native_methods_declared vaut 0.
+                  apparaître à tort son export en native_unclaimed. Une source illisible
+                  est ignorée, les autres sont liées ; si aucune n'a pu être lue,
+                  binding est vide et native_methods_declared vaut 0.
 
 ELF (elfs[])
   Est un ELF toute entrée dont les 4 premiers octets décompressés valent 7F 45 4C 46,
@@ -2110,7 +2148,7 @@ LIAISON (binding[]) — seuls les ELF d'origine lib ou raw sont liés
 SUMMARY
   elf_count       Nombre d'ELF inventoriés, toutes origines.
   native_methods_declared
-                  Méthodes ACC_NATIVE distinctes du DEX.
+                  Méthodes ACC_NATIVE distinctes, toutes sources de dex_sources fusionnées.
   bound_static, bound_registered, ambiguous, unbound
                   Une méthode compte une fois, sous son meilleur statut :
                   static > registered > registered_ambiguous > declared_unbound.
@@ -2514,8 +2552,9 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         assert!(is_elf_file(&path));
 
-        let report = analyze_elf_file(&path, None, None).unwrap();
+        let report = analyze_elf_file(&path, &[], None).unwrap();
         assert!(!report.dex_available);
+        assert!(report.dex_sources.is_empty());
         assert_eq!(report.sha256, format!("{:x}", Sha256::digest(&bytes)));
         assert_eq!(report.elfs.len(), 1);
         let elf = &report.elfs[0];
@@ -2815,6 +2854,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn natives_of_several_sources_are_merged_without_duplicates() {
+        let apk = vec![
+            native("Lcom/foo/A;", "f", "(I)", "V"),
+            native("Lcom/foo/A;", "g", "()", "V"),
+        ];
+        let extra = vec![
+            native("Lcom/foo/A;", "g", "()", "V"),
+            native("Lcom/foo/A;", "g", "(I)", "V"),
+            native("Lcom/foo/B;", "g", "()", "V"),
+        ];
+        let merged = merge_natives(vec![apk, extra]);
+        let expected = vec![
+            native("Lcom/foo/A;", "f", "(I)", "V"),
+            native("Lcom/foo/A;", "g", "()", "V"),
+            native("Lcom/foo/A;", "g", "(I)", "V"),
+            native("Lcom/foo/B;", "g", "()", "V"),
+        ];
+        assert_eq!(merged, expected);
+    }
+
     fn export(symbol: &str, address: u64) -> StaticExport {
         StaticExport {
             address,
@@ -2953,6 +3013,7 @@ mod tests {
             SWIG_DIRECTOR_PREFIX,
             ORIGIN_RAW,
             "dex_available",
+            "dex_sources",
             "--native-dex",
             "listings",
             "--native-listing",

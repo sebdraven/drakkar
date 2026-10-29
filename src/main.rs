@@ -103,10 +103,11 @@ struct Cli {
     #[arg(long)]
     native_disasm: bool,
 
-    /// (--native, entrée ELF brute) APK ou DEX brut dont les méthodes `native`
-    /// sont liées à l'ELF. Sans lui, la liaison est vide.
+    /// (--native) APK ou DEX brut dont les méthodes `native` sont liées aux ELF.
+    /// Répétable. Sur un ELF brut, sans lui, la liaison est vide ; sur un APK, il
+    /// s'ajoute au DEX de l'APK, toujours lu.
     #[arg(long, value_name = "APK|DEX")]
-    native_dex: Option<PathBuf>,
+    native_dex: Vec<PathBuf>,
 
     /// (--native-disasm) Liste les instructions de `<elf|*>@<adresse>` (fonction
     /// désassemblée) ou `<elf|*>@<début>-<fin>` (fin exclue), adresses en
@@ -635,14 +636,11 @@ fn main() -> Result<()> {
             options.max_insns = max_insns;
         }
         let disasm = cli.native_disasm.then_some(&options);
-        let dex = cli.native_dex.as_deref();
+        let dex = &cli.native_dex;
         let mut report = if parser::native_static::is_elf_file(input) {
             parser::native_static::analyze_elf_file(input, dex, disasm)?
         } else {
-            if dex.is_some() {
-                bail!("--native-dex ne s'applique qu'à un ELF brut : l'APK porte son DEX");
-            }
-            parser::native_static::analyze_apk(input, disasm)?
+            parser::native_static::analyze_apk(input, dex, disasm)?
         };
         parser::native_static::add_listings(&mut report, input, &listings, options.max_insns);
         if cli.format.wants_text() {
@@ -1706,6 +1704,9 @@ fn print_native(r: &drakkar::parser::native_static::NativeReport, full: bool) {
     let raw = r.elfs.iter().any(|e| e.origin == "raw");
     println!("{:<9} {}", if raw { "ELF" } else { "APK" }, r.sha256);
     println!("Légende   drakkar --native --legend");
+    for source in &r.dex_sources {
+        println!("DEX       {source}");
+    }
 
     if r.elfs.is_empty() {
         println!("\nAucun ELF dans l'APK.");
@@ -1715,8 +1716,10 @@ fn print_native(r: &drakkar::parser::native_static::NativeReport, full: bool) {
     }
 
     println!("\nLiaison DEX ↔ natif (ELF de lib/ ou ELF brut seulement) :");
-    if !r.dex_available {
+    if r.dex_sources.is_empty() {
         println!("  (aucun DEX : passer --native-dex <APK|DEX>)");
+    } else if !r.dex_available {
+        println!("  (aucune source DEX lisible : voir Non lu)");
     } else if r.binding.is_empty() {
         println!("  (aucune ligne)");
     }
@@ -1949,7 +1952,7 @@ fn print_and_dump_extract(
             ""
         };
         // nom de sortie aplati : lib/arm64-v8a/foo.so -> lib__arm64-v8a__foo.so
-        let flat = l.entry.replace('/', "__");
+        let flat = parser::output_file_name(&l.entry.replace('/', "__"), &l.entry);
         let dest = out_dir.join(&flat);
         std::fs::write(&dest, &l.bytes).with_context(|| format!("écriture {}", dest.display()))?;
         println!(

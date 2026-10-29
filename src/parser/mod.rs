@@ -41,8 +41,37 @@ pub mod ui_callbacks;
 use crate::cfg::CallGraph;
 use crate::model::ApkFeatures;
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::Path;
+
+/// Au-delà, un nom de sortie est raccourci : marge sous les 255 octets de
+/// NAME_MAX (ENAMETOOLONG, os error 63 sur macOS).
+pub const MAX_OUTPUT_NAME: usize = 200;
+const MAX_OUTPUT_EXT: usize = 16;
+
+/// Nom de fichier de sortie d'une entrée d'archive. `flat` : le chemin `entry`
+/// aplati par l'appelant. Rendu tel quel jusqu'à [`MAX_OUTPUT_NAME`] octets ;
+/// au-delà, `<préfixe>__<sha256 de entry><.ext>`, préfixe coupé sur une
+/// frontière de caractère UTF-8 pour tenir dans [`MAX_OUTPUT_NAME`].
+pub fn output_file_name(flat: &str, entry: &str) -> String {
+    if flat.len() <= MAX_OUTPUT_NAME {
+        return flat.to_string();
+    }
+    let sha256 = format!("{:x}", Sha256::digest(entry.as_bytes()));
+    let base = entry.rsplit(['/', '\\']).next().unwrap_or(entry);
+    let ext = match base.rfind('.') {
+        Some(at) if at > 0 && at + 1 < base.len() && base.len() - at <= MAX_OUTPUT_EXT + 1 => {
+            &base[at..]
+        }
+        _ => "",
+    };
+    let mut cut = MAX_OUTPUT_NAME - 2 - sha256.len() - ext.len();
+    while !flat.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}__{sha256}{ext}", &flat[..cut])
+}
 
 /// Résultat complet du parsing d'un APK.
 pub struct ParsedApk {
@@ -218,7 +247,7 @@ fn extract_apk(apk: &Path, out_dir: &Path, want: Want) -> Result<ApkEntries> {
         }
 
         // Nom de fichier de sortie aplati (lib/arm64-v8a/foo.so -> arm64-v8a__foo.so).
-        let flat = name.replace('/', "__");
+        let flat = output_file_name(&name.replace('/', "__"), &name);
         let dest = out_dir.join(&flat);
         let mut buf = Vec::with_capacity(entry.size() as usize);
         let read = entry.read_to_end(&mut buf);
@@ -277,6 +306,7 @@ fn extract_apk_tolerant(apk: &Path, out_dir: &Path, want: Want) -> Result<ApkEnt
             tracing::warn!(entry = %name, "nom d'entrée refusé");
             continue;
         }
+        let flat = output_file_name(&flat, name);
 
         let buf = match zip.read(i) {
             Ok(b) => b,
@@ -305,4 +335,33 @@ fn extract_apk_tolerant(apk: &Path, out_dir: &Path, want: Want) -> Result<ApkEnt
         dex_files,
         so_files,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_entry_path_yields_a_bounded_name_with_full_hash() {
+        let entry = format!("assets/{}/payload.so", "d".repeat(382));
+        assert_eq!(entry.len(), 400);
+        let name = output_file_name(&entry.replace('/', "__"), &entry);
+        let sha256 = format!("{:x}", Sha256::digest(entry.as_bytes()));
+        assert_eq!(sha256.len(), 64);
+        assert!(name.len() <= 255, "{}", name.len());
+        assert!(name.ends_with(".so"), "{name}");
+        assert!(name.contains(&sha256), "{name}");
+
+        let entry = format!("libs/{}.so", "é".repeat(200));
+        let name = output_file_name(&entry.replace('/', "__"), &entry);
+        assert!(name.len() <= MAX_OUTPUT_NAME);
+        assert!(name.ends_with(".so"));
+    }
+
+    #[test]
+    fn short_entry_path_is_unchanged() {
+        let entry = "lib/arm64-v8a/libfoo.so";
+        let flat = entry.replace('/', "__");
+        assert_eq!(output_file_name(&flat, entry), flat);
+    }
 }
