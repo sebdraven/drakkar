@@ -1,18 +1,25 @@
 name: ci
 
 on:
+  # Une branche ne passe que par pull_request : un push sur une branche dont la
+  # PR est ouverte ne lance qu'un run. Les tags v* relevent de release.yml, pas
+  # de ci.
   push:
-    # `branches: ['**']` couvre toutes les branches et AUCUN tag : le push d'un
-    # tag v* est le travail de release.yml, pas une deuxieme passe de ci.
-    branches: ['**']
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
   pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -25,6 +32,7 @@ jobs:
   fmt:
     name: fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
@@ -38,6 +46,7 @@ jobs:
     # Le code ne contient aucun `cfg(target_*)` : un seul runner suffit, la
     # lint ne dirait rien de plus sur l'autre cible.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
@@ -46,19 +55,18 @@ jobs:
           cache-key: clippy
       - run: cargo clippy --locked --all-targets -- -D warnings
 
+  # Les jobs macOS sont separes des jobs Linux : un `if:` de job ne peut pas lire
+  # `matrix`. Les noms restent ceux de l'ancienne matrice, donc les checks aussi.
   test:
     name: test (${{ matrix.target }})
     strategy:
-      # Un echec macOS ne doit pas masquer l'etat de Linux, ni l'inverse.
-      fail-fast: false
       matrix:
         include:
-          - target: aarch64-apple-darwin
-            os: macos-latest
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
     runs-on: ${{ matrix.os }}
-    steps:
+    timeout-minutes: 30
+    steps: &test-steps
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
         with:
@@ -66,18 +74,29 @@ jobs:
           cache-key: test-${{ matrix.target }}
       - run: cargo test --locked --target ${{ matrix.target }}
 
-  build:
-    name: build (${{ matrix.target }})
+  test-macos:
+    name: test (${{ matrix.target }})
+    # macOS : lancement manuel seulement (les tags passent par release.yml).
+    if: github.event_name == 'workflow_dispatch'
     strategy:
-      fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
             os: macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps: *test-steps
+
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      matrix:
+        include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
     runs-on: ${{ matrix.os }}
-    steps:
+    timeout-minutes: 30
+    steps: &build-steps
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
         with:
@@ -109,3 +128,15 @@ jobs:
           path: dist/
           retention-days: 30
           if-no-files-found: error
+
+  build-macos:
+    name: build (${{ matrix.target }})
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps: *build-steps
