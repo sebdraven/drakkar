@@ -87,6 +87,9 @@ pub struct NativeExtraction {
     /// Entrées en `.so` que même le lecteur tolérant n'a pas pu décompresser.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unreadable: Vec<String>,
+    /// Entrées en `.so` de longueur nulle : lues, vides, ni ELF ni illisibles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub empty: Vec<String>,
 }
 
 impl NativeExtraction {
@@ -201,6 +204,10 @@ fn extract_tolerant(zip: &TolerantZip) -> NativeExtraction {
 
 impl NativeExtraction {
     fn push(&mut self, name: String, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            self.empty.push(name);
+            return;
+        }
         // Filtre ELF : écarte les fausses `.so` (ressources, `.so` non déballé).
         let arch = match parse_elf_header(&bytes) {
             Some(a) => a,
@@ -265,6 +272,9 @@ skipped_non_elf  Entrées en .so qui ne sont pas des ELF (ressources, .so chiffr
 unreadable       Entrées en .so illisibles, y compris par le lecteur ZIP tolérant (repli quand
                  le crate zip refuse l'archive ou une entrée : local header abîmé, drapeau de
                  chiffrement, méthode inventée). Absent si vide.
+empty            Entrées en .so de longueur nulle (0 octet lu : stored vide ou flux deflate
+                 vide). Lues sans erreur, ni ELF ni illisibles : comptées ni dans
+                 skipped_non_elf ni dans unreadable. Absent si vide.
 out_of_lib()     Vrai si la lib est rangée hors lib/<abi>/ (packers : assets/libjiagu*.so)."
 }
 
@@ -361,6 +371,15 @@ mod tests {
         let ex = extract_apk_bytes(&apk).unwrap();
         assert!(ex.is_empty());
         assert!(ex.skipped_non_elf.is_empty());
+    }
+
+    #[test]
+    fn an_empty_so_is_empty_not_skipped_nor_unreadable() {
+        let apk = make_apk(&[("lib/armeabi/libvide.so", Vec::new())]);
+        let ex = extract_apk_bytes(&apk).unwrap();
+        assert_eq!(ex.empty, vec!["lib/armeabi/libvide.so".to_string()]);
+        assert!(ex.skipped_non_elf.is_empty());
+        assert!(ex.unreadable.is_empty());
     }
 
     #[test]

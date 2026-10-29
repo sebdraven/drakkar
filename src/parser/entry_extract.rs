@@ -166,6 +166,7 @@ fn glob_match(text: &str, pat: &str) -> bool {
 /// sans extension.
 fn sniff(bytes: &[u8]) -> &'static str {
     match bytes {
+        [] => "empty",
         [0x50, 0x4B, 0x03, 0x04, ..] | [0x50, 0x4B, 0x05, 0x06, ..] => "apk/zip",
         [0x64, 0x65, 0x78, 0x0A, ..] => "dex", // "dex\n"
         [0x64, 0x65, 0x79, 0x0A, ..] => "dey", // "dey\n" (conteneur Jiagu)
@@ -369,8 +370,12 @@ size             Taille décompressée, en octets.
 compressed_size  Taille stockée dans l'archive (après compression).
 sha256           SHA-256 du contenu DÉCOMPRESSÉ — identifiant à rapprocher du corpus.
 kind             Type déduit des OCTETS DE TÊTE, jamais de l'extension : apk/zip, dex, dey,
-                 elf, png, gzip, pdf, xml-bin, arsc, inconnu. Un APK embarqué s'appelle
-                 souvent \"plugin\" sans extension — d'où le reniflage.
+                 elf, png, gzip, pdf, xml-bin, arsc, empty, inconnu. Un APK embarqué
+                 s'appelle souvent \"plugin\" sans extension — d'où le reniflage.
+                 empty = entrée de longueur nulle (0 octet lu, stored vide ou flux
+                 deflate vide) : extraite comme un fichier vide, sha256 =
+                 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 (SHA-256 du
+                 vide). Ce n'est PAS une entrée illisible : unreadable ne la compte pas.
 entropy          Entropie de Shannon (0.0-8.0). > 7.9 = chiffré ou déjà compressé ;
                  un DEX en clair est vers 6.0. Un écart signale un payload.
 scanned          Nombre total d'entrées de l'archive (dénominateur du filtrage).
@@ -505,6 +510,40 @@ mod tests {
             })
             .collect();
         assert!(entropy(&rnd) > 7.5);
+    }
+
+    #[test]
+    fn empty_entries_are_empty_not_unreadable_by_both_readers() {
+        use zip::CompressionMethod;
+
+        let mut apk = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut apk));
+            let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            let deflated =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            zw.start_file("res/raw/output.mp3", stored).unwrap();
+            zw.start_file("res/raw/vide.bin", deflated).unwrap();
+            zw.finish().unwrap();
+        }
+        let empty_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let check = |ex: &EntryExtraction| {
+            assert!(ex.unreadable.is_empty(), "{:?}", ex.unreadable);
+            assert_eq!(ex.count(), 2);
+            for e in &ex.entries {
+                assert_eq!((e.kind.as_str(), e.size), ("empty", 0), "{}", e.entry);
+                assert_eq!(e.sha256, empty_sha);
+            }
+        };
+        check(&extract_matching_bytes(&apk, &["res/raw/*".into()]).unwrap());
+
+        // Bit 0 des GP flags du premier en-tête : le crate zip refuse, le lecteur
+        // tolérant prend la main.
+        for (sig, at) in [(b"PK\x03\x04", 6), (b"PK\x01\x02", 8)] {
+            let off = apk.windows(4).position(|w| w == sig).unwrap();
+            apk[off + at] |= 1;
+        }
+        check(&extract_matching_bytes(&apk, &["res/raw/*".into()]).unwrap());
     }
 
     #[test]

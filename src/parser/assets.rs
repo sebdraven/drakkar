@@ -688,7 +688,7 @@ fn method_label(method: u16) -> String {
 /// `config.dat` et le DEX chiffré d'un packer n'a pas d'extension du tout.
 fn sniff(bytes: &[u8]) -> &'static str {
     match bytes {
-        [] => "unknown",
+        [] => "empty",
         [0x64, 0x65, 0x78, 0x0A, ..] => "dex",
         [0x50, 0x4B, 0x03, 0x04, ..] => "apk/zip",
         [0x7F, 0x45, 0x4C, 0x46, ..] => "elf",
@@ -1129,8 +1129,10 @@ sha256               SHA-256 COMPLET (64 caractères hexadécimaux) du contenu D
                      Vaut NON-EVALUE — valeur volontairement NON hexadécimale — quand l'entrée
                      n'a pas été lue (voir taille_decompressee et chemin_ecrit).
 type                 Type déduit des OCTETS DE TÊTE, jamais de l'extension : dex, apk/zip, elf,
-                     axml, arsc, png, jpeg, gif, gzip, texte-utf8, unknown. NON-EVALUE si
-                     l'entrée n'a pas été lue.
+                     axml, arsc, png, jpeg, gif, gzip, texte-utf8, empty, unknown. NON-EVALUE si
+                     l'entrée n'a pas été lue. empty = entrée de longueur nulle (0 octet lu,
+                     stored vide ou flux deflate vide) : écrite comme un fichier vide, sha256 =
+                     SHA-256 du vide, et JAMAIS comptée dans skipped comme illisible.
 entropie             Entropie de Shannon en bits par octet (0.00-8.00), 2 décimales. > 7.90 =
                      chiffré ou déjà compressé : c'est ce qui fait ressortir les charges de packer
                      déposées dans assets/. Un texte est vers 4-5, un DEX en clair vers 6.
@@ -1334,6 +1336,33 @@ mod tests {
         assert_eq!(e.method, 0x64b4, "la méthode trafiquée est consignée");
         assert_eq!(e.method_label, "0x64b4");
         assert_eq!(e.sha256, format!("{:x}", Sha256::digest(vec![7u8; 4096])));
+    }
+
+    #[test]
+    fn empty_assets_are_typed_empty_not_skipped() {
+        use zip::CompressionMethod;
+
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            let deflated =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            zw.start_file("assets/output.mp3", stored).unwrap();
+            zw.start_file("assets/vide.bin", deflated).unwrap();
+            zw.finish().unwrap();
+        }
+        for bytes in [buf.clone(), tamper(buf)] {
+            let (_d, apk) = on_disk(&bytes);
+            let r = collect(&apk, &AssetsOptions::default()).unwrap();
+            assert!(r.skipped.is_empty(), "{:?} : {:?}", r.reader, r.skipped);
+            assert_eq!(r.count(), 2);
+            for e in &r.entries {
+                assert_eq!((e.kind.as_str(), e.size), ("empty", 0), "{}", e.entry);
+                assert_eq!(e.sha256, format!("{:x}", Sha256::digest(b"")));
+            }
+            assert_eq!(r.fingerprint_status, FP_COMPLETE);
+        }
     }
 
     #[test]

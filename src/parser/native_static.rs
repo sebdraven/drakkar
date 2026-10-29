@@ -42,9 +42,9 @@ mod disasm;
 mod jni_table;
 
 pub use self::disasm::{
-    parse_listing_spec, DisasmCall, DisasmFunction, DisasmInsn, DisasmOptions, ElfDisasm,
-    InvalidPath, JavaMember, JniCall, Listing, ListingInsn, ListingSpec, StringRef, Syscall,
-    TruncatedAt,
+    parse_listing_spec, parse_root_spec, DisasmCall, DisasmFunction, DisasmInsn, DisasmOptions,
+    ElfDisasm, IndexedString, InvalidPath, JavaMember, JniCall, Listing, ListingInsn, ListingSpec,
+    RootSpec, StringIndexRef, StringRef, Syscall, TruncatedAt,
 };
 
 /// Catégories d'imports : noms exacts, ou préfixes quand ils finissent par `*`.
@@ -163,6 +163,11 @@ pub struct ElfReport {
     /// Présent avec `--native-disasm` seulement.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disasm: Option<ElfDisasm>,
+    /// Présents avec `--native-string-index` seulement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub string_index: Option<Vec<IndexedString>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub string_index_mode: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -506,6 +511,7 @@ fn finish(
                 self::disasm::run(bytes, elf, options);
             }
         });
+        self::disasm::warn_unmatched_roots(&elfs, options);
         for elf in &mut elfs {
             self::disasm::adopt_tables(elf);
         }
@@ -658,6 +664,8 @@ impl ElfReport {
             strings: Strings::default(),
             anomalies,
             disasm: None,
+            string_index: None,
+            string_index_mode: None,
         }
     }
 }
@@ -1999,7 +2007,9 @@ RAPPORT
                   commande. Vide en mode brut sans --native-dex. Une source illisible
                   reste listée, avec sa raison dans errors.
   listings[]      --native-listing seulement, absent sinon (section LISTING).
-  errors          Ce qui n'a pas pu être lu : entrée d'archive illisible (on ignore alors
+  errors          Une entrée de longueur nulle (empty : stored vide ou flux deflate vide)
+                  est lue, vide, et n'y figure jamais.
+                  Ce qui n'a pas pu être lu : entrée d'archive illisible (on ignore alors
                   si c'était un ELF), DEX illisible, classes sautées, panique du parseur
                   DEX, listing impossible. Une méthode native manquante peut faire
                   apparaître à tort son export en native_unclaimed. Une source illisible
@@ -2176,17 +2186,38 @@ DÉSASSEMBLAGE (elfs[].disasm) — avec --native-disasm seulement, absent sinon
                   comme un point d'entrée, même avec --disasm-depth 0 ; callee =
                   fonction interne appelée directement par une fonction déjà
                   désassemblée, jusqu'à --disasm-depth niveaux (0 = points d'entrée
-                  seuls).
+                  seuls) ; user_root = racine --native-root ; export = symbole exporté
+                  enraciné par --native-roots exports. Une adresse déjà enracinée garde
+                  sa première origine : les racines ajoutées ne créent aucun doublon.
+    --native-root <SPEC>, répétable
+                  SPEC = nom d'un symbole défini (.dynsym ou .symtab), ou adresse
+                  hexadécimale 0x… ; en ARM 32 bits le bit 0 de l'adresse donne le mode,
+                  et un préfixe t: (Thumb) ou a: (ARM) le force, 0x facultatif après le
+                  préfixe (t:4c78). Une SPEC qui ne désigne ni un symbole défini ni une
+                  adresse d'un segment exécutable dans AUCUN ELF produit un WARN qui la
+                  nomme, jamais une erreur ; une SPEC mal formée est une erreur.
+    --native-roots exports
+                  Enracine chaque symbole défini STT_FUNC de .dynsym, de liaison GLOBAL
+                  ou WEAK, sauf le runtime C/C++ (préfixes de la table RUNTIME EXCLU en
+                  fin de légende). Pour le code appelé par un injecteur après dlopen,
+                  hors JNI.
     address       Adresse virtuelle de la fonction, bit Thumb effacé.
     Mode (ARM 32 bits)
                   ARM ou Thumb, décidé à l'entrée de la fonction. jni_static, jni_onload,
-                  jni_onunload, init, init_array, entry et main : bit 0 de st_value ou de
-                  la valeur lue (un symbole autre que STT_FUNC compte quand ce bit vaut 1 ;
-                  pair, il peut désigner des données) ; jni_registered : bit 0 de fnPtr.
-                  callee : mode du branchement — bl et b immédiats gardent le mode
-                  courant, blx immédiat bascule ARM <-> Thumb, bx / blx registre et
-                  ldr pc suivent le bit 0 de la cible quand elle est connue — SAUF si un
-                  symbole défini se trouve à la cible : le bit 0 de son st_value l'emporte.
+                  jni_onunload, init, init_array, entry, main, export et user_root (sans
+                  préfixe) : bit 0 de st_value ou de la valeur lue (un symbole autre que
+                  STT_FUNC compte quand ce bit vaut 1 ; pair, il peut désigner des
+                  données) ; jni_registered : bit 0 de fnPtr. callee : mode du
+                  branchement, selon les règles de l'ARM ARM (BranchWritePC, ALUWritePC,
+                  BXWritePC, LoadWritePC) — b et bl immédiats gardent le mode courant ;
+                  blx immédiat bascule ARM <-> Thumb ; bx / blx registre, ldr pc et
+                  pop {…, pc} suivent le bit 0 de la cible quand elle est connue ;
+                  écriture du pc par une instruction de données (mov pc, Rm ; add pc,
+                  Rm ; add pc, Rn, Rm) : en Thumb le mode reste Thumb et le bit 0 est
+                  ignoré, en ARM (ARMv7) le bit 0 décide comme pour bx. La cible d'une
+                  telle écriture est suivie quand l'évaluateur la connaît, y compris par
+                  littéral + add pc + lecture de table. Dans tous les cas, un symbole
+                  défini à la cible l'emporte : le bit 0 de son st_value.
     disasm_status ok = tous les chemins atteints ont été parcourus, invalid_paths
                   éventuels compris ; truncated = un plafond a interrompu le parcours,
                   voir truncated_reason ; arch_unsupported = autre machine ou ELF
@@ -2322,6 +2353,40 @@ DÉSASSEMBLAGE (elfs[].disasm) — avec --native-disasm seulement, absent sinon
   l'APK, cibles des tables de sauts ; les instructions des blocs IT (Thumb) sont lues
   comme inconditionnelles.
 
+INDEX DES CHAÎNES (elfs[].string_index) — --native-string-index, avec --native-disasm
+  Balayage LINÉAIRE des sections exécutables (sans section headers : des segments
+  LOAD exécutables), instruction après instruction, sans suivre aucun branchement : il
+  atteint les fonctions jamais désassemblées, appelées seulement par pointeur (handler
+  de hook, callback). Il relève les formations d'adresse que reconnaît string_refs —
+  ARM et Thumb : ldr littéral puis add pc ; AArch64 : adrp puis add ou ldr ; x86_64 :
+  lea [rip+…] — vers une section allouée en lecture seule (sans section headers : un
+  segment LOAD non inscriptible). L'évaluateur repart d'un état vide après chaque
+  retour ou saut, à chaque début de fonction connu, et après un octet indécodable.
+  ⚠️ HEURISTIQUE : un pool de littéraux, une table de sauts ou des données au milieu
+  du code sont décodés comme des instructions et peuvent produire des références
+  fausses, ou masquer des vraies. Une entrée se vérifie au listing (--native-listing).
+  string_index_mode
+                  ARM 32 bits seulement : mode du balayage. mapping_symbols = symboles
+                  de mapping $a (ARM), $t (Thumb), $d (données, sautées) de .symtab ;
+                  function_modes = sans eux, mode du symbole de fonction connu le plus
+                  proche en amont (bit 0 de st_value), Thumb avant le premier ;
+                  default_thumb = aucun indice, tout est lu en Thumb (ARMv7). Absent
+                  pour les autres machines.
+  value, target, encoding
+                  Chaîne (256 octets au plus, jusqu'au premier nul), son adresse
+                  virtuelle, et utf8 ou hex comme dans string_refs.
+  refs[]          Une par instruction qui forme l'adresse : address = instruction ;
+                  function = début de la fonction qui la contient ; function_source :
+                    symbol   symbole de fonction défini le plus proche en amont qui la
+                             couvre (dans st_size ; st_size nul : pas de prologue entre
+                             le symbole et la référence) ;
+                    disasm   fonction désassemblée dont les instructions encadrent la
+                             référence, si son début est plus proche ;
+                    prologue sinon, le dernier push {…, lr} ou stp x29, x30 vu par le
+                             balayage avant la référence.
+                  function et function_source valent null quand rien de tout cela
+                  n'existe.
+
 ANOMALIES (elfs[].anomalies, code avant « : », détail après)
   abi_mismatch    ELF incompatible avec son répertoire lib/<abi>/.
   elf_outside_lib ELF hors de lib/ : l'installateur ne l'extrait pas, c'est le code de
@@ -2405,6 +2470,9 @@ pub fn legend() -> String {
     out.push_str(&vm);
     let noreturn = disasm::NORETURN_IMPORTS.join(" ");
     let section = format!("\nIMPORTS SANS RETOUR (--native-disasm)\n  {noreturn}\n");
+    out.push_str(&section);
+    let runtime = disasm::RUNTIME_PREFIXES.join(" ");
+    let section = format!("\nRUNTIME EXCLU (--native-roots exports, préfixes)\n  {runtime}\n");
     out.push_str(&section);
     out
 }
@@ -3037,6 +3105,21 @@ mod tests {
             "--native-dex",
             "listings",
             "--native-listing",
+            "empty",
+            "user_root",
+            "export",
+            "--native-root",
+            "--native-roots exports",
+            "RUNTIME EXCLU",
+            "BranchWritePC",
+            "string_index",
+            "string_index_mode",
+            "mapping_symbols",
+            "function_modes",
+            "default_thumb",
+            "function_source",
+            "prologue",
+            "HEURISTIQUE",
             "(invalid)",
         ];
         for label in labels {

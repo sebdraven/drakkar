@@ -78,6 +78,12 @@ impl Entry {
     pub fn looks_tampered(&self) -> bool {
         self.flags & 1 != 0 || !matches!(self.method, 0 | 8)
     }
+
+    /// Taille décompressée déclarée nulle, sans data descriptor (bit 3) qui
+    /// renverrait les tailles après les données.
+    pub fn declares_empty(&self) -> bool {
+        self.uncomp_size == 0 && self.flags & 0x8 == 0
+    }
 }
 
 /// Archive ouverte en mémoire.
@@ -158,6 +164,14 @@ impl TolerantZip {
         // flux deflate porte sa propre fin.
         let remaining = self.data.len().saturating_sub(start);
         let declared = entry.comp_size as usize;
+        // Entrée vide : stored de 0 octet, ou flux deflate qui ne rend rien.
+        // Sans ce cas, le reste de l'archive serait pris pour ses données.
+        if entry.declares_empty() {
+            let stored = &self.data[start..start + declared.min(remaining)];
+            if declared == 0 || inflates_to_nothing(stored) {
+                return Ok(Vec::new());
+            }
+        }
         let span = if declared == 0 || declared > remaining {
             remaining
         } else {
@@ -239,6 +253,16 @@ fn try_inflate(raw: &[u8], hint: u64) -> Option<Vec<u8>> {
         Err(_) if !out.is_empty() => Some(out),
         _ => None,
     }
+}
+
+/// Flux deflate valide et vide (`03 00`, ou bloc stored de longueur nulle).
+fn inflates_to_nothing(raw: &[u8]) -> bool {
+    let mut out = Vec::new();
+    !raw.is_empty()
+        && flate2::read::DeflateDecoder::new(raw)
+            .read_to_end(&mut out)
+            .is_ok()
+        && out.is_empty()
 }
 
 /// Localise le central directory. Balaye l'EOCD depuis la fin, puis suit le
@@ -387,4 +411,50 @@ fn read_u64(d: &[u8], off: usize) -> u64 {
     let mut b = [0u8; 8];
     b.copy_from_slice(&d[off..off + 8]);
     u64::from_le_bytes(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::CompressionMethod;
+
+    /// res/raw/output.mp3 de Chrysaor : 0 octet. Une entrée stored, une deflate,
+    /// puis une entrée pleine qui ne doit pas déteindre sur les vides.
+    fn archive_with_empty_entries() -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            let deflated =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            zw.start_file("res/raw/output.mp3", stored).unwrap();
+            zw.start_file("assets/vide.bin", deflated).unwrap();
+            zw.start_file("assets/plein.bin", deflated).unwrap();
+            zw.write_all(b"contenu").unwrap();
+            zw.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn empty_entries_read_as_empty_not_unreadable() {
+        let zip = TolerantZip::from_bytes(archive_with_empty_entries()).unwrap();
+        assert_eq!(zip.len(), 3);
+        assert!(zip.entries()[0].declares_empty());
+        assert_eq!(zip.read(0).unwrap(), Vec::<u8>::new());
+        assert_eq!(zip.read(1).unwrap(), Vec::<u8>::new());
+        assert_eq!(zip.read(2).unwrap(), b"contenu");
+    }
+
+    #[test]
+    fn an_empty_deflate_stream_is_recognised() {
+        assert!(inflates_to_nothing(&[0x03, 0x00]));
+        assert!(inflates_to_nothing(&[0x01, 0x00, 0x00, 0xff, 0xff]));
+        assert!(!inflates_to_nothing(&[]));
+        let mut z = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(b"x").unwrap();
+        assert!(!inflates_to_nothing(&z.finish().unwrap()));
+    }
 }

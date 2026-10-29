@@ -36,6 +36,13 @@ impl Format {
     }
 }
 
+/// `--native-roots`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum NativeRoots {
+    /// Toutes les fonctions exportées, runtime C/C++ exclu.
+    Exports,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "drakkar",
@@ -114,6 +121,23 @@ struct Cli {
     /// hexadécimal. Répétable.
     #[arg(long, value_name = "SPEC")]
     native_listing: Vec<String>,
+
+    /// (--native-disasm) Racine de désassemblage en plus des points d'entrée
+    /// JNI : nom d'un symbole défini, ou adresse `0x…` (ARM 32 bits : bit 0 =
+    /// Thumb ; `t:` ou `a:` force le mode). Répétable. Introuvable : WARN.
+    #[arg(long, value_name = "SPEC")]
+    native_root: Vec<String>,
+
+    /// (--native-disasm) `exports` : enracine aussi chaque fonction exportée,
+    /// runtime C/C++ exclu (--native --legend).
+    #[arg(long, value_enum, value_name = "exports")]
+    native_roots: Option<NativeRoots>,
+
+    /// (--native-disasm) Index des chaînes en lecture seule et des instructions
+    /// qui forment leur adresse, par balayage linéaire du code. Heuristique
+    /// (--native --legend).
+    #[arg(long)]
+    native_string_index: bool,
 
     /// (--native-disasm) Profondeur des fonctions internes suivies depuis les
     /// points d'entrée : 0 = points d'entrée seuls. Défaut 1.
@@ -379,6 +403,20 @@ struct Cli {
     #[arg(long, value_name = "MOTIF", num_args = 0..)]
     disasm: Option<Vec<String>>,
 
+    /// Balayage des capacités (accessibilité, SMS, overlay, exécution, chargement
+    /// de DEX…) : sites invoke, const-string et sget du code applicatif qui
+    /// correspondent aux motifs de --capabilities --legend. Même sélection de
+    /// classes que --disasm. APK ou DEX brut, mode single ; texte par défaut,
+    /// --format json disponible. Un site relevé n'est pas une preuve
+    /// d'atteignabilité.
+    #[arg(long, value_name = "MOTIF", num_args = 0..)]
+    capabilities: Option<Vec<String>>,
+
+    /// (--capabilities) Préfixe de descripteur Dalvik exclu en plus des
+    /// bibliothèques connues. Répétable.
+    #[arg(long, value_name = "PREFIXE")]
+    capabilities_exclude: Vec<String>,
+
     /// (--disasm) Substitution `DEPUIS=VERS` appliquée aux descripteurs et aux
     /// chaînes avant affichage, pour comparer deux lots de namespaces
     /// différents (ex. `com/duiyun=com/dy`). Répétable. N'affecte que
@@ -502,7 +540,7 @@ struct Cli {
 
     /// Affiche la légende des étiquettes et règles de dérivation, puis sort.
     /// Se combine avec --manifest, --cert, --dating, --enrich, --decompile,
-    /// --bundle ou --native.
+    /// --bundle, --native ou --capabilities.
     #[arg(long)]
     legend: bool,
 
@@ -581,6 +619,17 @@ fn main() -> Result<()> {
     if cli.disasm_max_insns == Some(0) {
         bail!("--disasm-max-insns doit valoir au moins 1");
     }
+    let roots_tuning =
+        !cli.native_root.is_empty() || cli.native_roots.is_some() || cli.native_string_index;
+    if roots_tuning && !cli.native_disasm {
+        bail!(
+            "--native-root, --native-roots et --native-string-index n'ont d'effet qu'avec \
+             --native --native-disasm"
+        );
+    }
+    if !cli.capabilities_exclude.is_empty() && cli.capabilities.is_none() {
+        bail!("--capabilities-exclude n'a d'effet qu'avec --capabilities");
+    }
 
     // Sortie rapide : audit d'architecture native seul (pas de moteur de règles,
     // pas de catalogue MITRE) — lit uniquement les en-têtes ELF, en mémoire.
@@ -636,6 +685,14 @@ fn main() -> Result<()> {
         if let Some(max_insns) = cli.disasm_max_insns {
             options.max_insns = max_insns;
         }
+        for spec in &cli.native_root {
+            match parser::native_static::parse_root_spec(spec) {
+                Ok(root) => options.roots.push(root),
+                Err(why) => bail!("--native-root {spec:?} : {why}"),
+            }
+        }
+        options.export_roots = cli.native_roots == Some(NativeRoots::Exports);
+        options.string_index = cli.native_string_index;
         let disasm = cli.native_disasm.then_some(&options);
         let dex = &cli.native_dex;
         let mut report = if parser::native_static::is_elf_file(input) {
@@ -1306,6 +1363,33 @@ est racine — ne pas comparer à une mesure `manifest`)",
         return Ok(());
     }
 
+    // Sortie rapide : capacités par site d'appel, sur la sélection de --disasm.
+    if let Some(patterns) = &cli.capabilities {
+        if cli.legend {
+            println!("{}", parser::capabilities::legend());
+            return Ok(());
+        }
+        if cli.format == Format::Csv {
+            bail!("--format csv n'existe pas pour --capabilities : passer --format json ou both");
+        }
+        check_json_dest(cli.format, cli.json_out.as_deref())?;
+        let Some(input) = &cli.apk else {
+            bail!("--capabilities requiert un APK ou un DEX en argument (mode single)");
+        };
+        let report = parser::capabilities::run(input, patterns, &cli.capabilities_exclude)?;
+        if cli.format.wants_text() {
+            print!("{}", parser::capabilities::render(&report));
+        }
+        if cli.format.wants_json() {
+            emit_json(&report.capabilities, cli.json_out.as_deref())?;
+        }
+        eprintln!(
+            "[OK]    {} classe(s) retenue(s), dont {} exclue(s) comme bibliothèque",
+            report.selected, report.excluded
+        );
+        return Ok(());
+    }
+
     // Sortie rapide : désassemblage lisible d'une sélection de classes. Ne
     // charge ni catalogue MITRE ni moteur de règles. Mode single uniquement :
     // la sortie est destinée à être diffée, un fichier par binaire.
@@ -1829,6 +1913,18 @@ fn print_native_elf(e: &drakkar::parser::native_static::ElfReport, full: bool) {
             println!("    {item}");
         }
     }
+    if let Some(index) = &e.string_index {
+        let mode = e.string_index_mode.unwrap_or("-");
+        println!("  index des chaînes ({} ; balayage {mode})", index.len());
+        for s in index {
+            println!("    {}  {:?}", s.target, s.value);
+            for r in &s.refs {
+                let function = r.function.as_deref().unwrap_or("-");
+                let source = r.function_source.unwrap_or("-");
+                println!("      <- {}  fonction {function} ({source})", r.address);
+            }
+        }
+    }
 
     println!("  sections ({})", e.sections.len());
     for s in &e.sections {
@@ -1929,6 +2025,9 @@ fn print_and_dump_extract(
 
     for name in &ex.unreadable {
         println!("[FAIL]  {name}  — illisible, y compris par le lecteur ZIP tolérant");
+    }
+    for name in &ex.empty {
+        println!("[EMPTY] {name}  — entrée de longueur nulle, ni ELF ni illisible");
     }
 
     if ex.is_empty() {
