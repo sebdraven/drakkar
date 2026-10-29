@@ -89,9 +89,10 @@ struct Cli {
     /// ailleurs), reconnus au contenu : sections, segments, imports classés,
     /// chaînes, exports Java_*, tables JNINativeMethod reconstruites à travers
     /// les relocations relatives, puis liaison avec les méthodes `native` du DEX.
-    /// Aucune exécution ; désassemblage seulement avec --native-disasm. Texte par
-    /// défaut, --format json|both disponible ; --native --legend définit chaque
-    /// champ. Mode single.
+    /// Un ELF passé directement (reconnu à son magic) est analysé seul ; voir
+    /// --native-dex. Aucune exécution ; désassemblage seulement avec
+    /// --native-disasm. Texte par défaut, --format json|both disponible ;
+    /// --native --legend définit chaque champ. Mode single.
     #[arg(long, conflicts_with = "native_arch")]
     native: bool,
 
@@ -101,6 +102,17 @@ struct Cli {
     /// système. Rien n'est exécuté ni émulé.
     #[arg(long)]
     native_disasm: bool,
+
+    /// (--native, entrée ELF brute) APK ou DEX brut dont les méthodes `native`
+    /// sont liées à l'ELF. Sans lui, la liaison est vide.
+    #[arg(long, value_name = "APK|DEX")]
+    native_dex: Option<PathBuf>,
+
+    /// (--native-disasm) Liste les instructions de `<elf|*>@<adresse>` (fonction
+    /// désassemblée) ou `<elf|*>@<début>-<fin>` (fin exclue), adresses en
+    /// hexadécimal. Répétable.
+    #[arg(long, value_name = "SPEC")]
+    native_listing: Vec<String>,
 
     /// (--native-disasm) Profondeur des fonctions internes suivies depuis les
     /// points d'entrée : 0 = points d'entrée seuls. Défaut 1.
@@ -602,9 +614,19 @@ fn main() -> Result<()> {
             );
         }
         check_json_dest(cli.format, cli.json_out.as_deref())?;
-        let Some(apk) = &cli.apk else {
-            bail!("--native requiert un APK (mode single)");
+        let Some(input) = &cli.apk else {
+            bail!("--native requiert un APK ou un ELF (mode single)");
         };
+        let mut listings = Vec::new();
+        for spec in &cli.native_listing {
+            match parser::native_static::parse_listing_spec(spec) {
+                Ok(parsed) => listings.push(parsed),
+                Err(why) => bail!("--native-listing {spec:?} : {why}"),
+            }
+        }
+        if !listings.is_empty() && !cli.native_disasm {
+            bail!("--native-listing requiert --native-disasm");
+        }
         let mut options = parser::native_static::DisasmOptions::default();
         if let Some(depth) = cli.disasm_depth {
             options.depth = depth;
@@ -613,7 +635,16 @@ fn main() -> Result<()> {
             options.max_insns = max_insns;
         }
         let disasm = cli.native_disasm.then_some(&options);
-        let report = parser::native_static::analyze_apk(apk, disasm)?;
+        let dex = cli.native_dex.as_deref();
+        let mut report = if parser::native_static::is_elf_file(input) {
+            parser::native_static::analyze_elf_file(input, dex, disasm)?
+        } else {
+            if dex.is_some() {
+                bail!("--native-dex ne s'applique qu'à un ELF brut : l'APK porte son DEX");
+            }
+            parser::native_static::analyze_apk(input, disasm)?
+        };
+        parser::native_static::add_listings(&mut report, input, &listings, options.max_insns);
         if cli.format.wants_text() {
             print_native(&report, cli.disasm_full);
         }
@@ -1672,7 +1703,8 @@ fn print_native_arch(s: &drakkar::parser::native_arch::NativeArchSummary) {
 /// désassemblées (`--disasm-full`).
 fn print_native(r: &drakkar::parser::native_static::NativeReport, full: bool) {
     println!("== Analyse native statique ==\n");
-    println!("APK       {}", r.sha256);
+    let raw = r.elfs.iter().any(|e| e.origin == "raw");
+    println!("{:<9} {}", if raw { "ELF" } else { "APK" }, r.sha256);
     println!("Légende   drakkar --native --legend");
 
     if r.elfs.is_empty() {
@@ -1682,8 +1714,10 @@ fn print_native(r: &drakkar::parser::native_static::NativeReport, full: bool) {
         print_native_elf(e, full);
     }
 
-    println!("\nLiaison DEX ↔ natif (ELF de lib/ seulement) :");
-    if r.binding.is_empty() {
+    println!("\nLiaison DEX ↔ natif (ELF de lib/ ou ELF brut seulement) :");
+    if !r.dex_available {
+        println!("  (aucun DEX : passer --native-dex <APK|DEX>)");
+    } else if r.binding.is_empty() {
         println!("  (aucune ligne)");
     }
     for b in &r.binding {
@@ -1710,6 +1744,17 @@ fn print_native(r: &drakkar::parser::native_static::NativeReport, full: bool) {
     println!("  registered_ambiguous       {}", s.ambiguous);
     println!("  declared_unbound           {}", s.unbound);
     println!("  native_unclaimed           {}", s.unclaimed);
+
+    for l in &r.listings {
+        println!("\nListing {}  {}-{} :", l.elf, l.start, l.end);
+        for i in &l.instructions {
+            let text = format!("{}  {}  {} {}", i.address, i.bytes, i.mnemonic, i.operands);
+            match &i.comment {
+                Some(comment) => println!("  {}  ; {comment}", text.trim_end()),
+                None => println!("  {}", text.trim_end()),
+            }
+        }
+    }
 
     if !r.errors.is_empty() {
         println!("\nNon lu ({}) :", r.errors.len());
