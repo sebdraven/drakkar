@@ -39,6 +39,7 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Seek};
 use std::path::Path;
 
+use super::apkzip::TolerantZip;
 use super::native_arch::{parse_elf_header, Abi, Bits, ElfArch, Machine};
 
 /// Une bibliothèque native extraite (octets complets, en mémoire).
@@ -83,6 +84,9 @@ pub struct NativeExtraction {
     /// Entrées finissant en `.so` mais qui ne sont **pas** des ELF (ressource
     /// nommée `.so`, `.so` chiffré non déballé, …) — ignorées.
     pub skipped_non_elf: Vec<String>,
+    /// Entrées en `.so` que même le lecteur tolérant n'a pas pu décompresser.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<String>,
 }
 
 impl NativeExtraction {
@@ -108,23 +112,47 @@ impl NativeExtraction {
 
 /// Extrait les `.so` natifs d'un APK déjà chargé en mémoire (octets du zip).
 pub fn extract_apk_bytes(apk: &[u8]) -> Result<NativeExtraction> {
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(apk))
-        .context("lecture APK (zip) depuis la mémoire")?;
-    extract_archive(&mut archive)
+    let nominal = zip::ZipArchive::new(std::io::Cursor::new(apk))
+        .context("lecture APK (zip) depuis la mémoire")
+        .and_then(|mut archive| extract_archive(&mut archive));
+    match nominal {
+        Ok(extraction) => Ok(extraction),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "extraction native en échec par le crate zip, repli sur le lecteur tolérant"
+            );
+            Ok(extract_tolerant(&TolerantZip::from_bytes(apk.to_vec())?))
+        }
+    }
 }
 
 /// Extrait les `.so` natifs d'un APK sur disque. L'archive est lue, mais aucun
 /// `.so` n'est réécrit : les octets partent en RAM dans `ExtractedLib::bytes`.
+///
+/// Repli sur [`TolerantZip`] dès que le crate `zip` refuse l'archive à
+/// l'ouverture, une entrée à `by_index`, ou ses octets à `read_to_end`.
 pub fn extract_apk_file(path: &Path) -> Result<NativeExtraction> {
     let file =
         std::fs::File::open(path).with_context(|| format!("ouverture {}", path.display()))?;
-    let mut archive = zip::ZipArchive::new(file).context("lecture APK (zip)")?;
-    extract_archive(&mut archive)
+    let nominal = zip::ZipArchive::new(file)
+        .context("lecture APK (zip)")
+        .and_then(|mut archive| extract_archive(&mut archive));
+    match nominal {
+        Ok(extraction) => Ok(extraction),
+        Err(e) => {
+            tracing::warn!(
+                apk = %path.display(),
+                error = %e,
+                "extraction native en échec par le crate zip, repli sur le lecteur tolérant"
+            );
+            Ok(extract_tolerant(&TolerantZip::open(path)?))
+        }
+    }
 }
 
 fn extract_archive<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<NativeExtraction> {
-    let mut libs = Vec::new();
-    let mut skipped_non_elf = Vec::new();
+    let mut out = NativeExtraction::default();
 
     for i in 0..archive.len() {
         let mut entry = archive
@@ -141,13 +169,44 @@ fn extract_archive<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<N
         entry
             .read_to_end(&mut bytes)
             .with_context(|| format!("lecture {name}"))?;
+        out.push(name, bytes);
+    }
 
+    Ok(out)
+}
+
+/// Une entrée illisible est rangée dans `unreadable` au lieu de faire échouer
+/// l'extraction des autres.
+fn extract_tolerant(zip: &TolerantZip) -> NativeExtraction {
+    let mut out = NativeExtraction::default();
+    for (i, entry) in zip.entries().iter().enumerate() {
+        let name = &entry.name;
+        if name.ends_with('/') || !name.ends_with(".so") {
+            continue;
+        }
+        match zip.read(i) {
+            Ok(bytes) => out.push(name.clone(), bytes),
+            Err(e) => {
+                tracing::warn!(
+                    entry = %name,
+                    error = %e,
+                    "entrée illisible par le lecteur tolérant"
+                );
+                out.unreadable.push(name.clone());
+            }
+        }
+    }
+    out
+}
+
+impl NativeExtraction {
+    fn push(&mut self, name: String, bytes: Vec<u8>) {
         // Filtre ELF : écarte les fausses `.so` (ressources, `.so` non déballé).
         let arch = match parse_elf_header(&bytes) {
             Some(a) => a,
             None => {
-                skipped_non_elf.push(name);
-                continue;
+                self.skipped_non_elf.push(name);
+                return;
             }
         };
 
@@ -171,7 +230,7 @@ fn extract_archive<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<N
             (dir, None)
         };
 
-        libs.push(ExtractedLib {
+        self.libs.push(ExtractedLib {
             entry: name,
             file,
             source,
@@ -181,11 +240,6 @@ fn extract_archive<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<N
             bytes,
         });
     }
-
-    Ok(NativeExtraction {
-        libs,
-        skipped_non_elf,
-    })
 }
 
 /// Légende autonome des étiquettes produites par ce module.
@@ -205,6 +259,9 @@ sha256           SHA-256 COMPLET (64 caractères hexadécimaux) du contenu DÉCO
                  lecteur tolérant entre en jeu. Jamais tronqué, jamais un préfixe.
 bytes            Octets complets du .so, en mémoire (jamais écrits sur disque).
 skipped_non_elf  Entrées en .so qui ne sont pas des ELF (ressources, .so chiffré non déballé…).
+unreadable       Entrées en .so illisibles, y compris par le lecteur ZIP tolérant (repli quand
+                 le crate zip refuse l'archive ou une entrée : local header abîmé, drapeau de
+                 chiffrement, méthode inventée). Absent si vide.
 out_of_lib()     Vrai si la lib est rangée hors lib/<abi>/ (packers : assets/libjiagu*.so)."
 }
 
