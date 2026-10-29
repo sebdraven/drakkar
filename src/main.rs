@@ -1598,10 +1598,15 @@ est racine — ne pas comparer à une mesure `manifest`)",
             bulk::run(dir, &engine, &bulk_options(&cli))?;
         }
 
-        // ── Mode single : comportement historique inchangé ──
+        // ── Mode single : APK, JAR ou DEX brut, reconnu au contenu ──
         (Some(apk), None) => {
             reject_non_json_format(cli.format)?;
-            let parsed = parser::parse_apk(apk)?;
+            // Pas parse_any : il refuse une archive dont le premier local header
+            // est abîmé, que parse_apk ouvre par le lecteur tolérant.
+            let parsed = match parser::dyn_entrypoints::sniff(apk) {
+                Some(parser::dyn_entrypoints::InputKind::Dex) => parser::parse_dex(apk)?,
+                _ => parser::parse_apk(apk)?,
+            };
             let matches = engine.run(&parsed.features, &parsed.call_graph);
 
             if let Some(out) = &cli.export_graph {
@@ -1760,6 +1765,10 @@ fn print_native_elf(e: &drakkar::parser::native_static::ElfReport, full: bool) {
         let thumb = if t.thumb { "  thumb" } else { "" };
         println!("    table {table}  {name}{sig}  →  {at}{thumb}");
     }
+    for u in &jni.swig_director_upcalls {
+        let (table, name, sig) = (&u.table_offset, &u.name, &u.signature);
+        println!("    swig  {table}  {name}{sig}  (upcall de director SWIG, pas native)");
+    }
 
     for (category, bucket) in e.strings.categories() {
         if bucket.total == 0 {
@@ -1864,6 +1873,10 @@ fn print_and_dump_extract(
 
     println!("== Extraction des bibliothèques natives ==\n");
     println!("{}\n", drakkar::parser::native_extract::legend());
+
+    for name in &ex.unreadable {
+        println!("[FAIL]  {name}  — illisible, y compris par le lecteur ZIP tolérant");
+    }
 
     if ex.is_empty() {
         println!("Aucune bibliothèque native (.so ELF) dans l'APK.");
@@ -3168,6 +3181,9 @@ fn print_and_dump_entries(
         ex.count(),
         ex.scanned
     );
+    for name in &ex.unreadable {
+        println!("[FAIL]   {name}  — illisible, y compris par le lecteur ZIP tolérant");
+    }
 
     if ex.is_empty() {
         println!("\nAucune entrée ne correspond. `--list-entries` donne l'arborescence.");

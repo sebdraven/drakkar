@@ -28,6 +28,8 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
+use super::apkzip::TolerantZip;
+
 /// Une entrée extraite de l'APK.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedEntry {
@@ -92,6 +94,10 @@ pub struct EntryExtraction {
     pub entries: Vec<ExtractedEntry>,
     /// Nombre total d'entrées de l'archive (dénominateur du filtrage).
     pub scanned: usize,
+    /// Entrées retenues par un motif que même le lecteur tolérant n'a pas pu
+    /// décompresser.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<String>,
 }
 
 impl EntryExtraction {
@@ -196,19 +202,45 @@ fn entropy(bytes: &[u8]) -> f64 {
 /// Extrait de l'APK en mémoire toutes les entrées correspondant à l'un des
 /// motifs. Aucune écriture sur disque.
 pub fn extract_matching_bytes(apk: &[u8], patterns: &[String]) -> Result<EntryExtraction> {
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(apk))
-        .context("lecture APK (zip) depuis la mémoire")?;
-    extract_archive(&mut archive, patterns)
+    let nominal = zip::ZipArchive::new(std::io::Cursor::new(apk))
+        .context("lecture APK (zip) depuis la mémoire")
+        .and_then(|mut archive| extract_archive(&mut archive, patterns));
+    match nominal {
+        Ok(extraction) => Ok(extraction),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "extraction en échec par le crate zip, repli sur le lecteur tolérant"
+            );
+            let zip = TolerantZip::from_bytes(apk.to_vec())?;
+            Ok(extract_tolerant(&zip, patterns))
+        }
+    }
 }
 
 /// Extrait d'un APK sur disque les entrées correspondant à l'un des motifs.
 /// Les octets restent en mémoire — l'écriture est un choix explicite de
 /// l'appelant ([`ExtractedEntry::write_to`]).
+///
+/// Repli sur [`TolerantZip`] dès que le crate `zip` refuse l'archive à
+/// l'ouverture, une entrée à `by_index`, ou ses octets à `read_to_end`.
 pub fn extract_matching(path: &Path, patterns: &[String]) -> Result<EntryExtraction> {
     let file =
         std::fs::File::open(path).with_context(|| format!("ouverture {}", path.display()))?;
-    let mut archive = zip::ZipArchive::new(file).context("lecture APK (zip)")?;
-    extract_archive(&mut archive, patterns)
+    let nominal = zip::ZipArchive::new(file)
+        .context("lecture APK (zip)")
+        .and_then(|mut archive| extract_archive(&mut archive, patterns));
+    match nominal {
+        Ok(extraction) => Ok(extraction),
+        Err(e) => {
+            tracing::warn!(
+                apk = %path.display(),
+                error = %e,
+                "extraction en échec par le crate zip, repli sur le lecteur tolérant"
+            );
+            Ok(extract_tolerant(&TolerantZip::open(path)?, patterns))
+        }
+    }
 }
 
 /// Liste les chemins de toutes les entrées de l'archive, sans rien extraire.
@@ -216,17 +248,30 @@ pub fn extract_matching(path: &Path, patterns: &[String]) -> Result<EntryExtract
 pub fn list_entries(path: &Path) -> Result<Vec<String>> {
     let file =
         std::fs::File::open(path).with_context(|| format!("ouverture {}", path.display()))?;
-    let mut archive = zip::ZipArchive::new(file).context("lecture APK (zip)")?;
-    let mut names = Vec::with_capacity(archive.len());
-    for i in 0..archive.len() {
-        let entry = archive
-            .by_index(i)
-            .with_context(|| format!("entrée zip #{i}"))?;
-        let name = entry.name().to_string();
-        if !name.ends_with('/') {
-            names.push(name);
+    let nominal = (|| -> Result<Vec<String>> {
+        let mut archive = zip::ZipArchive::new(file).context("lecture APK (zip)")?;
+        let mut names = Vec::with_capacity(archive.len());
+        for i in 0..archive.len() {
+            let entry = archive
+                .by_index(i)
+                .with_context(|| format!("entrée zip #{i}"))?;
+            names.push(entry.name().to_string());
         }
-    }
+        Ok(names)
+    })();
+    let mut names = match nominal {
+        Ok(names) => names,
+        Err(e) => {
+            tracing::warn!(
+                apk = %path.display(),
+                error = %e,
+                "liste en échec par le crate zip, repli sur le lecteur tolérant"
+            );
+            let zip = TolerantZip::open(path)?;
+            zip.entries().iter().map(|e| e.name.clone()).collect()
+        }
+    };
+    names.retain(|name| !name.ends_with('/'));
     names.sort();
     Ok(names)
 }
@@ -243,10 +288,7 @@ fn extract_archive<R: Read + Seek>(
             .by_index(i)
             .with_context(|| format!("entrée zip #{i}"))?;
         let name = entry.name().to_string();
-        if name.ends_with('/') {
-            continue;
-        }
-        if !patterns.iter().any(|p| matches(&name, p)) {
+        if !selected(&name, patterns) {
             continue;
         }
 
@@ -256,27 +298,66 @@ fn extract_archive<R: Read + Seek>(
         entry
             .read_to_end(&mut bytes)
             .with_context(|| format!("lecture {name}"))?;
-
-        let sha256 = format!("{:x}", Sha256::digest(&bytes));
-        let file = name.rsplit('/').next().unwrap_or(name.as_str()).to_string();
-
-        entries.push(ExtractedEntry {
-            entry: name,
-            file,
-            size,
-            compressed_size,
-            sha256,
-            kind: sniff(&bytes).to_string(),
-            entropy: entropy(&bytes),
-            bytes,
-        });
+        entries.push(extracted(name, size, compressed_size, bytes));
     }
 
     Ok(EntryExtraction {
         patterns: patterns.to_vec(),
         entries,
         scanned,
+        unreadable: Vec::new(),
     })
+}
+
+/// `size` est la longueur réellement décompressée : le central directory d'une
+/// archive trafiquée peut mentir. Une entrée illisible va dans `unreadable`.
+fn extract_tolerant(zip: &TolerantZip, patterns: &[String]) -> EntryExtraction {
+    let mut out = EntryExtraction {
+        patterns: patterns.to_vec(),
+        scanned: zip.len(),
+        ..EntryExtraction::default()
+    };
+    for (i, entry) in zip.entries().iter().enumerate() {
+        let name = &entry.name;
+        if !selected(name, patterns) {
+            continue;
+        }
+        match zip.read(i) {
+            Ok(bytes) => {
+                let size = bytes.len() as u64;
+                let found = extracted(name.clone(), size, entry.comp_size, bytes);
+                out.entries.push(found);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    entry = %name,
+                    error = %e,
+                    "entrée illisible par le lecteur tolérant"
+                );
+                out.unreadable.push(name.clone());
+            }
+        }
+    }
+    out
+}
+
+fn selected(name: &str, patterns: &[String]) -> bool {
+    !name.ends_with('/') && patterns.iter().any(|p| matches(name, p))
+}
+
+fn extracted(name: String, size: u64, compressed_size: u64, bytes: Vec<u8>) -> ExtractedEntry {
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let file = name.rsplit('/').next().unwrap_or(name.as_str()).to_string();
+    ExtractedEntry {
+        entry: name,
+        file,
+        size,
+        compressed_size,
+        sha256,
+        kind: sniff(&bytes).to_string(),
+        entropy: entropy(&bytes),
+        bytes,
+    }
 }
 
 /// Légende autonome des étiquettes produites par ce module.
@@ -293,6 +374,12 @@ kind             Type déduit des OCTETS DE TÊTE, jamais de l'extension : apk/z
 entropy          Entropie de Shannon (0.0-8.0). > 7.9 = chiffré ou déjà compressé ;
                  un DEX en clair est vers 6.0. Un écart signale un payload.
 scanned          Nombre total d'entrées de l'archive (dénominateur du filtrage).
+unreadable       Entrées retenues mais illisibles, y compris par le lecteur ZIP tolérant.
+
+Lecture : crate zip d'abord ; s'il refuse l'archive, une entrée ou ses octets (local
+header abîmé, drapeau de chiffrement, méthode inventée), lecteur ZIP tolérant calqué sur
+le chargeur d'Android. size est alors la longueur réellement décompressée, et
+compressed_size la taille déclarée par le central directory.
 
 Motifs (--extract-entry, répétable) :
   égalité exacte   res/raw/plugin

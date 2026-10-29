@@ -35,6 +35,10 @@ pub(super) enum Expr {
 pub(super) enum Addr {
     Base(u8, i64),
     Abs(u64),
+    /// `[base, index]`.
+    Index(u8, u8),
+    /// `[pc, index]` : pc tel que l'instruction le lit.
+    PcIndex(u64, u8),
     Unknown,
 }
 
@@ -406,7 +410,8 @@ fn shifted(addr: Addr, by: u64) -> Addr {
     match addr {
         Addr::Base(reg, off) => Addr::Base(reg, off.wrapping_add(by as i64)),
         Addr::Abs(at) => Addr::Abs(at.wrapping_add(by)),
-        Addr::Unknown => Addr::Unknown,
+        Addr::PcIndex(pc, index) => Addr::PcIndex(pc.wrapping_add(by), index),
+        Addr::Index(..) | Addr::Unknown => Addr::Unknown,
     }
 }
 
@@ -953,11 +958,31 @@ fn arm_addr(op: ArmOperand, site: Site) -> Option<(Addr, Option<(u8, i64)>)> {
             let rn = rn.number();
             Some((Addr::Base(rn, 0), Some((rn, signed(off, add)))))
         }
+        ArmOperand::RegDerefPreindexReg(rn, rm, true, false) => {
+            Some((indexed(rn.number(), rm.number(), site), None))
+        }
+        ArmOperand::RegDerefPreindexRegShift(rn, shift, true, false) => {
+            let addr = match plain_shift(shift) {
+                Some(rm) => indexed(rn.number(), rm, site),
+                None => Addr::Unknown,
+            };
+            Some((addr, None))
+        }
         ArmOperand::RegDerefPreindexReg(..)
         | ArmOperand::RegDerefPostindexReg(..)
         | ArmOperand::RegDerefPreindexRegShift(..)
         | ArmOperand::RegDerefPostindexRegShift(..) => Some((Addr::Unknown, None)),
         _ => None,
+    }
+}
+
+/// `[rn, rm]` sans décalage ni réécriture : GOT indexée du code PIC
+/// (`ldr r2, [pc, r2]`, `ldr r3, [r4, r3]`).
+fn indexed(rn: u8, rm: u8, site: Site) -> Addr {
+    if rn == 15 {
+        Addr::PcIndex(site.pc(), rm)
+    } else {
+        Addr::Index(rn, rm)
     }
 }
 
@@ -1187,7 +1212,7 @@ fn x86_semantics(inst: &iced_x86::Instruction, ptr: u64, insn: &mut Insn) {
                 let expr = match addr {
                     Addr::Abs(at) => Expr::Imm(at),
                     Addr::Base(reg, off) => Expr::AddImm(reg, off),
-                    Addr::Unknown => Expr::Unknown,
+                    Addr::Index(..) | Addr::PcIndex(..) | Addr::Unknown => Expr::Unknown,
                 };
                 insn.set(rd, expr);
                 insn.forms_address = Some(rd);

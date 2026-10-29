@@ -81,6 +81,10 @@ pub const STATUS_AMBIGUOUS: &str = "registered_ambiguous";
 pub const STATUS_UNBOUND: &str = "declared_unbound";
 pub const STATUS_UNCLAIMED: &str = "native_unclaimed";
 
+/// Upcalls de director SWIG : méthodes Java statiques non natives que le code
+/// généré appelle depuis le natif.
+pub const SWIG_DIRECTOR_PREFIX: &str = "SwigDirector_";
+
 const ORIGIN_LIB: &str = "lib";
 const ELF_MAGIC: &[u8] = b"\x7FELF";
 const STRINGS_CAP: usize = 50;
@@ -228,6 +232,8 @@ pub struct JniInfo {
     pub jni_registration: &'static str,
     pub static_exports: Vec<StaticExport>,
     pub registered: Vec<RegisteredMethod>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub swig_director_upcalls: Vec<SwigUpcall>,
 }
 
 impl Default for JniInfo {
@@ -238,8 +244,18 @@ impl Default for JniInfo {
             jni_registration: "none",
             static_exports: Vec::new(),
             registered: Vec::new(),
+            swig_director_upcalls: Vec::new(),
         }
     }
+}
+
+/// Entrée `{method, signature}` de la table que le `swig_module_init` généré
+/// par SWIG passe à GetStaticMethodID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SwigUpcall {
+    pub name: String,
+    pub signature: String,
+    pub table_offset: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -422,16 +438,21 @@ pub fn analyze_apk(path: &Path, disasm: Option<&DisasmOptions>) -> Result<Native
     }
 
     let natives = declared_natives(path, &mut errors);
-    let mut binding = match &natives {
-        Some(natives) => bind(natives, &elfs),
-        None => Vec::new(),
-    };
     if let Some(options) = disasm {
         self::disasm::silence_panics(|| {
             for (elf, bytes) in elfs.iter_mut().zip(&kept) {
                 self::disasm::run(bytes, elf, options);
             }
         });
+        for elf in &mut elfs {
+            self::disasm::adopt_tables(elf);
+        }
+    }
+    let mut binding = match &natives {
+        Some(natives) => bind(natives, &elfs),
+        None => Vec::new(),
+    };
+    if disasm.is_some() {
         self::disasm::disambiguate(&elfs, &mut binding);
     }
     let declared = natives.as_ref().map_or(0, Vec::len);
@@ -875,6 +896,7 @@ fn inspect(bytes: &[u8], report: &mut ElfReport) -> object::read::Result<()> {
     };
     let slots = relocated_slots(&image, &tables, &mut report.anomalies);
     report.jni.registered = scan_jni_tables(&image, &slots);
+    report.jni.swig_director_upcalls = scan_swig_tables(&image, &slots);
     report.jni.registernatives_string = has_registernatives(&image);
     report.jni.jni_registration = registration_status(&report.jni);
     describe_strings(&image, &mut report.strings);
@@ -1201,10 +1223,13 @@ fn scan_jni_tables(image: &Image, slots: &HashMap<u64, u64>) -> Vec<RegisteredMe
     found
 }
 
+/// Un nom `SwigDirector_*` est refusé : sur une table SWIG `{method,
+/// signature}` lue par pas de trois pointeurs, fnPtr serait le nom de l'entrée
+/// suivante, exécutable quand .rodata partage le segment du code.
 fn jni_entry_at(image: &Image, slots: &HashMap<u64, u64>, at: u64) -> Option<RegisteredMethod> {
     let ps = image.ptr_size;
     let name = image.cstr_at(pointer(image, slots, at)?, MAX_NAME_LEN)?;
-    if !is_java_identifier(name) {
+    if !is_java_identifier(name) || name.starts_with(SWIG_DIRECTOR_PREFIX) {
         return None;
     }
     let signature = image.cstr_at(pointer(image, slots, at + ps)?, MAX_SIGNATURE_LEN)?;
@@ -1224,6 +1249,50 @@ fn jni_entry_at(image: &Image, slots: &HashMap<u64, u64>, at: u64) -> Option<Reg
         table_offset: String::new(),
         thumb,
     })
+}
+
+/// Tables `{method, signature}` de directors SWIG, par pas de deux pointeurs ;
+/// des entrées consécutives forment une même table.
+fn scan_swig_tables(image: &Image, slots: &HashMap<u64, u64>) -> Vec<SwigUpcall> {
+    let ps = image.ptr_size;
+    let stride = 2 * ps;
+    let mut found = Vec::new();
+    for region in image.data_regions(false) {
+        let end = region.vaddr.saturating_add(region.bytes.len() as u64);
+        let mut at = region
+            .vaddr
+            .checked_next_multiple_of(ps)
+            .unwrap_or(u64::MAX);
+        let mut table = None;
+        while at.saturating_add(stride) <= end {
+            let Some((name, signature)) = swig_upcall_at(image, slots, at) else {
+                table = None;
+                at += ps;
+                continue;
+            };
+            let table_offset = table.get_or_insert_with(|| hex(at)).clone();
+            found.push(SwigUpcall {
+                name,
+                signature,
+                table_offset,
+            });
+            at += stride;
+        }
+    }
+    found
+}
+
+fn swig_upcall_at(image: &Image, slots: &HashMap<u64, u64>, at: u64) -> Option<(String, String)> {
+    let name = image.cstr_at(pointer(image, slots, at)?, MAX_NAME_LEN)?;
+    if !name.starts_with(SWIG_DIRECTOR_PREFIX) || !is_java_identifier(name) {
+        return None;
+    }
+    let at = at + image.ptr_size;
+    let signature = image.cstr_at(pointer(image, slots, at)?, MAX_SIGNATURE_LEN)?;
+    if !is_jni_signature(signature) {
+        return None;
+    }
+    Some((name.to_string(), signature.to_string()))
 }
 
 fn pointer(image: &Image, slots: &HashMap<u64, u64>, at: u64) -> Option<u64> {
@@ -1828,10 +1897,10 @@ JNI (elfs[].jni)
                   « RegisterNatives ». Indice, pas preuve : l'appel passe par la table de
                   fonctions de JNIEnv et ne laisse aucun symbole.
   jni_registration
-                  tables_found = au moins une entrée de table JNINativeMethod reconstruite ;
-                  unresolved = JNI_OnLoad exporté mais aucune table reconstruite (noms ou
-                  signatures chiffrés, construits à l'exécution, ou relocations d'un format
-                  non géré) ; none = ni table ni JNI_OnLoad.
+                  tables_found = au moins une entrée de table JNINativeMethod reconstruite
+                  (registered[] non vide) ; unresolved = JNI_OnLoad exporté mais aucune table
+                  reconstruite (noms ou signatures chiffrés, construits à l'exécution, ou
+                  relocations d'un format non géré) ; none = ni table ni JNI_OnLoad.
   static_exports[]
                   Exports Java_* démanglés selon les règles JNI : _1 → _, _2 → ;, _3 → [,
                   _0xxxx → unité UTF-16 xxxx, _ seul → /, __ sépare le nom des arguments.
@@ -1848,7 +1917,20 @@ JNI (elfs[].jni)
                   résolution des relocations relatives, base de chargement 0.
                   fn_offset = adresse virtuelle de la fonction ; table_offset = adresse
                   virtuelle de la table ; thumb = bit 0 de fnPtr à 1 sur ARM 32 bits
-                  (code Thumb ; bit effacé dans fn_offset).
+                  (code Thumb ; bit effacé dans fn_offset). Un name qui commence par
+                  SwigDirector_ n'est jamais une entrée (voir swig_director_upcalls).
+                  Avec --native-disasm, s'y ajoutent, avant la liaison, les entrées lues à
+                  la table passée à RegisterNatives ou à jniRegisterNativeMethods
+                  (registered_by_code) qui n'y figurent pas déjà (même name, signature et
+                  fn_offset) ; table_offset = adresse passée en argument.
+  swig_director_upcalls[]
+                  Tables {method, signature} du code généré par SWIG pour ses directors
+                  (swig_module_init les passe à GetStaticMethodID) : name commence par
+                  SwigDirector_, signature conforme à la grammaire ci-dessous, par pas de
+                  deux pointeurs dans les mêmes régions que registered[]. Ce sont des
+                  méthodes Java statiques NON natives que le natif appelle (upcalls) : ni
+                  liées, ni native_unclaimed. table_offset = adresse virtuelle de la
+                  table. Absent si vide.
 
   Grammaire d'une signature JNI (descripteur complet, chaîne entière) :
     \\((\\[*([ZBCSIJFDV]|L[^;]+;))*\\)\\[*([ZBCSIJFDV]|L[^;]+;)
@@ -1928,7 +2010,11 @@ DÉSASSEMBLAGE (elfs[].disasm) — avec --native-disasm seulement, absent sinon
                   main = fonction passée à __libc_init (3e argument) ou
                   __libc_start_main (1er argument) par le point d'entrée d'un
                   exécutable, quand cet argument est connu au site d'appel (import par
-                  PLT ou GOT) et tombe dans un segment LOAD exécutable ; désassemblée
+                  PLT ou GOT) et tombe dans un segment LOAD exécutable ; l'argument peut
+                  être lu dans un emplacement de GOT, relogé ou nommant par
+                  R_*_GLOB_DAT un symbole défini ; un thunk (saut direct inconditionnel,
+                  ou ldr pc sur un littéral, vers une fonction interne : `b main` du
+                  crtbegin de bionic ancien) est traversé, 4 sauts au plus ; désassemblée
                   comme un point d'entrée, même avec --disasm-depth 0 ; callee =
                   fonction interne appelée directement par une fonction déjà
                   désassemblée, jusqu'à --disasm-depth niveaux (0 = points d'entrée
@@ -2008,7 +2094,13 @@ DÉSASSEMBLAGE (elfs[].disasm) — avec --native-disasm seulement, absent sinon
                   est l'env ou la JavaVM : les arguments de jni.h occupent les mêmes
                   registres que sous la forme vtable (FindClass : nom en x1 / r1 ;
                   Get*ID : nom en x2 / r2, signature en x3 / r3 ; RegisterNatives :
-                  table en x2 / r2, nombre en x3 / r3).
+                  table en x2 / r2, nombre en x3 / r3) ; jnihelp = appel direct (plt,
+                  internal, ou emplacement de GOT) de jniRegisterNativeMethods(env,
+                  className, gMethods, numMethods) de libnativehelper JNIHelp, symbole
+                  exact ou surcharge C++ _Z24jniRegisterNativeMethods… : rangé sous
+                  RegisterNatives (index 215), className est une chaîne C en x1 / r1,
+                  table et nombre aux mêmes registres ; le symbole tient lieu de preuve
+                  de l'env.
       resolved    true = l'appel est attribué à JNIEnv avec preuve (env suivi, premier
                   argument d'une fonction JNI ou écrit par GetEnv / AttachCurrentThread,
                   ou symbole de wrapper) ET tous les arguments décodés pour cette
@@ -2018,24 +2110,28 @@ DÉSASSEMBLAGE (elfs[].disasm) — avec --native-disasm seulement, absent sinon
                   env_unproven = forme vtable sans env prouvé, qui est aussi la forme
                   d'un appel virtuel C++ ; class_unresolved = nom de classe de FindClass
                   inconnu, ou jclass de Get*ID / RegisterNatives qui ne vient pas d'un
-                  FindClass suivi ; name_unresolved, signature_unresolved = chaîne de
+                  FindClass suivi, ou className de jniRegisterNativeMethods inconnu ;
+                  name_unresolved, signature_unresolved = chaîne de
                   Get*ID inconnue ; table_unresolved = aucune entrée JNINativeMethod lue
                   pour RegisterNatives.
       class, method, signature
                   Chaînes passées en argument dans la même fonction pour FindClass,
-                  Get[Static]MethodID, Get[Static]FieldID, RegisterNatives (class en
-                  forme L…;) ; absents sinon. Valeurs suivies jusqu'au site d'appel à
-                  travers adrp+add, adr, ldr littéral, mov / orr registre, add #imm,
-                  movw / movt, ldr [pc, #imm] + add pc, et la pile (str / stur puis
-                  ldr / ldur à la même adresse sp ou fp + décalage).
+                  Get[Static]MethodID, Get[Static]FieldID, RegisterNatives,
+                  jniRegisterNativeMethods (class en forme L…;) ; absents sinon. Valeurs
+                  suivies jusqu'au site d'appel à travers adrp+add, adr, ldr littéral,
+                  mov / orr registre, add #imm, movw / movt, ldr [pc, #imm] + add pc,
+                  ldr / str [rn, rm] et [pc, rm] sans décalage ni réécriture (ARM, GOT
+                  indexée du code PIC), et la pile (str / stur puis ldr / ldur à la même
+                  adresse sp ou fp + décalage).
     syscalls[]    svc, swi, syscall, sysenter, int 0x80 ; number = valeur de x8, r7, rax
                   ou eax si elle est connue à cet endroit, null sinon.
   upcalls[]       {class, name, signature} des Get[Static]MethodID / Get[Static]FieldID
                   dont la classe vient d'un FindClass suivi.
   registered_by_code[]
                   {class, name, signature} des entrées JNINativeMethod passées à
-                  RegisterNatives quand la classe vient d'un FindClass de la même fonction
-                  (voir disambiguated_by).
+                  RegisterNatives quand la classe vient d'un FindClass de la même fonction,
+                  ou à jniRegisterNativeMethods quand className est connu (voir
+                  disambiguated_by). Reversées dans jni.registered avant la liaison.
   imports_called  Imports appelés par les fonctions désassemblées, par catégorie de la
                   table des imports ; other = hors table.
   invalid_paths_count
@@ -2086,6 +2182,8 @@ ANOMALIES (elfs[].anomalies, code avant « : », détail après)
                   chemin sur les mêmes octets (détail : octets et nombre de fonctions).
                   Un motif répété désigne des octets poubelle derrière des prédicats
                   opaques plutôt que du code, signe d'obfuscation par aplatissement.
+                  Les fonctions invalid_entry ne comptent pas : leur seul chemin abandonné
+                  est leur point d'entrée (racine erronée), pas un bloc mort.
 ";
 
 /// Légende autonome : chaque champ, statut, catégorie et anomalie de `--native`.
@@ -2330,6 +2428,42 @@ mod tests {
             thumb: true,
         };
         assert_eq!(found, vec![expected]);
+    }
+
+    /// Table SWIG {method, signature} dont les chaînes partagent le segment
+    /// exécutable : lue par pas de trois, elle passerait pour une table JNI.
+    #[test]
+    fn swig_director_tables_are_not_jni_entries() {
+        let mut data = vec![0u8; 0x70];
+        put(&mut data, 0x00, b"SwigDirector_A_run\0");
+        put(&mut data, 0x14, b"(LA;)V\0");
+        put(&mut data, 0x20, b"SwigDirector_A_get\0");
+        put(&mut data, 0x34, b"(LA;)I\0");
+        for (i, word) in [0x00u32, 0x14, 0x20, 0x34].into_iter().enumerate() {
+            put(&mut data, 0x60 + 4 * i, &word.to_le_bytes());
+        }
+        let image = Image {
+            data: &data,
+            ptr_size: 4,
+            big_endian: false,
+            machine: elf::EM_ARM,
+            segments: vec![
+                load(0, 0, 0x60, elf::PF_R | elf::PF_X),
+                load(0x60, 0x1060, 0x10, elf::PF_R | elf::PF_W),
+            ],
+            sections: Vec::new(),
+        };
+        assert!(scan_jni_tables(&image, &HashMap::new()).is_empty());
+        let upcall = |name: &str, signature: &str| SwigUpcall {
+            name: name.into(),
+            signature: signature.into(),
+            table_offset: "0x1060".into(),
+        };
+        let expected = vec![
+            upcall("SwigDirector_A_run", "(LA;)V"),
+            upcall("SwigDirector_A_get", "(LA;)I"),
+        ];
+        assert_eq!(scan_swig_tables(&image, &HashMap::new()), expected);
     }
 
     #[test]
@@ -2650,6 +2784,8 @@ mod tests {
             "form",
             "unresolved_reason",
             "TABLE JavaVM",
+            "swig_director_upcalls",
+            SWIG_DIRECTOR_PREFIX,
         ];
         for label in labels {
             assert!(legend.contains(label), "{label}");

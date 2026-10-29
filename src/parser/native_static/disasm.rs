@@ -46,6 +46,12 @@ const CALL_UNRESOLVED: &str = "unresolved";
 
 const FORM_VTABLE: &str = "vtable";
 const FORM_CXX_WRAPPER: &str = "cxx_wrapper";
+const FORM_JNIHELP: &str = "jnihelp";
+
+/// libnativehelper `JNIHelp.h` : `jniRegisterNativeMethods(env, className,
+/// gMethods, numMethods)`, extern "C" ; `_Z24` préfixe sa surcharge C++.
+const JNIHELP_REGISTER: &str = "jniRegisterNativeMethods";
+const JNIHELP_REGISTER_CXX: &str = "_Z24jniRegisterNativeMethods";
 
 const UNRESOLVED_ENV: &str = "env_unproven";
 const UNRESOLVED_CLASS: &str = "class_unresolved";
@@ -59,6 +65,7 @@ const MAX_STRING_BYTES: usize = 256;
 const MAX_REGISTER_ENTRIES: u64 = 512;
 const MAX_INIT_ARRAY: u64 = 4096;
 const PLT_STUB_INSNS: usize = 6;
+const MAX_THUNK_HOPS: usize = 4;
 const OPAQUE_DEAD_CODE_MIN: usize = 3;
 
 /// Imports qui ne rendent jamais la main : un appel direct vers l'un d'eux
@@ -111,6 +118,9 @@ pub struct ElfDisasm {
     pub registered_by_code: Vec<JavaMember>,
     pub imports_called: BTreeMap<&'static str, Vec<String>>,
     pub invalid_paths_count: usize,
+    /// Entrées de `registered_by_code`, sous la forme de `jni.registered`.
+    #[serde(skip)]
+    pub(super) tables_by_code: Vec<RegisteredMethod>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -293,6 +303,26 @@ pub(super) fn disambiguate(elfs: &[ElfReport], binding: &mut [Binding]) {
     }
 }
 
+/// Ajoute à `jni.registered` les entrées lues à la table passée à
+/// RegisterNatives ou jniRegisterNativeMethods que le scan des données n'a pas
+/// trouvées, puis recalcule `jni_registration`. Avant la liaison.
+pub(super) fn adopt_tables(report: &mut ElfReport) {
+    let Some(disasm) = &report.disasm else {
+        return;
+    };
+    for method in &disasm.tables_by_code {
+        let known = report.jni.registered.iter().any(|r| {
+            r.name == method.name
+                && r.signature == method.signature
+                && r.fn_offset == method.fn_offset
+        });
+        if !known {
+            report.jni.registered.push(method.clone());
+        }
+    }
+    report.jni.jni_registration = registration_status(&report.jni);
+}
+
 fn disassemble(bytes: &[u8], report: &ElfReport, options: &DisasmOptions) -> ElfDisasm {
     let Ok(parsed) = parse_elf(bytes) else {
         return ElfDisasm::default();
@@ -322,6 +352,7 @@ fn disassemble(bytes: &[u8], report: &ElfReport, options: &DisasmOptions) -> Elf
         ctx.starts.insert(address);
         let slot = ctx.symbols.entry(address);
         slot.or_insert_with(|| (sym.name.clone(), sym.size));
+        ctx.defined.entry(sym.name.clone()).or_insert(sym.value);
     }
 
     let mut entries = Vec::new();
@@ -637,6 +668,8 @@ struct Ctx<'a> {
     got: HashMap<u64, String>,
     /// Adresse de fonction → (nom, st_size).
     symbols: HashMap<u64, (String, u64)>,
+    /// Nom de fonction définie → st_value, bit Thumb compris.
+    defined: HashMap<String, u64>,
     starts: HashSet<u64>,
     plt_got: Option<u64>,
     plt_cache: RefCell<HashMap<u64, Option<String>>>,
@@ -653,6 +686,7 @@ impl<'a> Ctx<'a> {
             slots: HashMap::new(),
             got: HashMap::new(),
             symbols: HashMap::new(),
+            defined: HashMap::new(),
             starts: HashSet::new(),
             plt_got: None,
             plt_cache: RefCell::new(HashMap::new()),
@@ -834,8 +868,24 @@ impl Machine {
                 let base = self.get(reg);
                 self.load_from(ctx, base, off, width)
             }
+            Addr::Index(..) | Addr::PcIndex(..) => match self.index_place(ctx, addr) {
+                Some(place) => self.load_from(ctx, place, 0, width),
+                None => self.fresh(),
+            },
             Addr::Unknown => self.fresh(),
         }
+    }
+
+    /// `base + index`, à la largeur d'un pointeur ; `None` si l'index est inconnu.
+    fn index_place(&mut self, ctx: &Ctx, addr: Addr) -> Option<Val> {
+        let (base, index) = match addr {
+            Addr::Index(base, index) => (self.get(base), index),
+            Addr::PcIndex(pc, index) => (Val::Const(pc), index),
+            _ => return None,
+        };
+        let index = self.get(index);
+        let off = self.materialize(ctx, index)?;
+        Some(self.add(ctx, base, off as i64))
     }
 
     fn load_from(&mut self, ctx: &Ctx, base: Val, off: i64, width: u64) -> Val {
@@ -877,6 +927,10 @@ impl Machine {
                 let base = self.get(reg);
                 self.add(ctx, base, off)
             }
+            Addr::Index(..) | Addr::PcIndex(..) => match self.index_place(ctx, addr) {
+                Some(place) => place,
+                None => return,
+            },
             Addr::Unknown => return,
         };
         self.store_at(ctx, place, value);
@@ -1041,6 +1095,36 @@ fn resolve_plt(ctx: &Ctx, at: u64) -> Option<String> {
     None
 }
 
+/// Thunk vers main (crtbegin de bionic ancien : `add r2, pc, #4` désigne un
+/// `b main`) : saut direct inconditionnel, ou `ldr pc` sur un littéral, suivi
+/// tant que la cible est une fonction interne.
+fn through_thunks(ctx: &Ctx, mut address: u64, mut thumb: bool) -> (u64, bool) {
+    let Some(arch) = ctx.arch else {
+        return (address, thumb);
+    };
+    for _ in 0..MAX_THUNK_HOPS {
+        let Some(code) = ctx.image.code_window(address) else {
+            break;
+        };
+        let Ok(insn) = decode(arch, code, address, thumb) else {
+            break;
+        };
+        let (target, mode) = match insn.flow {
+            Flow::Jump(target, mode) => (target, mode),
+            Flow::JumpVia(Via::Mem(Addr::Abs(at))) => match pointer(&ctx.image, &ctx.slots, at) {
+                Some(value) => split_thumb(arch == Arch::Arm, value),
+                None => break,
+            },
+            _ => break,
+        };
+        if !callable(ctx, target) || plt_import(ctx, target, mode).is_some() {
+            break;
+        }
+        (address, thumb) = (target, mode);
+    }
+    (address, thumb)
+}
+
 /// `__x86.get_pc_thunk.*` : `mov reg, [esp]; ret`. Rend le registre écrit.
 fn pc_thunk(ctx: &Ctx, target: u64) -> Option<u8> {
     let code = ctx.image.code_window(target)?;
@@ -1164,6 +1248,7 @@ struct Analyzed {
     mains: Vec<Entry>,
     upcalls: Vec<JavaMember>,
     registered: Vec<JavaMember>,
+    tables: Vec<RegisteredMethod>,
 }
 
 impl Analyzed {
@@ -1174,6 +1259,7 @@ impl Analyzed {
             mains: Vec::new(),
             upcalls: Vec::new(),
             registered: Vec::new(),
+            tables: Vec::new(),
         }
     }
 }
@@ -1358,6 +1444,7 @@ impl Walk<'_, '_> {
         if let Some(name) = plt_import(ctx, target, mode) {
             let wrapper = cxx_wrapper(&name);
             self.libc_main(&name);
+            self.jnihelp_register(&name);
             self.calls.push(DisasmCall {
                 target: Some(hex(target)),
                 import: Some(name),
@@ -1368,6 +1455,9 @@ impl Walk<'_, '_> {
         }
         let symbol = ctx.symbols.get(&target).map(|(name, _)| name.clone());
         let wrapper = symbol.as_deref().and_then(cxx_wrapper);
+        if let Some(name) = &symbol {
+            self.jnihelp_register(name);
+        }
         self.calls.push(DisasmCall {
             target: Some(hex(target)),
             import: None,
@@ -1413,6 +1503,7 @@ impl Walk<'_, '_> {
             if let Some(name) = ctx.got.get(&slot) {
                 let wrapper = cxx_wrapper(name);
                 self.libc_main(name);
+                self.jnihelp_register(name);
                 self.calls.push(DisasmCall {
                     target: None,
                     import: Some(name.clone()),
@@ -1447,10 +1538,20 @@ impl Walk<'_, '_> {
         };
         let ctx = self.ctx;
         let value = self.arg(index);
-        let Some(target) = self.machine.materialize(ctx, value) else {
-            return;
+        // Emplacement de GOT relogé par R_*_GLOB_DAT sur un symbole défini.
+        let by_symbol = match value {
+            Val::Mem(slot) => ctx.got.get(&slot).and_then(|name| ctx.defined.get(name)),
+            _ => None,
+        };
+        let target = match by_symbol {
+            Some(&raw) => raw,
+            None => match self.machine.materialize(ctx, value) {
+                Some(target) => target,
+                None => return,
+            },
         };
         let (address, thumb) = split_thumb(self.arch == Arch::Arm, target);
+        let (address, thumb) = through_thunks(ctx, address, thumb);
         if callable(ctx, address) {
             let main = entry(address, thumb, ORIGIN_MAIN, Val::Opaque(0));
             self.out.mains.push(main);
@@ -1596,21 +1697,43 @@ impl Walk<'_, '_> {
             None => MAX_REGISTER_ENTRIES,
         };
         let stride = 3 * ctx.image.ptr_size;
+        let table = hex(at);
         let before = self.out.registered.len();
         for _ in 0..limit {
-            let Some(method) = jni_entry_at(&ctx.image, &ctx.slots, at) else {
+            let Some(mut method) = jni_entry_at(&ctx.image, &ctx.slots, at) else {
                 break;
             };
             let member = JavaMember {
                 class: class.to_string(),
-                name: method.name,
-                signature: method.signature,
+                name: method.name.clone(),
+                signature: method.signature.clone(),
                 fn_address: parse_hex(&method.fn_offset),
             };
             self.out.registered.push(member);
+            method.table_offset = table.clone();
+            self.out.tables.push(method);
             at = at.wrapping_add(stride);
         }
         self.out.registered.len() > before
+    }
+
+    /// `jniRegisterNativeMethods(env, className, gMethods, numMethods)` :
+    /// RegisterNatives sur la classe nommée par une chaîne C, arguments aux
+    /// mêmes positions. Le symbole tient lieu de preuve de l'env.
+    fn jnihelp_register(&mut self, function: &str) {
+        if function != JNIHELP_REGISTER && !function.starts_with(JNIHELP_REGISTER_CXX) {
+            return;
+        }
+        let index = jni::REGISTER_NATIVES;
+        let mut call = JniCall::new(jni::JNI_NATIVE_INTERFACE[index], index, FORM_JNIHELP);
+        call.class = self.string_arg(1).map(|name| class_descriptor(&name));
+        let missing = match call.class.clone() {
+            Some(class) => (!self.registered_by_code(&class)).then_some(UNRESOLVED_TABLE),
+            None => Some(UNRESOLVED_CLASS),
+        };
+        call.resolved = missing.is_none();
+        call.unresolved_reason = missing;
+        self.out.function.jni_calls.push(call);
     }
 
     fn invoke_call(&mut self, off: u64) {
@@ -1693,6 +1816,11 @@ fn walk_functions(ctx: &Ctx, entries: Vec<Entry>, options: &DisasmOptions) -> El
             }
             push_unique(&mut out.upcalls, analyzed.upcalls);
             push_unique(&mut out.registered_by_code, analyzed.registered);
+            for method in analyzed.tables {
+                if !out.tables_by_code.contains(&method) {
+                    out.tables_by_code.push(method);
+                }
+            }
             out.functions.push(analyzed.function);
         }
         level = next;
@@ -1703,10 +1831,14 @@ fn walk_functions(ctx: &Ctx, entries: Vec<Entry>, options: &DisasmOptions) -> El
 }
 
 /// Anomalie `opaque_dead_code` : mêmes octets invalides dans au moins
-/// [`OPAQUE_DEAD_CODE_MIN`] fonctions.
+/// [`OPAQUE_DEAD_CODE_MIN`] fonctions. Une fonction invalid_entry ne compte
+/// pas : son seul chemin abandonné est sa racine, pas un bloc mort.
 fn opaque_dead_code(functions: &[DisasmFunction]) -> Option<String> {
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     for function in functions {
+        if function.disasm_status == STATUS_INVALID_ENTRY {
+            continue;
+        }
         let mut distinct: Vec<&str> = Vec::new();
         for path in &function.invalid_paths {
             let bytes = path.bytes.as_str();
@@ -2527,6 +2659,92 @@ mod tests {
         assert_eq!(import, Some("__libc_init"));
     }
 
+    /// crtbegin de bionic ancien : r2 désigne un `b main`, tail-call de
+    /// __libc_init par la PLT.
+    const ARM_LIBC_INIT_THUNK: &[(u32, &str)] = &[
+        (0xe1a0000d, "1000  mov  r0, sp"),
+        (0xe3a01000, "1004  mov  r1, #0"),
+        (0xe28f2004, "1008  add  r2, pc, #4     ; 0x1014"),
+        (0xe28f3004, "100c  add  r3, pc, #4     ; 0x1018"),
+        (0xea0001fa, "1010  b    0x1800         ; __libc_init@plt"),
+        (0xea000039, "1014  b    0x1100         ; main"),
+    ];
+
+    #[test]
+    fn arm_main_behind_a_branch_thunk_becomes_a_root() {
+        let mut data = vec![0u8; 0x4000];
+        assemble(&mut data, CODE, ARM_LIBC_INIT_THUNK);
+        put(&mut data, 0x1100, &0xe12fff1eu32.to_le_bytes());
+        assemble(&mut data, 0x1800, ARM_PLT);
+        let dynamic = jump_slot(&mut data, 0x348c, "__libc_init", true);
+        let mut ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        let disasm = walk_functions(&ctx, vec![exec_entry(CODE)], &options(0, 100));
+        let expected = [
+            ("0x1000", ORIGIN_ENTRY, STATUS_OK),
+            ("0x1100", ORIGIN_MAIN, STATUS_OK),
+        ];
+        assert_eq!(origins(&disasm), expected);
+    }
+
+    /// main lu dans un emplacement de GOT (0x3010) que R_*_GLOB_DAT reloge sur
+    /// le symbole défini main : le fichier y porte 0.
+    const A64_LIBC_INIT_GOT: &[(u32, &str)] = &[
+        (0xd0000002, "1000  adrp x2, 0x3000"),
+        (0xf9400842, "1004  ldr  x2, [x2, #0x10]"),
+        (0x940001fe, "1008  bl   0x1800         ; __libc_init@plt"),
+        (0xd65f03c0, "100c  ret"),
+    ];
+
+    #[test]
+    fn aarch64_main_from_a_got_slot_becomes_a_root() {
+        let mut data = vec![0u8; 0x4000];
+        assemble(&mut data, CODE, A64_LIBC_INIT_GOT);
+        put(&mut data, 0x2100, &0xd65f03c0u32.to_le_bytes());
+        assemble(&mut data, 0x1800, A64_PLT);
+        let dynamic = jump_slot(&mut data, 0x3000, "__libc_init", false);
+        let mut ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        ctx.got.insert(0x3010, "main".to_string());
+        ctx.defined.insert("main".to_string(), 0x2100);
+        let disasm = walk_functions(&ctx, vec![exec_entry(CODE)], &options(0, 100));
+        let expected = [
+            ("0x1000", ORIGIN_ENTRY, STATUS_OK),
+            ("0x2100", ORIGIN_MAIN, STATUS_OK),
+        ];
+        assert_eq!(origins(&disasm), expected);
+    }
+
+    /// PIC ARM : décalage de GOT en littéral, puis `ldr r2, [pc, r2]`.
+    const ARM_LIBC_INIT_PC_INDEXED: &[(u32, &str)] = &[
+        (0xe59f2008, "1000  ldr  r2, [pc, #8]   ; 0x1010"),
+        (0xe79f2002, "1004  ldr  r2, [pc, r2]   ; 0x100c + 0x2000"),
+        (0xeb0001fc, "1008  bl   0x1800         ; __libc_init@plt"),
+        (0xe12fff1e, "100c  bx   lr"),
+        (
+            0x00002000,
+            "1010  littéral : décalage de l'emplacement de main",
+        ),
+    ];
+
+    #[test]
+    fn arm_main_through_a_pc_indexed_got_load_becomes_a_root() {
+        let mut data = vec![0u8; 0x4000];
+        assemble(&mut data, CODE, ARM_LIBC_INIT_PC_INDEXED);
+        put(&mut data, 0x300c, &0x1100u32.to_le_bytes());
+        put(&mut data, 0x1100, &0xe12fff1eu32.to_le_bytes());
+        assemble(&mut data, 0x1800, ARM_PLT);
+        let dynamic = jump_slot(&mut data, 0x348c, "__libc_init", true);
+        let mut ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        let disasm = walk_functions(&ctx, vec![exec_entry(CODE)], &options(0, 100));
+        let expected = [
+            ("0x1000", ORIGIN_ENTRY, STATUS_OK),
+            ("0x1100", ORIGIN_MAIN, STATUS_OK),
+        ];
+        assert_eq!(origins(&disasm), expected);
+    }
+
     /// AArch64 : FindClass par le wrapper C++ de jni.h, appelé par sa PLT.
     const A64_CXX_FIND_CLASS: &[(u32, &str)] = &[
         (0xb0000001, "1000  adrp x1, 0x2000"),
@@ -2604,6 +2822,63 @@ mod tests {
         assert_eq!(forms, [FORM_VTABLE, FORM_CXX_WRAPPER]);
         let run = member("Lcom/foo/Bar;", "run", "()V", Some(0x1100));
         assert_eq!(out.registered, [run]);
+    }
+
+    /// JNIHelp : nom de classe en chaîne C, table JNINativeMethod en 0x2040.
+    const A64_JNIHELP_REGISTER: &[(u32, &str)] = &[
+        (0xb0000001, "1000  adrp x1, 0x2000"),
+        (0x91000021, "1004  add  x1, x1, #0x0      ; com/foo/Bar"),
+        (0xb0000002, "1008  adrp x2, 0x2000"),
+        (0x91010042, "100c  add  x2, x2, #0x40     ; table"),
+        (0x52800023, "1010  mov  w3, #1"),
+        (
+            0x940001fb,
+            "1014  bl   0x1800            ; jniRegisterNativeMethods@plt",
+        ),
+        (0xd65f03c0, "1018  ret"),
+    ];
+
+    #[test]
+    fn jnihelp_register_native_methods_registers_its_table() {
+        let mut data = vec![0u8; 0x4000];
+        strings(&mut data);
+        assemble(&mut data, CODE, A64_JNIHELP_REGISTER);
+        assemble(&mut data, 0x1800, A64_PLT);
+        for (i, value) in [0x2010u64, 0x2018, 0x1100].into_iter().enumerate() {
+            put(&mut data, 0x2040 + 8 * i as u64, &value.to_le_bytes());
+        }
+        put(&mut data, 0x1100, &0xd65f03c0u32.to_le_bytes());
+        let dynamic = jump_slot(&mut data, 0x3000, JNIHELP_REGISTER, false);
+        let mut ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        let out = analyze(&ctx, CODE, false);
+        assert_eq!(jni_names(&out.function), [("RegisterNatives", 215, true)]);
+        let call = &out.function.jni_calls[0];
+        assert_eq!(call.form, FORM_JNIHELP);
+        assert_eq!(call.class.as_deref(), Some("Lcom/foo/Bar;"));
+        let run = member("Lcom/foo/Bar;", "run", "()V", Some(0x1100));
+        assert_eq!(out.registered, [run]);
+        let entry = RegisteredMethod {
+            name: "run".into(),
+            signature: "()V".into(),
+            fn_offset: "0x1100".into(),
+            table_offset: "0x2040".into(),
+            thumb: false,
+        };
+        assert_eq!(out.tables, std::slice::from_ref(&entry));
+
+        let mut elf = ElfReport::new("lib/arm64-v8a/libovpnutil.so", &[]);
+        elf.jni.jni_onload = true;
+        elf.jni.jni_registration = registration_status(&elf.jni);
+        assert_eq!(elf.jni.jni_registration, "unresolved");
+        elf.disasm = Some(ElfDisasm {
+            tables_by_code: vec![entry.clone()],
+            ..ElfDisasm::default()
+        });
+        adopt_tables(&mut elf);
+        adopt_tables(&mut elf);
+        assert_eq!(elf.jni.registered, [entry]);
+        assert_eq!(elf.jni.jni_registration, "tables_found");
     }
 
     /// AArch64 : le nom de classe passe par la pile avant FindClass.
@@ -2831,6 +3106,18 @@ mod tests {
     }
 
     #[test]
+    fn invalid_entries_do_not_count_as_opaque_dead_code() {
+        let mut data = vec![0u8; 0x2000];
+        put(&mut data, CODE, &0xa2f2fff1u32.to_le_bytes());
+        let ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        let function = analyze(&ctx, CODE, false).function;
+        assert_eq!(function.disasm_status, STATUS_INVALID_ENTRY);
+        assert_eq!(function.invalid_paths.len(), 1);
+        let three = [function.clone(), function.clone(), function];
+        assert_eq!(opaque_dead_code(&three), None);
+    }
+
+    #[test]
     fn legend_defines_every_disasm_label() {
         let legend = legend();
         let labels = [
@@ -2865,6 +3152,8 @@ mod tests {
             CALL_UNRESOLVED,
             FORM_VTABLE,
             FORM_CXX_WRAPPER,
+            FORM_JNIHELP,
+            JNIHELP_REGISTER_CXX,
             "form",
             "unresolved_reason",
             UNRESOLVED_ENV,
