@@ -48,11 +48,12 @@
 //!
 //! # Écriture
 //!
-//! [`write_all`] n'écrit **jamais** hors du répertoire demandé : chemins
-//! normalisés, `..`, chemins absolus et séparateurs Windows refusés, collisions
-//! de noms suffixées, composants trop longs tronqués pour le système de
-//! fichiers. Le chemin ORIGINAL de l'archive reste dans le JSON — c'est lui qui
-//! sert au rapprochement, pas le nom écrit.
+//! [`write_all`] n'écrit **jamais** hors du répertoire demandé : `..`, chemins
+//! absolus et séparateurs Windows refusés, puis un fichier par asset directement
+//! sous le répertoire, nommé par la règle de `--extract-libs`
+//! ([`super::flat_output_name`]), collisions suffixées. Le chemin ORIGINAL de
+//! l'archive reste dans le JSON — c'est lui qui sert au rapprochement, pas le
+//! nom écrit.
 //!
 //! # Filtrage par hash connu
 //!
@@ -81,8 +82,8 @@ use std::path::{Path, PathBuf};
 /// faux négatif silencieux.
 const ASSETS_PREFIX: &str = "assets/";
 
-/// Longueur max d'un composant de chemin à l'écriture. 255 octets est la limite
-/// commune d'ext4 et d'APFS ; au-delà le nom est tronqué et l'original consigné.
+/// Longueur max d'un nom écrit. 255 octets est la limite commune d'ext4 et
+/// d'APFS.
 const MAX_COMPONENT: usize = 255;
 
 /// Valeur portée par `sha256` et `kind` quand l'entrée n'a pas été lue, donc pas
@@ -305,8 +306,8 @@ pub struct AssetEntry {
     /// Chemin réellement écrit sur disque, renseigné par [`write_all`].
     /// `None` en inventaire seul, ou si l'écriture a été refusée.
     pub written: Option<String>,
-    /// Trace d'une divergence à l'écriture : refus (traversée de chemin),
-    /// troncature de nom, suffixe de collision, erreur d'E/S.
+    /// Trace d'une divergence à l'écriture : refus (traversée de chemin), nom
+    /// raccourci, suffixe de collision, erreur d'E/S.
     pub note: Option<String>,
     /// Octets complets, en mémoire. Exclus de la sérialisation (binaire).
     #[serde(skip)]
@@ -811,8 +812,8 @@ fn file_sha256(path: &Path) -> Result<String> {
 // Écriture
 // ---------------------------------------------------------------------------
 
-/// Écrit les assets retenus sous `dir`, en reproduisant l'arborescence de
-/// l'archive, puis y dépose `assets.json` (le rapport sérialisé).
+/// Écrit les assets retenus à plat sous `dir`, un fichier par asset nommé par
+/// [`sanitize`], puis y dépose `assets.json` (le rapport sérialisé).
 ///
 /// Chaque entrée est annotée : [`AssetEntry::written`] porte le chemin
 /// réellement écrit, [`AssetEntry::note`] la raison d'un refus ou la trace
@@ -831,7 +832,7 @@ pub fn write_all(report: &mut AssetsReport, dir: &Path) -> Result<PathBuf> {
             // raison, `written` reste None.
             continue;
         }
-        let (rel, mut note) = match sanitize(&e.entry) {
+        let (name, mut note) = match sanitize(&e.entry) {
             Ok(v) => v,
             Err(why) => {
                 e.note = Some(format!("non écrit : {why}"));
@@ -840,7 +841,7 @@ pub fn write_all(report: &mut AssetsReport, dir: &Path) -> Result<PathBuf> {
             }
         };
 
-        let mut dest = root.join(&rel);
+        let mut dest = root.join(&name);
         // Ultime garde-fou : même construit à partir de composants assainis, le
         // chemin doit rester sous la racine.
         if !dest.starts_with(&root) {
@@ -854,18 +855,6 @@ pub fn write_all(report: &mut AssetsReport, dir: &Path) -> Result<PathBuf> {
                 None => "collision de nom suffixée".to_string(),
             });
             dest = unique;
-        }
-
-        if let Some(parent) = dest.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                // Typiquement un `assets/a` fichier et un `assets/a/b` fichier
-                // dans la même archive : le parent existe déjà comme fichier.
-                e.note = Some(format!(
-                    "non écrit : création de {} — {err}",
-                    parent.display()
-                ));
-                continue;
-            }
         }
 
         // Le résultat est lié avant le match : l'emprunt de `e.bytes` se termine
@@ -888,13 +877,15 @@ pub fn write_all(report: &mut AssetsReport, dir: &Path) -> Result<PathBuf> {
     Ok(json_path)
 }
 
-/// Normalise un chemin d'archive en chemin relatif sûr.
+/// Nom de fichier sûr pour un chemin d'archive : composants `""` et `.` retirés,
+/// puis aplatis par la règle de [`super::flat_output_name`] (SHA-256 du chemin
+/// d'archive ORIGINAL au-delà de 200 octets).
 ///
 /// Rend `Err(raison)` sur `..`, chemin absolu, séparateur Windows ou préfixe de
 /// lecteur — aucune écriture hors du répertoire de sortie, jamais. Rend aussi
-/// une note quand un composant a dû être tronqué pour le système de fichiers :
-/// le nom ORIGINAL reste dans `entry`, seul le nom écrit est raccourci.
-fn sanitize(entry: &str) -> std::result::Result<(PathBuf, Option<String>), String> {
+/// une note quand le nom a été raccourci : le chemin ORIGINAL reste dans
+/// `entry`.
+fn sanitize(entry: &str) -> std::result::Result<(String, Option<String>), String> {
     if entry.contains('\\') {
         return Err("séparateur Windows dans le chemin".to_string());
     }
@@ -902,8 +893,7 @@ fn sanitize(entry: &str) -> std::result::Result<(PathBuf, Option<String>), Strin
         return Err("chemin absolu".to_string());
     }
 
-    let mut parts: Vec<String> = Vec::new();
-    let mut truncated = false;
+    let mut parts: Vec<&str> = Vec::new();
     for c in entry.split('/') {
         match c {
             "" | "." => continue,
@@ -913,19 +903,17 @@ fn sanitize(entry: &str) -> std::result::Result<(PathBuf, Option<String>), Strin
         if c.len() >= 2 && c.as_bytes()[1] == b':' && c.as_bytes()[0].is_ascii_alphabetic() {
             return Err("préfixe de lecteur Windows".to_string());
         }
-        if c.len() > MAX_COMPONENT {
-            truncated = true;
-            parts.push(truncate_bytes(c, MAX_COMPONENT).to_string());
-        } else {
-            parts.push(c.to_string());
-        }
+        parts.push(c);
     }
 
     if parts.is_empty() {
         return Err("chemin vide après normalisation".to_string());
     }
-    let note = truncated.then(|| "nom tronqué pour le système de fichiers".to_string());
-    Ok((parts.iter().collect(), note))
+    let flat = parts.join("__");
+    let name = super::output_file_name(&flat, entry);
+    let note =
+        (name != flat).then(|| "nom raccourci : préfixe + SHA-256 du chemin d'archive".to_string());
+    Ok((name, note))
 }
 
 /// Tronque à `max` octets sans couper un caractère UTF-8 en deux.
@@ -1146,8 +1134,12 @@ type                 Type déduit des OCTETS DE TÊTE, jamais de l'extension : d
 entropie             Entropie de Shannon en bits par octet (0.00-8.00), 2 décimales. > 7.90 =
                      chiffré ou déjà compressé : c'est ce qui fait ressortir les charges de packer
                      déposées dans assets/. Un texte est vers 4-5, un DEX en clair vers 6.
-chemin_ecrit         (--extract-assets) Chemin réellement écrit. \"-\" suivi d'une raison si
-                     l'entrée a été refusée (traversée de chemin) ou si l'écriture a échoué.
+chemin_ecrit         (--extract-assets) Chemin réellement écrit : DIR/<nom aplati>, règle de
+                     --extract-libs et --extract-entry (composants vides et \".\" retirés, \"/\"
+                     -> \"__\" : assets/sub/x.bin -> assets__sub__x.bin ; au-delà de 200 octets,
+                     <préfixe>__<sha256 COMPLET du chemin d'archive><.ext d'origine>, et note
+                     le dit). \"-\" suivi d'une raison si l'entrée a été refusée (traversée de
+                     chemin) ou si l'écriture a échoué.
 
 fingerprint          SHA-256 de la liste TRIÉE des lignes \"chemin<TAB>sha256\", chacune terminée
                      par un saut de ligne. Axe de regroupement : deux APK de la même famille
@@ -1213,9 +1205,10 @@ Le module ne déballe PAS récursivement : un asset qui est lui-même un ZIP, un
 typé et écrit tel quel. Le déballage reste une opération explicite (repasser le fichier à drakkar).
 
 Sécurité d'écriture (zip-slip) : \"..\", chemin absolu, séparateur Windows et préfixe de lecteur
-sont REFUSÉS ; les composants de plus de 255 octets sont tronqués et les collisions suffixées
-(-1, -2, …), l'entrée conservant son chemin d'origine dans le JSON. Rien n'est écrit hors du
-répertoire de sortie."
+sont REFUSÉS. Les assets sont écrits À PLAT, l'arborescence de l'archive n'est pas recréée : le
+nom écrit est le chemin aplati (voir chemin_ecrit), raccourci au-delà de 200 octets, ce qui
+borne aussi la longueur totale du chemin. Les collisions sont suffixées (-1, -2, …), l'entrée
+conservant son chemin d'origine dans le JSON. Rien n'est écrit hors du répertoire de sortie."
 }
 
 #[cfg(test)]
@@ -1461,12 +1454,40 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_truncates_long_component_and_notes_it() {
-        let long = "a".repeat(400);
-        let (rel, note) = sanitize(&format!("assets/{long}")).unwrap();
-        assert!(note.is_some());
-        let last = rel.file_name().unwrap().to_string_lossy().into_owned();
-        assert_eq!(last.len(), MAX_COMPONENT);
+    fn sanitize_flattens_like_extract_libs() {
+        let (name, note) = sanitize("assets/./sub/x.bin").unwrap();
+        assert_eq!(name, "assets__sub__x.bin");
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn sanitize_shortens_long_unicode_path_and_notes_it() {
+        let entry = format!("assets/{}/cordEX.json", "répertoire/".repeat(40));
+        let (name, note) = sanitize(&entry).unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(entry.as_bytes()));
+        assert!(note.unwrap().contains("SHA-256"));
+        assert!(
+            name.len() <= crate::parser::MAX_OUTPUT_NAME,
+            "{}",
+            name.len()
+        );
+        assert!(name.ends_with(".json"), "{name}");
+        assert!(name.contains(&sha256), "{name}");
+        assert!(!name.contains('/'));
+    }
+
+    #[test]
+    fn write_all_handles_a_path_too_long_for_a_tree() {
+        let entry = format!("assets/{}/cordEX.json", "répertoire/".repeat(40));
+        let (_d, apk) = on_disk(&make_apk(&[(entry.as_str(), b"{}".to_vec())]));
+        let mut r = collect(&apk, &AssetsOptions::default()).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        write_all(&mut r, out.path()).unwrap();
+        let e = &r.entries[0];
+        let written = PathBuf::from(e.written.as_ref().expect("écrit"));
+        assert!(written.exists());
+        assert_eq!(e.entry, entry, "le chemin d'origine reste dans le rapport");
+        assert!(e.note.as_ref().unwrap().contains("raccourci"));
     }
 
     #[test]
@@ -1487,7 +1508,11 @@ mod tests {
             assert!(w.starts_with(&root), "{} sort du répertoire", w.display());
             assert!(w.exists());
         }
-        assert!(root.join("assets/sub/payload.bin").exists());
+        assert!(root.join("assets__sub__payload.bin").exists());
+        assert!(
+            !root.join("assets").exists(),
+            "l'arborescence n'est pas recréée"
+        );
 
         // Le JSON porte le chemin d'archive ET le chemin écrit, hash complet.
         let body = std::fs::read_to_string(&json).unwrap();
@@ -1557,7 +1582,7 @@ mod tests {
         assert!(r.entries[0].written.is_none());
         assert!(r.entries[0].note.as_ref().unwrap().contains("traversée"));
         assert!(r.entries[1].written.is_some());
-        assert!(out.path().join("assets/good.bin").exists());
+        assert!(out.path().join("assets__good.bin").exists());
     }
 
     /// A1, démonstration directe : le même contenu rangé une fois `stored` et
@@ -1834,9 +1859,9 @@ mod tests {
 
         let out = tempfile::tempdir().unwrap();
         write_all(&mut r, out.path()).unwrap();
-        assert!(out.path().join("assets/a.bin").exists());
-        assert!(!out.path().join("assets/b.bin").exists());
-        assert!(!out.path().join("assets/c.bin").exists());
+        assert!(out.path().join("assets__a.bin").exists());
+        assert!(!out.path().join("assets__b.bin").exists());
+        assert!(!out.path().join("assets__c.bin").exists());
     }
 
     /// Une entrée non lue ne produit pas un fichier vide trompeur.
@@ -1854,7 +1879,7 @@ mod tests {
 
         let out = tempfile::tempdir().unwrap();
         let json = write_all(&mut r, out.path()).unwrap();
-        assert!(!out.path().join("assets/big.bin").exists());
+        assert!(!out.path().join("assets__big.bin").exists());
         assert!(r.entries[0].written.is_none());
 
         let back: AssetsReport =

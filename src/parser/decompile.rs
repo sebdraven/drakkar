@@ -246,6 +246,9 @@ impl<'a> BundleInfo<'a> {
 pub struct ClassJava {
     pub descriptor: String,
     pub dex: String,
+    /// Valeurs initiales des champs statiques, lues par Drakkar et non par le
+    /// décompilateur.
+    pub statics: Vec<disasm::StaticInit>,
     pub java: String,
     /// Raison du repli méthode par méthode, quand `decompile_class` a échoué.
     pub fallback: Option<String>,
@@ -407,6 +410,7 @@ pub fn decompile_matching(path: &Path, patterns: &[String]) -> Result<DecompileR
             report.classes.push(ClassJava {
                 descriptor: class.descriptor.to_string(),
                 dex: dex.name.clone(),
+                statics: disasm::static_inits(&dex.bin, &class, &[]),
                 java,
                 fallback,
             });
@@ -429,6 +433,9 @@ pub fn render(r: &DecompileReport) -> String {
     let mut s = String::new();
     for c in &r.classes {
         s.push_str(&format!("// == {} — {} ==\n", c.descriptor, c.dex));
+        for st in &c.statics {
+            s.push_str(&format!("// {}\n", disasm::render_static(st)));
+        }
         if let Some(why) = &c.fallback {
             let why = why.replace(['\n', '\r'], " ");
             s.push_str(&format!(
@@ -838,16 +845,19 @@ fn render_class<'a>(
     }
 
     let sizes: Vec<usize> = dasm_methods.iter().map(|m| m.insns.len()).collect();
+    let statics = disasm::static_inits(&dex.bin, class, &[]);
+    let header = usize::from(codeless > 0) + statics.len();
     out.dasm = disasm::render(&DisasmReport {
         input: String::new(),
         classes: vec![ClassDisasm {
             descriptor: class.descriptor.to_string(),
+            statics,
             methods: dasm_methods,
             codeless,
         }],
         scanned: 0,
     });
-    match dasm_spans(&sizes, codeless, &out.dasm) {
+    match dasm_spans(&sizes, header, &out.dasm) {
         Some(spans) => {
             for (record, slot) in out.methods.iter_mut().zip(dasm_slots) {
                 record.dasm_lines = slot.map(|s| spans[s]);
@@ -952,10 +962,11 @@ fn descriptor_of(file: &DexFile, idx: u32) -> Option<String> {
 }
 
 /// Bornes `[en-tête, dernière instruction]` de chaque méthode dans la sortie de
-/// `disasm::render` pour une classe. `None` si le nombre de lignes rendu ne
+/// `disasm::render` pour une classe. `header` : lignes sous `== … ==` (méthodes
+/// sans code, valeurs statiques). `None` si le nombre de lignes rendu ne
 /// correspond pas au gabarit — un descripteur portant un saut de ligne suffit.
-fn dasm_spans(sizes: &[usize], codeless: usize, rendered: &str) -> Option<Vec<[usize; 2]>> {
-    let mut line = 1 + usize::from(codeless > 0);
+fn dasm_spans(sizes: &[usize], header: usize, rendered: &str) -> Option<Vec<[usize; 2]>> {
+    let mut line = 1 + header;
     let mut spans = Vec::with_capacity(sizes.len());
     for n in sizes {
         spans.push([line + 2, line + 2 + n]);
@@ -1271,8 +1282,8 @@ classes/<id>.class.java
   la raison est dans errors.json, stage decompile_class.
 
 classes/<id>.dasm
-  Rendu de --disasm pour la classe seule. Une méthode dont le code ne se
-  décode pas n'y figure pas.
+  Rendu de --disasm pour la classe seule, valeurs statiques comprises sous
+  l'en-tête. Une méthode dont le code ne se décode pas n'y figure pas.
 
 strings.json
   pool             Une entrée par DEX : {dex, declared, unreadable, strings}.
@@ -1330,7 +1341,12 @@ errors.json — {stage, dex, class_id, target, error}
 --decompile <MOTIF>
   Même sélection que --disasm : sous-chaîne du descripteur Dalvik, insensible
   à la casse, répétable ; sans motif, toutes les classes. Chaque classe sort
-  précédée de `// == <descripteur> — <dex> ==`, en Java de classe entière
+  précédée de `// == <descripteur> — <dex> ==`, puis d'une ligne
+  `// static <nom> : <type> = <valeur>` par champ statique doté d'une valeur
+  initiale dans l'encoded_array de static_values_off, lue par Drakkar et rendue
+  comme dans --disasm (--disasm --legend, En-tête de classe) : présentes même
+  quand le décompilateur omet l'initialiseur ou que la classe passe en repli
+  méthode par méthode, qui n'a pas de champs. Puis le Java de classe entière
   (decompile_class). Si decompile_class échoue, une ligne
   `// repli méthode par méthode — decompile_class : <raison>` précède le rendu
   de classes/<id>.java. Une classe interne nommée (A$B) sort aussi dans le Java
@@ -1367,6 +1383,7 @@ mod tests {
             input: String::new(),
             classes: vec![ClassDisasm {
                 descriptor: "La;".to_string(),
+                statics: Vec::new(),
                 methods: vec![method("a", 2), method("b", 0), method("c", 3)],
                 codeless: 1,
             }],
@@ -1381,6 +1398,60 @@ mod tests {
         assert_eq!(spans[1], [8, 8]);
         assert_eq!(spans[2], [10, 13]);
         assert!(lines[spans[2][1] - 1].starts_with("    0002"));
+    }
+
+    #[test]
+    fn bornes_dasm_comptent_les_valeurs_statiques() {
+        let statics = vec![
+            disasm::StaticInit {
+                name: "a".into(),
+                typ: "Ljava/lang/String;".into(),
+                value: "\"x\"".into(),
+            },
+            disasm::StaticInit {
+                name: "b".into(),
+                typ: "I".into(),
+                value: "1".into(),
+            },
+        ];
+        let rendered = disasm::render(&DisasmReport {
+            input: String::new(),
+            classes: vec![ClassDisasm {
+                descriptor: "La;".to_string(),
+                statics,
+                methods: vec![method("m", 1)],
+                codeless: 1,
+            }],
+            scanned: 0,
+        });
+        let spans = dasm_spans(&[1], 3, &rendered).expect("gabarit respecté");
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert!(lines[spans[0][0] - 1].starts_with("  m("));
+        assert!(dasm_spans(&[1], 1, &rendered).is_none());
+    }
+
+    #[test]
+    fn decompile_rend_les_valeurs_statiques_en_commentaire() {
+        let report = DecompileReport {
+            classes: vec![ClassJava {
+                descriptor: "Lalxu/taw/ce/dw6cyh;".into(),
+                dex: "classes.dex".into(),
+                statics: vec![disasm::StaticInit {
+                    name: "a".into(),
+                    typ: "Ljava/lang/String;".into(),
+                    value: "\"93hjbo029kfjsv79emkcxsfqu80kr5wb\"".into(),
+                }],
+                java: "class dw6cyh {}\n".into(),
+                fallback: None,
+            }],
+            scanned: 1,
+        };
+        let lines: Vec<String> = render(&report).lines().map(str::to_string).collect();
+        assert_eq!(
+            lines[1],
+            "// static a : Ljava/lang/String; = \"93hjbo029kfjsv79emkcxsfqu80kr5wb\""
+        );
+        assert_eq!(lines[2], "class dw6cyh {}");
     }
 
     #[test]

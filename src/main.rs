@@ -159,8 +159,9 @@ struct Cli {
     #[arg(long)]
     list_assets: bool,
 
-    /// Extrait les entrées `assets/` vers DIR : les fichiers, en reproduisant
-    /// l'arborescence de l'archive, plus un `assets.json` (SHA-256 de l'APK, une
+    /// Extrait les entrées `assets/` vers DIR : les fichiers à plat, nommés comme
+    /// --extract-libs (`/` -> `__`, SHA-256 du chemin d'archive au-delà de 200
+    /// octets), plus un `assets.json` (SHA-256 de l'APK, une
     /// entrée par asset avec les mêmes champs que --list-assets + le chemin
     /// réellement écrit). Un asset qui est lui-même un ZIP, un APK ou un DEX est
     /// typé et écrit TEL QUEL — pas de déballage récursif. En bulk, un
@@ -1869,7 +1870,11 @@ fn print_native_disasm(d: &drakkar::parser::native_static::ElfDisasm, full: bool
                 (Some(name), _) | (None, Some(name)) => name.as_str(),
                 (None, None) => "",
             };
-            println!("      call     {kind:<9} {target}  {name}");
+            let via = match &c.veneer {
+                Some(veneer) => format!("  (veneer {veneer})"),
+                None => String::new(),
+            };
+            println!("      call     {kind:<9} {target}  {name}{via}");
         }
         for j in &f.jni_calls {
             let (name, index, form) = (j.name, j.index, j.form);
@@ -1952,7 +1957,7 @@ fn print_and_dump_extract(
             ""
         };
         // nom de sortie aplati : lib/arm64-v8a/foo.so -> lib__arm64-v8a__foo.so
-        let flat = parser::output_file_name(&l.entry.replace('/', "__"), &l.entry);
+        let flat = parser::flat_output_name(&l.entry);
         let dest = out_dir.join(&flat);
         std::fs::write(&dest, &l.bytes).with_context(|| format!("écriture {}", dest.display()))?;
         println!(

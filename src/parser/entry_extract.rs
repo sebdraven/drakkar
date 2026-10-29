@@ -29,7 +29,7 @@ use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
 use super::apkzip::TolerantZip;
-use super::output_file_name;
+use super::flat_output_name;
 
 /// Une entrée extraite de l'APK.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,13 +59,12 @@ pub struct ExtractedEntry {
 }
 
 impl ExtractedEntry {
-    /// Nom de fichier de sortie, dérivé du chemin dans l'archive : les
-    /// séparateurs deviennent `_`, ce qui évite de recréer l'arborescence et
-    /// garde une trace de l'emplacement d'origine.
+    /// Nom de fichier de sortie, dérivé du chemin dans l'archive par
+    /// [`flat_output_name`], la règle de `--extract-libs`.
     ///
-    /// `res/raw/plugin` → `res_raw_plugin`. Borné par [`output_file_name`].
+    /// `res/raw/plugin` → `res__raw__plugin`.
     pub fn output_name(&self) -> String {
-        output_file_name(&self.entry.replace(['/', '\\'], "_"), &self.entry)
+        flat_output_name(&self.entry)
     }
 
     /// Écrit l'entrée dans `dir` sous [`Self::output_name`]. Le répertoire est
@@ -389,12 +388,13 @@ Motifs (--extract-entry, répétable) :
 La comparaison est insensible à la casse.
 
 Sécurité : une entrée dont le chemin contient \"..\" ou commence par \"/\" est refusée à
-l'écriture (Zip Slip). Le nom de sortie est dérivé du chemin d'archive avec les
-séparateurs remplacés par \"_\" : res/raw/plugin -> res_raw_plugin. Au-delà de 200
-octets : <préfixe>__<sha256 du chemin d'archive><.ext>, où préfixe = début du nom
-aplati coupé sur un caractère UTF-8, sha256 = SHA-256 COMPLET (64 hex) du chemin
-d'archive (pas du contenu), .ext = extension d'origine si elle fait au plus 16 octets.
-Le récapitulatif affiche toujours le chemin d'archive au-dessus du fichier écrit."
+l'écriture (Zip Slip). Le nom de sortie suit la règle de --extract-libs et de
+--extract-assets : chemin d'archive aplati, séparateurs / et \\ remplacés par \"__\" :
+res/raw/plugin -> res__raw__plugin. Au-delà de 200 octets : <préfixe>__<sha256 du
+chemin d'archive><.ext>, où préfixe = début du nom aplati coupé sur un caractère UTF-8,
+sha256 = SHA-256 COMPLET (64 hex) du chemin d'archive (pas du contenu), .ext =
+extension d'origine si elle fait au plus 16 octets. Le récapitulatif affiche toujours
+le chemin d'archive au-dessus du fichier écrit."
 }
 
 #[cfg(test)]
@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(e.file, "plugin");
         assert_eq!(e.kind, "apk/zip"); // reniflé, malgré l'absence d'extension
         assert_eq!(e.sha256, format!("{:x}", Sha256::digest(&inner)));
-        assert_eq!(e.output_name(), "res_raw_plugin");
+        assert_eq!(e.output_name(), "res__raw__plugin");
         assert_eq!(e.bytes, inner);
     }
 

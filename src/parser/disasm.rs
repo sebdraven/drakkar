@@ -33,7 +33,7 @@
 //! de rustc et un même binaire, ce qui suffit à comparer deux exécutions
 //! successives. **Ne pas persister ces valeurs ni les publier comme IOC.**
 
-use crate::parser::dex_facade::DexBin;
+use crate::parser::dex_facade::{DexBin, DexClass, DexValue};
 use anyhow::{bail, Context, Result};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -78,9 +78,20 @@ pub struct MethodDisasm {
     pub insns: Vec<Insn>,
 }
 
+/// Valeur initiale d'un champ statique, lue dans l'`encoded_array` de
+/// `static_values_off`, déjà rendue.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StaticInit {
+    pub name: String,
+    pub typ: String,
+    pub value: String,
+}
+
 /// Une classe désassemblée.
 pub struct ClassDisasm {
     pub descriptor: String,
+    /// Champs statiques qui ont une valeur initiale, ordre des `static_fields`.
+    pub statics: Vec<StaticInit>,
     pub methods: Vec<MethodDisasm>,
     /// Méthodes sans `code_item` (abstraites, natives) — comptées, pas listées.
     pub codeless: usize,
@@ -195,11 +206,73 @@ fn collect_from_dex(path: &Path, opts: &DisasmOptions, out: &mut DisasmReport) -
 
         out.classes.push(ClassDisasm {
             descriptor: normalize(&descriptor, &opts.normalize),
+            statics: static_inits(&dex, &class, &opts.normalize),
             methods,
             codeless,
         });
     }
     Ok(())
+}
+
+/// Champs statiques de `class` qui ont une valeur initiale. Un `encoded_array`
+/// illisible est signalé et ne donne aucune ligne.
+pub fn static_inits(
+    dex: &DexBin,
+    class: &DexClass<'_>,
+    subs: &[(String, String)],
+) -> Vec<StaticInit> {
+    let fields = match dex.static_fields(class) {
+        Ok(fields) => fields,
+        Err(e) => {
+            tracing::warn!(class = %class.descriptor, error = %e, "static_values illisibles");
+            return Vec::new();
+        }
+    };
+    fields
+        .into_iter()
+        .filter_map(|f| {
+            let value = f.value?.normalized(subs);
+            Some(StaticInit {
+                name: normalize(&f.name, subs),
+                typ: normalize(&f.typ, subs),
+                value: render_value(&value),
+            })
+        })
+        .collect()
+}
+
+/// Rendu d'une valeur d'`encoded_value` sur une ligne, défini dans [`legend`].
+pub fn render_value(v: &DexValue) -> String {
+    match v {
+        DexValue::Byte(n) => n.to_string(),
+        DexValue::Short(n) => n.to_string(),
+        DexValue::Int(n) => n.to_string(),
+        DexValue::Long(n) => format!("{n}L"),
+        DexValue::Char(c) => match char::from_u32(u32::from(*c)) {
+            Some(ch) if !ch.is_control() && ch != '\'' && ch != '\\' => format!("'{ch}'"),
+            _ => format!("'\\u{c:04x}'"),
+        },
+        DexValue::Float(x) => format!("{x}f"),
+        DexValue::Double(x) => format!("{x}d"),
+        DexValue::Bool(b) => b.to_string(),
+        DexValue::Null => "null".to_string(),
+        DexValue::Str(s) => format!("\"{}\"", escape(s)),
+        DexValue::Type(t) => format!("{t}.class"),
+        DexValue::Field(f) => f.clone(),
+        DexValue::Enum(e) => format!("enum {e}"),
+        DexValue::Method(m) => m.clone(),
+        DexValue::Array(vs) => {
+            let items: Vec<String> = vs.iter().map(render_value).collect();
+            format!("{{{}}}", items.join(", "))
+        }
+        DexValue::Opaque(what) => format!("<{what}>"),
+    }
+}
+
+/// Ligne d'en-tête de classe pour une valeur initiale, partagée avec
+/// `--decompile`.
+pub fn render_static(s: &StaticInit) -> String {
+    format!("static {} : {} = {}", s.name, s.typ, s.value)
 }
 
 /// Le descripteur correspond-il à l'un des motifs ? Vide = tout.
@@ -400,6 +473,9 @@ pub fn render(r: &DisasmReport) -> String {
                 c.codeless
             ));
         }
+        for st in &c.statics {
+            s.push_str(&format!("   {}\n", render_static(st)));
+        }
         for m in &c.methods {
             s.push_str(&format!(
                 "\n  {}({})   regs={} ins={}  fp={:016x}  {} insn\n",
@@ -455,6 +531,35 @@ Colonnes d'une ligne d'instruction :
   ; ...       Opérande résolue : chaîne littérale, Type, Owner->methode(),
               ou Owner->champ:Type. Un seul marqueur par instruction.
 
+En-tête de classe :
+  `== <descripteur> ==`, puis le nombre de méthodes sans code s'il y en a, puis
+  une ligne par champ statique doté d'une valeur initiale :
+    static <nom> : <type> = <valeur>
+  Valeur lue dans l'encoded_array de static_values_off du class_def_item, apparié
+  aux static_fields du class_data_item par position : c'est là que vit un `static
+  final String` initialisé par une constante de compilation, qu'AUCUNE instruction
+  n'écrit (pas de <clinit>) — invisible aux lignes d'instruction, endpoints C2
+  compris. Tous les champs couverts par le tableau sortent, final ou non ; un champ
+  au-delà de la fin du tableau n'a pas de ligne (sa valeur est le zéro du type).
+  Rendu de <valeur> :
+    \"…\"            String, échappée comme la colonne de résolution (\\n, \\t, \\\", \\\\).
+    123  123L      byte, short, int ; long suffixé L.
+    1.5f  1.5d     float, double : texte décimal exact suivi de f ou d (NaNf, inff,
+                   -infd pour les valeurs spéciales).
+    'a'  '\\u000a'  char ; \\uXXXX pour un contrôle, ' ou \\.
+    true  false    boolean.
+    null           null.
+    Lx/Y;.class    type (descripteur).
+    enum Lowner;->NOM:Ltype;     constante d'enum.
+    Lowner;->nom:Ltype;          champ.
+    Lowner;->nom                 méthode.
+    {a, b, …}      tableau, éléments rendus de même.
+    <annotation> <method-type> <method-handle>
+                   forme abrégée : la charge utile n'est pas décodée.
+    <string?> <type?> <field?> <enum?> <method?>
+                   index de pool non résolu.
+  --disasm-normalize s'applique aussi au nom, au type et à la valeur.
+
 En-tête de méthode :
   regs / ins  registers_size et ins_size du code_item.
   fp          Empreinte d'opcodes — hachage des MNÉMONIQUES SEULS, calcul
@@ -503,5 +608,58 @@ mod tests {
     fn escape_keeps_non_ascii() {
         // Les chaînes de debug du corpus sont en chinois : elles doivent passer.
         assert_eq!(escape("三星浏览器\n"), "三星浏览器\\n");
+    }
+
+    #[test]
+    fn static_values_render_on_one_line() {
+        let cases = [
+            (DexValue::Str("a\"b\n".into()), "\"a\\\"b\\n\""),
+            (DexValue::Int(-7), "-7"),
+            (DexValue::Long(1 << 40), "1099511627776L"),
+            (DexValue::Bool(true), "true"),
+            (DexValue::Char(u16::from(b'x')), "'x'"),
+            (DexValue::Char(10), "'\\u000a'"),
+            (DexValue::Float(1.5), "1.5f"),
+            (DexValue::Double(f64::NAN), "NaNd"),
+            (DexValue::Null, "null"),
+            (DexValue::Type("Lx/Y;".into()), "Lx/Y;.class"),
+            (
+                DexValue::Enum("Lx/E;->A:Lx/E;".into()),
+                "enum Lx/E;->A:Lx/E;",
+            ),
+            (
+                DexValue::Array(vec![DexValue::Int(1), DexValue::Str("z".into())]),
+                "{1, \"z\"}",
+            ),
+            (DexValue::Opaque("annotation"), "<annotation>"),
+        ];
+        for (value, want) in cases {
+            assert_eq!(render_value(&value), want);
+        }
+    }
+
+    #[test]
+    fn static_values_sit_under_the_class_header() {
+        let report = DisasmReport {
+            input: String::new(),
+            classes: vec![ClassDisasm {
+                descriptor: "Lalxu/taw/ce/dw6cyh;".into(),
+                statics: vec![StaticInit {
+                    name: "a".into(),
+                    typ: "Ljava/lang/String;".into(),
+                    value: render_value(&DexValue::Str("93hjbo029kfjsv79emkcxsfqu80kr5wb".into())),
+                }],
+                methods: Vec::new(),
+                codeless: 0,
+            }],
+            scanned: 1,
+        };
+        let text = render(&report);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "== Lalxu/taw/ce/dw6cyh; ==");
+        assert_eq!(
+            lines[1],
+            "   static a : Ljava/lang/String; = \"93hjbo029kfjsv79emkcxsfqu80kr5wb\""
+        );
     }
 }

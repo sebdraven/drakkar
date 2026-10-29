@@ -73,6 +73,13 @@ pub fn output_file_name(flat: &str, entry: &str) -> String {
     format!("{}__{sha256}{ext}", &flat[..cut])
 }
 
+/// Nom de sortie d'une entrée d'archive pour `--extract-libs`, `--extract-entry`
+/// et `--extract-assets` : `/` et `\` deviennent `__`, borné par
+/// [`output_file_name`].
+pub fn flat_output_name(entry: &str) -> String {
+    output_file_name(&entry.replace(['/', '\\'], "__"), entry)
+}
+
 /// Résultat complet du parsing d'un APK.
 pub struct ParsedApk {
     pub features: ApkFeatures,
@@ -356,6 +363,23 @@ mod tests {
         let name = output_file_name(&entry.replace('/', "__"), &entry);
         assert!(name.len() <= MAX_OUTPUT_NAME);
         assert!(name.ends_with(".so"));
+    }
+
+    #[test]
+    fn flat_output_name_is_shared_and_bounded() {
+        assert_eq!(
+            flat_output_name("lib/arm64-v8a/libfoo.so"),
+            "lib__arm64-v8a__libfoo.so"
+        );
+        assert_eq!(flat_output_name("res\\raw/plugin"), "res__raw__plugin");
+
+        let entry = format!("assets/{}/cordEX.json", "données/".repeat(30));
+        let name = flat_output_name(&entry);
+        let sha256 = format!("{:x}", Sha256::digest(entry.as_bytes()));
+        assert!(name.len() <= MAX_OUTPUT_NAME, "{}", name.len());
+        assert!(name.ends_with(".json"), "{name}");
+        assert!(name.contains(&sha256), "{name}");
+        assert!(name.starts_with("assets__données__"), "{name}");
     }
 
     #[test]

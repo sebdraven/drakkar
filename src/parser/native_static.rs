@@ -2178,6 +2178,15 @@ DÉSASSEMBLAGE (elfs[].disasm) — avec --native-disasm seulement, absent sinon
                   désassemblée, jusqu'à --disasm-depth niveaux (0 = points d'entrée
                   seuls).
     address       Adresse virtuelle de la fonction, bit Thumb effacé.
+    Mode (ARM 32 bits)
+                  ARM ou Thumb, décidé à l'entrée de la fonction. jni_static, jni_onload,
+                  jni_onunload, init, init_array, entry et main : bit 0 de st_value ou de
+                  la valeur lue (un symbole autre que STT_FUNC compte quand ce bit vaut 1 ;
+                  pair, il peut désigner des données) ; jni_registered : bit 0 de fnPtr.
+                  callee : mode du branchement — bl et b immédiats gardent le mode
+                  courant, blx immédiat bascule ARM <-> Thumb, bx / blx registre et
+                  ldr pc suivent le bit 0 de la cible quand elle est connue — SAUF si un
+                  symbole défini se trouve à la cible : le bit 0 de son st_value l'emporte.
     disasm_status ok = tous les chemins atteints ont été parcourus, invalid_paths
                   éventuels compris ; truncated = un plafond a interrompu le parcours,
                   voir truncated_reason ; arch_unsupported = autre machine ou ELF
@@ -2235,6 +2244,17 @@ DÉSASSEMBLAGE (elfs[].disasm) — avec --native-disasm seulement, absent sinon
                   (forme courte à 3 mots ou longue à 4) ou movw / movt / add ip, pc ;
                   x86_64 jmp [rip+…] ; x86 jmp [ebx+…]. Sur ARM, seule une cible en mode
                   ARM peut être une entrée PLT.
+                  Veneer d'interworking Thumb-1 → ARM (builds armeabi, ARMv5), 16 octets
+                  à la cible d'un appel ou d'un saut direct en Thumb : `bx pc` (4778),
+                  `nop` (46c0), puis en ARM `ldr ip, [pc, #0]` (e59fc000), `add pc, ip,
+                  pc` (e08cf00f) et un littéral de 32 bits. L'appel est rapporté vers la
+                  cible RÉELLE = littéral + adresse de `add pc, ip, pc` + 8, en mode ARM
+                  (Thumb si le bit 0 de la cible vaut 1) : plt avec le nom d'import si
+                  c'est un stub PLT reconnu, exactement comme un appel direct au PLT ;
+                  internal vers cette cible sinon. veneer = adresse du veneer traversé,
+                  absent pour tout autre appel. Aucune fonction callee n'est créée pour
+                  le veneer, et un import sans retour derrière un veneer termine le
+                  chemin comme un appel direct.
     string_refs[] address = instruction qui forme l'adresse ; target = adresse de la
                   chaîne ; value = octets jusqu'au premier nul, 256 au plus ; encoding =
                   utf8, ou hex pour des octets non UTF-8 d'une section en lecture seule.
