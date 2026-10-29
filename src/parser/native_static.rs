@@ -42,8 +42,9 @@ mod disasm;
 mod jni_table;
 
 pub use self::disasm::{
-    DisasmCall, DisasmFunction, DisasmInsn, DisasmOptions, ElfDisasm, InvalidPath, JavaMember,
-    JniCall, StringRef, Syscall, TruncatedAt,
+    parse_listing_spec, DisasmCall, DisasmFunction, DisasmInsn, DisasmOptions, ElfDisasm,
+    InvalidPath, JavaMember, JniCall, Listing, ListingInsn, ListingSpec, StringRef, Syscall,
+    TruncatedAt,
 };
 
 /// Catégories d'imports : noms exacts, ou préfixes quand ils finissent par `*`.
@@ -86,6 +87,7 @@ pub const STATUS_UNCLAIMED: &str = "native_unclaimed";
 pub const SWIG_DIRECTOR_PREFIX: &str = "SwigDirector_";
 
 const ORIGIN_LIB: &str = "lib";
+const ORIGIN_RAW: &str = "raw";
 const ELF_MAGIC: &[u8] = b"\x7FELF";
 const STRINGS_CAP: usize = 50;
 const MIN_STRING_CHARS: usize = 4;
@@ -118,13 +120,16 @@ const PACKED_TAGS: [(u32, &str); 2] = [
     (DT_ANDROID_RELA, "DT_ANDROID_RELA (format packé APS2)"),
 ];
 
-/// Rapport `--native` d'un APK.
+/// Rapport `--native` d'un APK ou d'un ELF brut.
 #[derive(Debug, Clone, Serialize)]
 pub struct NativeReport {
     pub sha256: String,
+    pub dex_available: bool,
     pub elfs: Vec<ElfReport>,
     pub binding: Vec<Binding>,
     pub summary: Summary,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub listings: Vec<Listing>,
     pub errors: Vec<String>,
 }
 
@@ -436,11 +441,56 @@ pub fn analyze_apk(path: &Path, disasm: Option<&DisasmOptions>) -> Result<Native
             }
         }
     }
+    Ok(finish(sha256, elfs, &kept, Some(path), disasm, errors))
+}
 
-    let natives = declared_natives(path, &mut errors);
+/// ELF brut, reconnu à son magic. `dex` : APK ou DEX brut dont les méthodes
+/// natives sont liées à cet ELF ; sans lui, binding est vide.
+pub fn analyze_elf_file(
+    path: &Path,
+    dex: Option<&Path>,
+    disasm: Option<&DisasmOptions>,
+) -> Result<NativeReport> {
+    let bytes = std::fs::read(path).with_context(|| format!("lecture {}", path.display()))?;
+    if !bytes.starts_with(ELF_MAGIC) {
+        anyhow::bail!("{} : magic ELF 7F 45 4C 46 absent", path.display());
+    }
+    let name = match path.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => path.display().to_string(),
+    };
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let elf = analyze_elf_as(&name, ORIGIN_RAW, &bytes);
+    let kept = if disasm.is_some() {
+        vec![bytes]
+    } else {
+        Vec::new()
+    };
+    Ok(finish(sha256, vec![elf], &kept, dex, disasm, Vec::new()))
+}
+
+/// Les quatre premiers octets du fichier valent 7F 45 4C 46.
+pub fn is_elf_file(path: &Path) -> bool {
+    let mut magic = [0u8; 4];
+    let read = std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic));
+    read.is_ok() && magic[..] == *ELF_MAGIC
+}
+
+/// Fin commune des modes APK et ELF brut : désassemblage, tables lues par le
+/// code, liaison. `kept` : octets des ELF, dans l'ordre de `elfs`, avec
+/// `disasm` seulement.
+fn finish(
+    sha256: String,
+    mut elfs: Vec<ElfReport>,
+    kept: &[Vec<u8>],
+    dex: Option<&Path>,
+    disasm: Option<&DisasmOptions>,
+    mut errors: Vec<String>,
+) -> NativeReport {
+    let natives = dex.and_then(|dex| declared_natives(dex, &mut errors));
     if let Some(options) = disasm {
         self::disasm::silence_panics(|| {
-            for (elf, bytes) in elfs.iter_mut().zip(&kept) {
+            for (elf, bytes) in elfs.iter_mut().zip(kept) {
                 self::disasm::run(bytes, elf, options);
             }
         });
@@ -457,17 +507,70 @@ pub fn analyze_apk(path: &Path, disasm: Option<&DisasmOptions>) -> Result<Native
     }
     let declared = natives.as_ref().map_or(0, Vec::len);
     let summary = summarize(&binding, declared, elfs.len());
-    Ok(NativeReport {
+    NativeReport {
         sha256,
+        dex_available: dex.is_some(),
         elfs,
         binding,
         summary,
+        listings: Vec::new(),
         errors,
-    })
+    }
+}
+
+/// `--native-listing` sur un rapport déjà désassemblé. `input` : l'APK ou l'ELF
+/// brut analysé, d'où les octets de chaque ELF retenu sont relus.
+pub fn add_listings(
+    report: &mut NativeReport,
+    input: &Path,
+    specs: &[ListingSpec],
+    max_insns: usize,
+) {
+    if specs.is_empty() {
+        return;
+    }
+    let in_archive = report.elfs.iter().any(|e| e.origin != ORIGIN_RAW);
+    let zip = in_archive.then(|| TolerantZip::open(input));
+    self::disasm::silence_panics(|| {
+        for spec in specs {
+            let mut matched = false;
+            for elf in &report.elfs {
+                if spec.elf.as_deref().is_some_and(|path| path != elf.path) {
+                    continue;
+                }
+                matched = true;
+                let bytes = match (&zip, elf.origin) {
+                    (_, ORIGIN_RAW) => std::fs::read(input).map_err(|e| e.to_string()),
+                    (Some(Ok(zip)), _) => zip.read_by_name(&elf.path).map_err(|e| format!("{e:#}")),
+                    (Some(Err(e)), _) => Err(format!("archive illisible ({e:#})")),
+                    (None, _) => Err("archive non ouverte".to_string()),
+                };
+                let listing = match bytes {
+                    Ok(bytes) => self::disasm::listing(&bytes, elf, spec, max_insns),
+                    Err(why) => Err(why),
+                };
+                match listing {
+                    Ok(listing) => report.listings.push(listing),
+                    Err(why) => report
+                        .errors
+                        .push(format!("listing {spec} ({}) : {why}", elf.path)),
+                }
+            }
+            if !matched {
+                report
+                    .errors
+                    .push(format!("listing {spec} : aucun ELF de ce chemin"));
+            }
+        }
+    });
 }
 
 fn analyze_elf(path: &str, bytes: &[u8]) -> ElfReport {
-    let mut report = ElfReport::new(path, bytes);
+    analyze_elf_as(path, origin_of(path), bytes)
+}
+
+fn analyze_elf_as(path: &str, origin: &'static str, bytes: &[u8]) -> ElfReport {
+    let mut report = ElfReport::with_origin(path, origin, bytes);
     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| inspect(bytes, &mut report)));
     let failure = match outcome {
         Ok(Ok(())) => None,
@@ -481,7 +584,12 @@ fn analyze_elf(path: &str, bytes: &[u8]) -> ElfReport {
 }
 
 impl ElfReport {
+    #[cfg(test)]
     fn new(path: &str, bytes: &[u8]) -> Self {
+        Self::with_origin(path, origin_of(path), bytes)
+    }
+
+    fn with_origin(path: &str, origin: &'static str, bytes: &[u8]) -> Self {
         let abi = declared_abi(path);
         let arch = parse_elf_header(bytes);
         let abi_mismatch = match (&abi, arch) {
@@ -502,14 +610,13 @@ impl ElfReport {
             Some(Endian::Big) => "big",
             None => "unknown",
         };
-        let origin = origin_of(path);
         let mut anomalies = Vec::new();
         if abi_mismatch {
             anomalies.push(format!(
                 "abi_mismatch: ELF {machine} {bits} bits dans {path}"
             ));
         }
-        if origin != ORIGIN_LIB {
+        if origin != ORIGIN_LIB && origin != ORIGIN_RAW {
             anomalies.push(format!("elf_outside_lib: {origin}"));
         }
         ElfReport {
@@ -1601,9 +1708,13 @@ fn declared_natives(apk: &Path, errors: &mut Vec<String>) -> Option<Vec<NativeMe
     }
 }
 
+/// `apk` : APK, ou DEX brut reconnu à son magic.
 fn read_natives(apk: &Path) -> Result<(Vec<NativeMethod>, Vec<String>)> {
     let tmp = tempfile::tempdir().context("création du répertoire temporaire")?;
-    let files = super::extract_dex_files(apk, tmp.path())?;
+    let files = match super::dyn_entrypoints::sniff(apk) {
+        Some(super::dyn_entrypoints::InputKind::Dex) => vec![apk.to_path_buf()],
+        _ => super::extract_dex_files(apk, tmp.path())?,
+    };
     let mut problems = Vec::new();
     let mut seen = HashSet::new();
     let mut natives = Vec::new();
@@ -1645,11 +1756,12 @@ fn read_natives(apk: &Path) -> Result<(Vec<NativeMethod>, Vec<String>)> {
 }
 
 /// Relie les méthodes natives du DEX aux exports `Java_*` et aux tables
-/// `JNINativeMethod` des ELF d'origine `lib`. Une ligne par couple (méthode,
-/// ELF) lié, une ligne `declared_unbound` par méthode sans liaison, une ligne
-/// `native_unclaimed` par export ou entrée de table sans méthode.
+/// `JNINativeMethod` des ELF d'origine `lib` ou `raw`. Une ligne par couple
+/// (méthode, ELF) lié, une ligne `declared_unbound` par méthode sans liaison, une
+/// ligne `native_unclaimed` par export ou entrée de table sans méthode.
 pub fn bind(natives: &[NativeMethod], elfs: &[ElfReport]) -> Vec<Binding> {
-    let libs: Vec<&ElfReport> = elfs.iter().filter(|e| e.origin == ORIGIN_LIB).collect();
+    let bound = |e: &&ElfReport| e.origin == ORIGIN_LIB || e.origin == ORIGIN_RAW;
+    let libs: Vec<&ElfReport> = elfs.iter().filter(bound).collect();
     let mut homonyms: HashMap<(&str, String), Vec<String>> = HashMap::new();
     for m in natives {
         homonyms
@@ -1840,21 +1952,29 @@ const LEGEND: &str = "\
 --native : analyse statique de TOUS les ELF de l'APK et liaison avec les méthodes
 `native` du DEX. Ni exécution, ni émulation ; désassemblage seulement avec
 --native-disasm (section DÉSASSEMBLAGE).
+Mode ELF brut : une entrée dont les 4 premiers octets valent 7F 45 4C 46 est
+analysée seule, quelle que soit son extension ; --native-dex <APK|DEX> fournit les
+méthodes natives à lier, sans quoi binding est vide.
 
 RAPPORT
-  sha256          SHA-256 complet du fichier APK.
+  sha256          SHA-256 complet du fichier APK, ou de l'ELF en mode brut.
+  dex_available   Une source de méthodes natives a été lue ou tentée : l'APK lui-même,
+                  ou --native-dex. false en mode brut sans --native-dex : binding est
+                  alors vide et native_methods_declared vaut 0, sans rien dire du DEX.
+  listings[]      --native-listing seulement, absent sinon (section LISTING).
   errors          Ce qui n'a pas pu être lu : entrée d'archive illisible (on ignore alors
                   si c'était un ELF), DEX illisible, classes sautées, panique du parseur
-                  DEX. Une méthode native manquante peut faire apparaître à tort son
-                  export en native_unclaimed. Si le DEX n'a pas pu être lu du tout,
-                  binding est vide et native_methods_declared vaut 0.
+                  DEX, listing impossible. Une méthode native manquante peut faire
+                  apparaître à tort son export en native_unclaimed. Si le DEX n'a pas pu
+                  être lu du tout, binding est vide et native_methods_declared vaut 0.
 
 ELF (elfs[])
   Est un ELF toute entrée dont les 4 premiers octets décompressés valent 7F 45 4C 46,
   quel que soit son chemin ou son extension. Archive lue par le lecteur ZIP tolérant.
-  path            Chemin de l'entrée dans l'APK.
+  path            Chemin de l'entrée dans l'APK ; nom du fichier en mode brut.
   origin          lib = sous lib/ ; assets = sous assets/ ; res_raw = sous res/raw/ ;
-                  other = ailleurs (racine, res/ renommé, META-INF/…).
+                  other = ailleurs (racine, res/ renommé, META-INF/…) ; raw = fichier ELF
+                  passé directement, hors de toute archive, lié comme lib.
   sha256          SHA-256 COMPLET du contenu DÉCOMPRESSÉ, jamais des octets stockés
                   (même sémantique que --extract-libs) : la forme qui se croise avec
                   VirusTotal, MalwareBazaar, Koodous. Jamais tronqué.
@@ -1957,7 +2077,7 @@ STRINGS (elfs[].strings)
                   ci-dessous ; caractères A-Z a-z 0-9 _ $ / ; ni // ni / final.
   jni_signatures  Chaîne entièrement conforme à la grammaire des signatures JNI.
 
-LIAISON (binding[]) — seuls les ELF d'origine lib sont liés
+LIAISON (binding[]) — seuls les ELF d'origine lib ou raw sont liés
   java            Méthode : Lclasse;->nom(arguments)retour. Pour native_unclaimed : classe
                   et nom de l'export Java_*, arguments seulement s'il est surchargé ; « ? »
                   pour la classe d'une entrée de table, que la table ne porte pas.
@@ -2147,7 +2267,8 @@ DÉSASSEMBLAGE (elfs[].disasm) — avec --native-disasm seulement, absent sinon
 ANOMALIES (elfs[].anomalies, code avant « : », détail après)
   abi_mismatch    ELF incompatible avec son répertoire lib/<abi>/.
   elf_outside_lib ELF hors de lib/ : l'installateur ne l'extrait pas, c'est le code de
-                  l'application qui le charge ou l'exécute (packer, dropper).
+                  l'application qui le charge ou l'exécute (packer, dropper). Jamais
+                  pour origin raw.
   section_headers_absent
                   Pas de section headers. Le chargeur s'en passe, les outils non.
   section_headers_invalid
@@ -2184,6 +2305,28 @@ ANOMALIES (elfs[].anomalies, code avant « : », détail après)
                   opaques plutôt que du code, signe d'obfuscation par aplatissement.
                   Les fonctions invalid_entry ne comptent pas : leur seul chemin abandonné
                   est leur point d'entrée (racine erronée), pas un bloc mort.
+
+LISTING (listings[]) — --native-listing <spec>, répétable, avec --native-disasm
+  spec            <elf>@<adresse> ou <elf>@<début>-<fin> : <elf> = elfs[].path exact, ou
+                  * pour tous les ELF ; adresses virtuelles hexadécimales, 0x facultatif ;
+                  fin EXCLUE. Sur ARM 32 bits, le bit 0 de l'adresse à 1 = Thumb ; il est
+                  effacé de début et fin.
+  Une adresse seule liste toute la fonction désassemblée qui commence à cette adresse,
+  ou à défaut qui passe par elle ; aucune = erreur. Une plage liste les instructions,
+  dans la plage, de la fonction désassemblée qui passe par son début ; à défaut, elle
+  est décodée linéairement de début à fin, sans suivre aucun branchement, dans le
+  mode (ARM ou Thumb) du début, au plus --disasm-max-insns instructions ; un octet
+  indécodable y devient (invalid) et le décodage reprend juste après. Les octets sont
+  relus dans l'APK ou le fichier ELF analysé.
+  elf             elfs[].path de l'ELF listé.
+  start, end      Bornes listées : celles de la fonction (end = fin de sa dernière
+                  instruction), ou celles de la plage.
+  instructions[]  address, bytes, mnemonic, operands comme dans disasm ; comment =
+                  ce que le désassemblage a attribué à cette adresse, séparé par des
+                  virgules : chaîne référencée (entre guillemets), import ou symbole
+                  appelé, sinon kind et cible de l'appel (internal, unresolved,
+                  indirect), puis nom de la fonction JNIEnv ou JavaVM appelée ; null si
+                  rien. Un indirect résolu en appel JNI ne garde que le nom JNI.
 ";
 
 /// Légende autonome : chaque champ, statut, catégorie et anomalie de `--native`.
@@ -2360,6 +2503,28 @@ mod tests {
         assert_eq!(report.jni.registered, vec![foo_entry()]);
         assert_eq!(report.jni.jni_registration, "tables_found");
         assert_eq!(report.strings.jni_signatures.items, vec!["(I)V"]);
+    }
+
+    /// Une table JNI reconstruite, mais aucun DEX : binding reste vide.
+    #[test]
+    fn raw_elf_is_analyzed_alone_without_binding() {
+        let bytes = aarch64_fixture(true);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("libt.so");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(is_elf_file(&path));
+
+        let report = analyze_elf_file(&path, None, None).unwrap();
+        assert!(!report.dex_available);
+        assert_eq!(report.sha256, format!("{:x}", Sha256::digest(&bytes)));
+        assert_eq!(report.elfs.len(), 1);
+        let elf = &report.elfs[0];
+        assert_eq!((elf.path.as_str(), elf.origin), ("libt.so", ORIGIN_RAW));
+        assert!(elf.anomalies.is_empty(), "{:?}", elf.anomalies);
+        assert_eq!(elf.jni.registered, vec![foo_entry()]);
+        assert!(report.binding.is_empty());
+        assert_eq!(report.summary.native_methods_declared, 0);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
     }
 
     #[test]
@@ -2786,6 +2951,12 @@ mod tests {
             "TABLE JavaVM",
             "swig_director_upcalls",
             SWIG_DIRECTOR_PREFIX,
+            ORIGIN_RAW,
+            "dex_available",
+            "--native-dex",
+            "listings",
+            "--native-listing",
+            "(invalid)",
         ];
         for label in labels {
             assert!(legend.contains(label), "{label}");

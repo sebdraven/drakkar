@@ -139,6 +139,9 @@ pub struct DisasmFunction {
     pub string_refs: Vec<StringRef>,
     pub jni_calls: Vec<JniCall>,
     pub syscalls: Vec<Syscall>,
+    /// Adresse d'instruction → commentaire de `--native-listing`.
+    #[serde(skip)]
+    pub(super) notes: BTreeMap<u64, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -242,6 +245,7 @@ impl DisasmFunction {
             string_refs: Vec::new(),
             jni_calls: Vec::new(),
             syscalls: Vec::new(),
+            notes: BTreeMap::new(),
         }
     }
 }
@@ -1301,7 +1305,16 @@ fn analyze_function(ctx: &Ctx, entry: &Entry, max_insns: usize) -> Analyzed {
         } else if explored.targets.contains(&insn.address) || expected != Some(insn.address) {
             walk.machine.reset();
         }
+        let function = &walk.out.function;
+        let seen = (
+            walk.calls.len(),
+            function.jni_calls.len(),
+            function.string_refs.len(),
+        );
         walk.step(insn);
+        if let Some(note) = step_note(&walk.calls, &walk.out.function, seen) {
+            walk.out.function.notes.insert(insn.address, note);
+        }
         expected = match insn.flow {
             Flow::Jump(..) | Flow::JumpVia(_) | Flow::Return | Flow::Stop => None,
             _ => Some(insn.address.wrapping_add(insn.len)),
@@ -1860,6 +1873,226 @@ fn opaque_dead_code(functions: &[DisasmFunction]) -> Option<String> {
         return None;
     }
     Some(format!("opaque_dead_code: {}", repeated.join(" ; ")))
+}
+
+/// Ce que `step` vient d'attribuer à une instruction : chaîne référencée, cible
+/// ou import appelé, fonction JNI. `seen` : longueurs avant `step`.
+fn step_note(
+    calls: &[DisasmCall],
+    function: &DisasmFunction,
+    seen: (usize, usize, usize),
+) -> Option<String> {
+    let (calls_seen, jni_seen, refs_seen) = seen;
+    let jni = &function.jni_calls[jni_seen..];
+    let mut parts = Vec::new();
+    for string in &function.string_refs[refs_seen..] {
+        parts.push(format!("{:?}", string.value));
+    }
+    for call in &calls[calls_seen..] {
+        let part = match (&call.import, &call.symbol, &call.target) {
+            (Some(import), _, _) => import.clone(),
+            (None, Some(symbol), _) => symbol.clone(),
+            (None, None, Some(target)) => format!("{} {target}", call.kind),
+            (None, None, None) if jni.is_empty() => call.kind.to_string(),
+            (None, None, None) => continue,
+        };
+        parts.push(part);
+    }
+    for call in jni {
+        parts.push(call.name.to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// `--native-listing <elf>@<adresse>` ou `<elf>@<début>-<fin>`, fin exclue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingSpec {
+    /// Chemin de l'ELF ; `None` pour `*`.
+    pub elf: Option<String>,
+    pub start: u64,
+    pub end: Option<u64>,
+}
+
+impl std::fmt::Display for ListingSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}@{:#x}",
+            self.elf.as_deref().unwrap_or("*"),
+            self.start
+        )?;
+        if let Some(end) = self.end {
+            write!(f, "-{end:#x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Adresses hexadécimales, préfixe `0x` facultatif.
+pub fn parse_listing_spec(spec: &str) -> Result<ListingSpec, String> {
+    let Some((elf, at)) = spec.rsplit_once('@') else {
+        return Err("forme attendue : <elf|*>@<adresse> ou <elf|*>@<début>-<fin>".into());
+    };
+    let elf = match elf {
+        "" => return Err("chemin d'ELF vide (passer * pour tous les ELF)".into()),
+        "*" => None,
+        path => Some(path.to_string()),
+    };
+    let hex_addr = |text: &str| {
+        let digits = text.strip_prefix("0x").unwrap_or(text);
+        u64::from_str_radix(digits, 16)
+            .map_err(|_| format!("adresse hexadécimale invalide : {text:?}"))
+    };
+    let (start, end) = match at.split_once('-') {
+        Some((start, end)) => (hex_addr(start)?, Some(hex_addr(end)?)),
+        None => (hex_addr(at)?, None),
+    };
+    if end.is_some_and(|end| end <= start) {
+        return Err(format!("fin {at:?} : doit suivre le début"));
+    }
+    Ok(ListingSpec { elf, start, end })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Listing {
+    pub elf: String,
+    pub start: String,
+    pub end: String,
+    pub instructions: Vec<ListingInsn>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ListingInsn {
+    pub address: String,
+    pub bytes: String,
+    pub mnemonic: String,
+    pub operands: String,
+    pub comment: Option<String>,
+}
+
+/// Listing de `spec` dans l'ELF `report`, dont `bytes` est le contenu. Une
+/// adresse seule liste la fonction désassemblée qui commence ou passe par elle ;
+/// une plage liste les instructions de la fonction qui passe par son début, ou,
+/// à défaut, la décode linéairement. `Err` : raison pour laquelle rien n'est listé.
+pub(super) fn listing(
+    bytes: &[u8],
+    report: &ElfReport,
+    spec: &ListingSpec,
+    max_insns: usize,
+) -> Result<Listing, String> {
+    let disasm = report.disasm.as_ref().ok_or("ELF non désassemblé")?;
+    let parsed = parse_elf(bytes).map_err(|e| format!("ELF illisible ({e})"))?;
+    let image = parsed.image;
+    let arm = image.machine == elf::EM_ARM;
+    let mut notes = BTreeMap::new();
+    for function in &disasm.functions {
+        for (&at, note) in &function.notes {
+            notes.insert(at, note.as_str());
+        }
+    }
+    let (start, thumb) = split_thumb(arm, spec.start);
+    let start_hex = hex(start);
+    let passes_by = |f: &&DisasmFunction| f.instructions.iter().any(|i| i.address == start_hex);
+    let Some(end) = spec.end else {
+        let function = disasm
+            .functions
+            .iter()
+            .find(|f| f.address == start_hex)
+            .or_else(|| disasm.functions.iter().find(passes_by))
+            .ok_or_else(|| format!("aucune fonction désassemblée en {start_hex}"))?;
+        let instructions = function
+            .instructions
+            .iter()
+            .map(|i| listed(i, &notes))
+            .collect();
+        let end = match function.instructions.last() {
+            Some(last) => parse_hex(&last.address).unwrap_or(0) + last.bytes.len() as u64 / 2,
+            None => start,
+        };
+        return Ok(Listing {
+            elf: report.path.clone(),
+            start: function.address.clone(),
+            end: hex(end),
+            instructions,
+        });
+    };
+    let (end, _) = split_thumb(arm, end);
+    if end <= start {
+        return Err(format!(
+            "plage vide une fois le bit Thumb effacé : {start_hex}"
+        ));
+    }
+    let instructions = match disasm.functions.iter().find(passes_by) {
+        Some(function) => function
+            .instructions
+            .iter()
+            .filter(|i| parse_hex(&i.address).is_some_and(|at| (start..end).contains(&at)))
+            .map(|i| listed(i, &notes))
+            .collect(),
+        None => linear(&image, start, end, thumb, max_insns, &notes)?,
+    };
+    Ok(Listing {
+        elf: report.path.clone(),
+        start: hex(start),
+        end: hex(end),
+        instructions,
+    })
+}
+
+fn listed(insn: &DisasmInsn, notes: &BTreeMap<u64, &str>) -> ListingInsn {
+    let comment = parse_hex(&insn.address).and_then(|at| notes.get(&at));
+    ListingInsn {
+        address: insn.address.clone(),
+        bytes: insn.bytes.clone(),
+        mnemonic: insn.mnemonic.clone(),
+        operands: insn.operands.clone(),
+        comment: comment.map(|note| note.to_string()),
+    }
+}
+
+/// Décodage linéaire de `[start, end)`, sans suivre aucun branchement ; un
+/// octet indécodable devient `(invalid)` et le décodage reprend après lui.
+fn linear(
+    image: &Image,
+    start: u64,
+    end: u64,
+    thumb: bool,
+    max_insns: usize,
+    notes: &BTreeMap<u64, &str>,
+) -> Result<Vec<ListingInsn>, String> {
+    let Some(arch) = arch_of(image) else {
+        return Err(format!(
+            "e_machine {} ou gros-boutiste : pas de décodeur",
+            image.machine
+        ));
+    };
+    let mut out = Vec::new();
+    let mut at = start;
+    while at < end && out.len() < max_insns {
+        let Some(code) = image.code_window(at) else {
+            break;
+        };
+        let (len, bytes, mnemonic, operands) = match decode(arch, code, at, thumb) {
+            Ok(insn) => (insn.len, insn.bytes, insn.mnemonic, insn.operands),
+            Err(_) => {
+                let len = undecoded_len(arch, code, thumb).max(1);
+                let raw = hex_bytes(&code[..len.min(code.len())]);
+                (len as u64, raw, "(invalid)".to_string(), String::new())
+            }
+        };
+        out.push(ListingInsn {
+            address: hex(at),
+            bytes,
+            mnemonic,
+            operands,
+            comment: notes.get(&at).map(|note| note.to_string()),
+        });
+        at = at.wrapping_add(len.max(1));
+    }
+    if out.is_empty() {
+        return Err(format!("{} hors segment LOAD exécutable", hex(start)));
+    }
+    Ok(out)
 }
 
 fn push_unique(into: &mut Vec<JavaMember>, members: Vec<JavaMember>) {
@@ -3115,6 +3348,35 @@ mod tests {
         assert_eq!(function.invalid_paths.len(), 1);
         let three = [function.clone(), function.clone(), function];
         assert_eq!(opaque_dead_code(&three), None);
+    }
+
+    #[test]
+    fn listing_specs_parse_addresses_ranges_and_wildcards() {
+        let spec = |elf: Option<&str>, start, end| ListingSpec {
+            elf: elf.map(str::to_string),
+            start,
+            end,
+        };
+        let path = Some("lib/arm64-v8a/libx.so");
+        let single = parse_listing_spec("lib/arm64-v8a/libx.so@0x1000");
+        assert_eq!(single, Ok(spec(path, 0x1000, None)));
+        let range = parse_listing_spec("lib/arm64-v8a/libx.so@1000-0x1020");
+        assert_eq!(range, Ok(spec(path, 0x1000, Some(0x1020))));
+        let any = parse_listing_spec("*@0x1001-0x1021");
+        assert_eq!(any, Ok(spec(None, 0x1001, Some(0x1021))));
+        assert_eq!(any.unwrap().to_string(), "*@0x1001-0x1021");
+        let bad = [
+            "libx.so",
+            "@0x1000",
+            "libx.so@",
+            "libx.so@0xzz",
+            "libx.so@0x1000-",
+            "libx.so@0x1020-0x1000",
+            "libx.so@0x1000-0x1000",
+        ];
+        for input in bad {
+            assert!(parse_listing_spec(input).is_err(), "{input}");
+        }
     }
 
     #[test]
