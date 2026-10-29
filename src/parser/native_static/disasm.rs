@@ -173,6 +173,9 @@ pub struct DisasmCall {
     pub import: Option<String>,
     pub symbol: Option<String>,
     pub kind: &'static str,
+    /// Veneer d'interworking Thumb-1 → ARM traversé pour atteindre `target`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub veneer: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -344,15 +347,14 @@ fn disassemble(bytes: &[u8], report: &ElfReport, options: &DisasmOptions) -> Elf
         ctx.plt_got = dyn_tag(dynamic, elf::DT_PLTGOT);
     }
     let arm = ctx.image.machine == elf::EM_ARM;
-    let mut thumb_at = HashSet::new();
     for sym in parsed.symbols.iter().chain(&parsed.local_symbols) {
+        if let Some((address, thumb)) = symbol_mode(arm, sym) {
+            ctx.modes.entry(address).or_insert(thumb);
+        }
         if !sym.defined || !sym.func || sym.value == 0 {
             continue;
         }
-        let (address, thumb) = split_thumb(arm, sym.value);
-        if thumb {
-            thumb_at.insert(address);
-        }
+        let (address, _) = split_thumb(arm, sym.value);
         ctx.starts.insert(address);
         let slot = ctx.symbols.entry(address);
         slot.or_insert_with(|| (sym.name.clone(), sym.size));
@@ -361,7 +363,7 @@ fn disassemble(bytes: &[u8], report: &ElfReport, options: &DisasmOptions) -> Elf
 
     let mut entries = Vec::new();
     for export in &report.jni.static_exports {
-        let thumb = thumb_at.contains(&export.address);
+        let thumb = ctx.modes.get(&export.address).copied().unwrap_or(false);
         entries.push(entry(export.address, thumb, ORIGIN_JNI_STATIC, Val::Env));
     }
     for method in &report.jni.registered {
@@ -432,6 +434,53 @@ fn split_thumb(arm: bool, value: u64) -> (u64, bool) {
     } else {
         (value, false)
     }
+}
+
+/// Mode porté par un symbole ARM défini : bit 0 de st_value. Un symbole autre
+/// que STT_FUNC ne compte que s'il porte ce bit : pair, il peut désigner des
+/// données ou un symbole de mapping ($a, $t, $d).
+fn symbol_mode(arm: bool, sym: &DynSymbol) -> Option<(u64, bool)> {
+    if !arm || !sym.defined || sym.value == 0 {
+        return None;
+    }
+    let (address, thumb) = split_thumb(true, sym.value);
+    (sym.func || thumb).then_some((address, thumb))
+}
+
+/// Veneer d'interworking Thumb-1 → ARM des builds armeabi, 16 octets :
+/// Thumb `bx pc ; nop`, puis ARM `ldr ip, [pc, #0] ; add pc, ip, pc` et un
+/// littéral. Cible = littéral + adresse de `add pc, ip, pc` + 8 ; mode = bit 0
+/// de la cible. `None` si `at`, en Thumb, ne porte pas ce motif.
+fn veneer_target(ctx: &Ctx, at: u64, thumb: bool) -> Option<(u64, bool)> {
+    if ctx.arch != Some(Arch::Arm) || !thumb {
+        return None;
+    }
+    let code = ctx.image.code_window(at)?;
+    let word = |i: usize| -> Option<u32> {
+        let b = code.get(i..i + 4)?;
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    if code.get(..4)? != [0x78, 0x47, 0xc0, 0x46].as_slice()
+        || word(4)? != 0xe59f_c000
+        || word(8)? != 0xe08c_f00f
+    {
+        return None;
+    }
+    let add_pc = at.wrapping_add(8);
+    let target = u64::from(word(12)?).wrapping_add(add_pc.wrapping_add(8)) & 0xffff_ffff;
+    Some(split_thumb(true, target))
+}
+
+/// Cible réelle d'un appel ou d'un saut direct : veneer traversé, puis mode
+/// donné par un symbole connu à cette adresse plutôt que par le branchement.
+/// Rend aussi l'adresse du veneer traversé.
+fn direct_target(ctx: &Ctx, target: u64, mode: bool) -> (u64, bool, Option<u64>) {
+    let (address, mode, veneer) = match veneer_target(ctx, target, mode) {
+        Some((address, mode)) => (address, mode, Some(target)),
+        None => (target, mode, None),
+    };
+    let mode = ctx.modes.get(&address).copied().unwrap_or(mode);
+    (address, mode, veneer)
 }
 
 fn parse_hex(text: &str) -> Option<u64> {
@@ -674,6 +723,8 @@ struct Ctx<'a> {
     symbols: HashMap<u64, (String, u64)>,
     /// Nom de fonction définie → st_value, bit Thumb compris.
     defined: HashMap<String, u64>,
+    /// ARM 32 bits : adresse d'un symbole défini → Thumb, par [`symbol_mode`].
+    modes: HashMap<u64, bool>,
     starts: HashSet<u64>,
     plt_got: Option<u64>,
     plt_cache: RefCell<HashMap<u64, Option<String>>>,
@@ -691,6 +742,7 @@ impl<'a> Ctx<'a> {
             got: HashMap::new(),
             symbols: HashMap::new(),
             defined: HashMap::new(),
+            modes: HashMap::new(),
             starts: HashSet::new(),
             plt_got: None,
             plt_cache: RefCell::new(HashMap::new()),
@@ -1208,6 +1260,7 @@ fn explore(ctx: &Ctx, arch: Arch, entry: &Entry, max_insns: usize) -> Explored {
             match flow {
                 Flow::Next | Flow::CallVia(_) => {}
                 Flow::Call(target, mode) => {
+                    let (target, mode, _) = direct_target(ctx, target, mode);
                     if is_noreturn(ctx, target, mode) {
                         break;
                     }
@@ -1220,6 +1273,7 @@ fn explore(ctx: &Ctx, arch: Arch, entry: &Entry, max_insns: usize) -> Explored {
                     from = Some(at);
                 }
                 Flow::Jump(target, mode) => {
+                    let (target, mode, _) = direct_target(ctx, target, mode);
                     if is_internal(ctx, entry.address, target, mode) {
                         out.targets.insert(target);
                         work.push((target, mode, Some(at)));
@@ -1369,9 +1423,12 @@ impl Walk<'_, '_> {
         }
         match insn.flow {
             Flow::Call(target, mode) => self.direct_call(insn, target, mode),
-            Flow::Jump(target, mode) if !is_internal(ctx, self.start, target, mode) => {
-                let arg0 = self.arg(0);
-                self.record_direct(target, mode, arg0);
+            Flow::Jump(target, mode) => {
+                let (real, real_mode, _) = direct_target(ctx, target, mode);
+                if !is_internal(ctx, self.start, real, real_mode) {
+                    let arg0 = self.arg(0);
+                    self.record_direct(target, mode, arg0);
+                }
             }
             Flow::CallVia(via) => self.indirect(via, true),
             Flow::JumpVia(via) => self.indirect(via, false),
@@ -1445,12 +1502,15 @@ impl Walk<'_, '_> {
     /// wrapper C++ de jni.h.
     fn record_direct(&mut self, target: u64, mode: bool, arg0: Val) -> Option<Val> {
         let ctx = self.ctx;
+        let (target, mode, veneer) = direct_target(ctx, target, mode);
+        let veneer = veneer.map(hex);
         if !callable(ctx, target) {
             self.calls.push(DisasmCall {
                 target: Some(hex(target)),
                 import: None,
                 symbol: None,
                 kind: CALL_UNRESOLVED,
+                veneer,
             });
             return None;
         }
@@ -1463,6 +1523,7 @@ impl Walk<'_, '_> {
                 import: Some(name),
                 symbol: None,
                 kind: CALL_PLT,
+                veneer,
             });
             return wrapper.map(|w| self.wrapper_call(w));
         }
@@ -1476,6 +1537,7 @@ impl Walk<'_, '_> {
             import: None,
             symbol,
             kind: CALL_INTERNAL,
+            veneer,
         });
         let arg0 = match arg0 {
             Val::Env | Val::Vm => arg0,
@@ -1522,6 +1584,7 @@ impl Walk<'_, '_> {
                     import: Some(name.clone()),
                     symbol: None,
                     kind: CALL_PLT,
+                    veneer: None,
                 });
                 return wrapper.map(|w| self.wrapper_call(w));
             }
@@ -1791,6 +1854,7 @@ fn indirect_call() -> DisasmCall {
         import: None,
         symbol: None,
         kind: CALL_INDIRECT,
+        veneer: None,
     }
 }
 
@@ -2551,6 +2615,7 @@ mod tests {
             import: Some("dlopen".to_string()),
             symbol: None,
             kind: CALL_PLT,
+            veneer: None,
         };
         assert_eq!(out.function.calls, [plt]);
         assert!(out.callees.is_empty());
@@ -2798,6 +2863,7 @@ mod tests {
             import: Some("dlopen".to_string()),
             symbol: None,
             kind: CALL_PLT,
+            veneer: None,
         };
         let expected = std::slice::from_ref(&plt);
         for (address, thumb) in [(CODE, false), (0x1100, true)] {
@@ -2805,6 +2871,174 @@ mod tests {
             assert_eq!(out.function.calls, expected, "{address:#x}");
             assert!(out.callees.is_empty(), "{address:#x}");
         }
+    }
+
+    /// armeabi (Thumb-1) : appel par un veneer d'interworking en 0x1100.
+    const THUMB1_CALLS_VENEER: &[(u16, &str)] = &[
+        (0xf000, "1000  bl   0x1100"),
+        (0xf87e, ""),
+        (0x2001, "1004  movs r0, #1"),
+        (0x4770, "1006  bx   lr"),
+    ];
+
+    /// `bx pc ; nop ; ldr ip, [pc, #0] ; add pc, ip, pc ; .word` vers `target`.
+    fn veneer_to(data: &mut [u8], at: u64, target: u64) {
+        assemble_thumb(data, at, &[(0x4778, "bx pc"), (0x46c0, "nop")]);
+        let arm = [
+            (0xe59f_c000, "ldr ip, [pc, #0]"),
+            (0xe08c_f00f, "add pc, ip, pc"),
+        ];
+        assemble(data, at + 4, &arm);
+        let literal = target.wrapping_sub(at + 16) as u32;
+        put(data, at + 12, &literal.to_le_bytes());
+    }
+
+    fn thumb1_through_veneer(import: &str) -> (Vec<u8>, [(u64, u64); 6]) {
+        let mut data = vec![0u8; 0x4000];
+        assemble_thumb(&mut data, CODE, THUMB1_CALLS_VENEER);
+        veneer_to(&mut data, 0x1100, 0x1800);
+        assemble(&mut data, 0x1800, ARM_PLT);
+        let dynamic = jump_slot(&mut data, 0x348c, import, true);
+        (data, dynamic)
+    }
+
+    #[test]
+    fn a_thumb1_veneer_to_a_plt_stub_is_a_plt_call() {
+        let (data, dynamic) = thumb1_through_veneer("malloc");
+        let mut ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        let out = analyze(&ctx, CODE, true);
+        let plt = DisasmCall {
+            target: Some("0x1800".to_string()),
+            import: Some("malloc".to_string()),
+            symbol: None,
+            kind: CALL_PLT,
+            veneer: Some("0x1100".to_string()),
+        };
+        assert_eq!(out.function.calls, [plt]);
+        assert!(out.callees.is_empty(), "aucune fonction pour le veneer");
+        assert_eq!(out.function.instructions.len(), 3);
+
+        let entries = vec![jni_entry(CODE, true)];
+        let disasm = walk_functions(&ctx, entries, &DisasmOptions::default());
+        let other = disasm.imports_called.get("other").cloned();
+        assert_eq!(other.unwrap_or_default(), ["malloc"]);
+        let json = serde_json::to_value(&disasm.functions[0].calls[0]).unwrap();
+        assert_eq!(json["veneer"], "0x1100");
+    }
+
+    #[test]
+    fn a_noreturn_import_behind_a_veneer_ends_the_path() {
+        let (data, dynamic) = thumb1_through_veneer("__stack_chk_fail");
+        let mut ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        ctx.got = got_imports(&ctx.image, &dynamic);
+        let out = analyze(&ctx, CODE, true);
+        assert_eq!(out.function.instructions.len(), 1);
+        let import = out.function.calls[0].import.as_deref();
+        assert_eq!(import, Some("__stack_chk_fail"));
+    }
+
+    #[test]
+    fn a_thumb1_veneer_to_code_is_an_internal_arm_call() {
+        let mut data = vec![0u8; 0x4000];
+        assemble_thumb(&mut data, CODE, THUMB1_CALLS_VENEER);
+        veneer_to(&mut data, 0x1100, 0x1200);
+        put(&mut data, 0x1200, &0xe12f_ff1eu32.to_le_bytes());
+        let ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        let out = analyze(&ctx, CODE, true);
+        let call = &out.function.calls[0];
+        let seen = (call.kind, call.target.as_deref(), call.veneer.as_deref());
+        assert_eq!(seen, (CALL_INTERNAL, Some("0x1200"), Some("0x1100")));
+        assert_eq!(out.callees.len(), 1);
+        let callee = out.callees[0];
+        assert_eq!((callee.address, callee.thumb), (0x1200, false));
+    }
+
+    /// Les mêmes octets sans le motif complet ne sont pas un veneer.
+    #[test]
+    fn a_bare_bx_pc_is_not_a_veneer() {
+        let mut data = vec![0u8; 0x4000];
+        assemble_thumb(&mut data, 0x1100, &[(0x4778, "bx pc"), (0x46c0, "nop")]);
+        let ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        assert_eq!(veneer_target(&ctx, 0x1100, true), None);
+        veneer_to(&mut data, 0x1100, 0x1800);
+        let ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        assert_eq!(
+            veneer_target(&ctx, 0x1100, false),
+            None,
+            "veneer atteint en ARM"
+        );
+        assert_eq!(veneer_target(&ctx, 0x1100, true), Some((0x1800, false)));
+    }
+
+    /// ARM `bl` vers 0x1100, où vit une fonction Thumb.
+    const ARM_CALLS_THUMB_SYMBOL: &[(u32, &str)] = &[
+        (0xeb00_003e, "1000  bl   0x1100"),
+        (0xe12f_ff1e, "1004  bx   lr"),
+    ];
+
+    fn defined(value: u64, func: bool) -> DynSymbol {
+        DynSymbol {
+            name: "f".to_string(),
+            defined: true,
+            bind: elf::STB_GLOBAL,
+            value,
+            size: 0,
+            func,
+        }
+    }
+
+    #[test]
+    fn symbol_modes_follow_bit_zero_of_st_value() {
+        assert_eq!(
+            symbol_mode(true, &defined(0x1101, true)),
+            Some((0x1100, true))
+        );
+        assert_eq!(
+            symbol_mode(true, &defined(0x1100, true)),
+            Some((0x1100, false))
+        );
+        // Export Java_* rangé en STT_NOTYPE par un packer : le bit 0 suffit.
+        assert_eq!(
+            symbol_mode(true, &defined(0x2001, false)),
+            Some((0x2000, true))
+        );
+        // Pair hors STT_FUNC : données ou symbole de mapping, rien n'est conclu.
+        assert_eq!(symbol_mode(true, &defined(0x2000, false)), None);
+        assert_eq!(symbol_mode(false, &defined(0x1101, true)), None);
+    }
+
+    /// Le cas de stage2_armv7.so : un callee Thumb atteint par un branchement qui
+    /// dit ARM était lu en mots ARM. Le symbole à la cible l'emporte.
+    #[test]
+    fn a_callee_takes_the_mode_of_the_symbol_at_its_address() {
+        let mut data = vec![0u8; 0x2000];
+        assemble(&mut data, CODE, ARM_CALLS_THUMB_SYMBOL);
+        assemble_thumb(
+            &mut data,
+            0x1100,
+            &[(0x4478, "add r0, pc"), (0x4770, "bx lr")],
+        );
+        let mut ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        let out = analyze(&ctx, CODE, false);
+        let callee = out.callees[0];
+        assert_eq!(
+            (callee.address, callee.thumb),
+            (0x1100, false),
+            "sans symbole"
+        );
+
+        let (address, thumb) = symbol_mode(true, &defined(0x1101, true)).unwrap();
+        ctx.modes.insert(address, thumb);
+        let out = analyze(&ctx, CODE, false);
+        let callee = out.callees[0];
+        assert_eq!((callee.address, callee.thumb), (0x1100, true));
+
+        let walked = walk_functions(&ctx, vec![jni_entry(CODE, false)], &options(1, 100));
+        let f = &walked.functions[1];
+        assert_eq!(f.address, "0x1100");
+        assert!(f.invalid_paths.is_empty(), "{:?}", f.invalid_paths);
+        assert_eq!(f.instructions[0].mnemonic, "add");
     }
 
     /// Point d'entrée ARM d'un exécutable : main (0x1100) par ldr littéral en r2,
@@ -3202,6 +3436,7 @@ mod tests {
             import: None,
             symbol: None,
             kind: CALL_UNRESOLVED,
+            veneer: None,
         };
         assert_eq!(out.function.calls, [unresolved]);
         assert!(out.callees.is_empty());
@@ -3429,6 +3664,8 @@ mod tests {
             "uxtb",
             DISAMBIGUATED_BY_FIND_CLASS,
             "disambiguated_by",
+            "veneer",
+            "e59fc000",
             "disasm_failed",
             "truncated_reason",
             "string_refs",

@@ -102,6 +102,8 @@ pub struct FieldItem<'a> {
 /// Un champ statique et sa valeur initiale, quand le DEX en porte une.
 pub struct StaticField {
     pub name: String,
+    /// Descripteur du type déclaré ; vide si illisible.
+    pub typ: String,
     /// `None` quand l'`encoded_array` s'arrête avant ce champ.
     pub value: Option<DexValue>,
 }
@@ -382,14 +384,16 @@ impl DexBin {
         for enc in &data.static_fields {
             // Un nom illisible garde sa PLACE, avec une chaîne vide : aucun nom
             // de champ réel n'est vide, donc rien ne s'y appariera par erreur.
-            let name = self
-                .dex
-                .fields
-                .get(enc.field_idx)
-                .ok()
+            let field = self.dex.fields.get(enc.field_idx).ok();
+            let name = field
+                .as_ref()
                 .and_then(|f| self.string(f.name_idx))
                 .unwrap_or_default();
-            names.push(name.to_string());
+            let typ = field
+                .as_ref()
+                .and_then(|f| self.typ(f.type_idx as u32))
+                .unwrap_or_default();
+            names.push((name.to_string(), typ.to_string()));
         }
 
         let values: Vec<DexValue> = self
@@ -549,12 +553,13 @@ impl DexBin {
 /// Le tableau peut s'arrêter avant la fin de la liste des champs : ceux de
 /// queue n'ont alors pas de valeur. Il ne peut pas la dépasser — l'excédent
 /// d'un DEX malformé est ignoré, l'appelant le signale.
-fn pair_statics(names: Vec<String>, values: Vec<DexValue>) -> Vec<StaticField> {
+fn pair_statics(fields: Vec<(String, String)>, values: Vec<DexValue>) -> Vec<StaticField> {
     let mut values = values.into_iter();
-    names
+    fields
         .into_iter()
-        .map(|name| StaticField {
+        .map(|(name, typ)| StaticField {
             name,
+            typ,
             value: values.next(),
         })
         .collect()
@@ -605,8 +610,10 @@ mod tests {
         assert_eq!(shorty_params(&[]), "");
     }
 
-    fn noms(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+    fn noms(v: &[&str]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|s| (s.to_string(), "Ljava/lang/String;".to_string()))
+            .collect()
     }
 
     #[test]
@@ -618,6 +625,7 @@ mod tests {
         );
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].name, "a");
+        assert_eq!(out[0].typ, "Ljava/lang/String;");
         assert_eq!(
             out[0].value,
             Some(DexValue::Str("https://i.safespy.com/api/".into()))

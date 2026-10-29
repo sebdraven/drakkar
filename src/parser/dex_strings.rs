@@ -291,4 +291,32 @@ mod tests {
         assert_eq!(pool.strings, vec!["http://c2.example/gate"]);
         assert_eq!((pool.declared, pool.unreadable), (1, 0));
     }
+
+    /// Une seule entrée altérée, et pas la DEX : le crate `zip` refuse quand
+    /// même la passe, la DEX saine est lue par le lecteur tolérant.
+    #[test]
+    fn a_tampered_non_dex_entry_still_yields_the_dex_strings() {
+        use std::io::Write;
+
+        let mut apk = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut apk));
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file("assets/a.bin", opts).unwrap();
+            zw.write_all(b"abc").unwrap();
+            zw.start_file("classes.dex", opts).unwrap();
+            zw.write_all(&dex_with("token")).unwrap();
+            zw.finish().unwrap();
+        }
+        // Premiers en-têtes = assets/a.bin.
+        for (sig, at) in [(b"PK\x03\x04", 6), (b"PK\x01\x02", 8)] {
+            let off = apk.windows(4).position(|w| w == sig).unwrap();
+            apk[off + at] |= 1;
+        }
+        let zip = TolerantZip::from_bytes(apk.clone()).unwrap();
+        assert_eq!(zip.tampered_count(), 1);
+
+        let pool = extract_from_apk_bytes(&apk).unwrap();
+        assert_eq!(pool.strings, vec!["token"]);
+    }
 }
