@@ -54,6 +54,8 @@ pub(super) enum Op {
 pub(super) enum Via {
     Reg(u8),
     Mem(Addr),
+    /// Cible calculée par l'instruction elle-même : `add pc, rn, rm`.
+    Expr(Expr),
     Unknown,
 }
 
@@ -82,6 +84,9 @@ pub(super) struct Insn {
     pub(super) syscall: bool,
     /// Registre qui reçoit une adresse calculée : candidat `string_refs`.
     pub(super) forms_address: Option<u8>,
+    /// Thumb : écriture du PC par une instruction de données (BranchWritePC),
+    /// la cible reste en Thumb quel que soit son bit 0.
+    pub(super) branch_write_pc: bool,
 }
 
 impl Insn {
@@ -96,6 +101,7 @@ impl Insn {
             ops: Vec::new(),
             syscall: false,
             forms_address: None,
+            branch_write_pc: false,
         }
     }
 
@@ -847,10 +853,15 @@ fn arm_semantics(inst: &armv7::Instruction, site: Site, insn: &mut Insn) {
     }
 }
 
-/// Une écriture dans pc est un saut dont la cible n'est pas suivie.
+/// Une écriture dans pc est un saut vers la valeur calculée.
 fn arm_write(rd: u8, expr: Expr, insn: &mut Insn) {
     if rd == 15 {
-        insn.flow = Flow::JumpVia(Via::Unknown);
+        let via = match expr {
+            Expr::Unknown => Via::Unknown,
+            Expr::Reg(rm) => Via::Reg(rm),
+            other => Via::Expr(other),
+        };
+        insn.flow = Flow::JumpVia(via);
     } else {
         insn.set(rd, expr);
     }
@@ -867,6 +878,7 @@ fn arm_mov(ops: &[ArmOperand; 4], site: Site, insn: &mut Insn) {
             Some(rm) => Flow::JumpVia(Via::Reg(rm)),
             None => Flow::JumpVia(Via::Unknown),
         };
+        insn.branch_write_pc = site.thumb;
         return;
     }
     let expr = match (arm_imm(&ops[1]), arm_reg(&ops[1])) {
@@ -910,6 +922,9 @@ fn arm_add(inst: &armv7::Instruction, site: Site, insn: &mut Insn) {
         _ => Expr::Unknown,
     };
     arm_write(rd, expr, insn);
+    if rd == 15 {
+        insn.branch_write_pc = site.thumb;
+    }
 }
 
 /// ADR : Thumb `adr rd, #imm` ; ARM `add|sub rd, pc, #imm`, dont le signe ne

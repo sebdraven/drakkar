@@ -27,6 +27,34 @@ const ORIGIN_INIT_ARRAY: &str = "init_array";
 const ORIGIN_ENTRY: &str = "entry";
 const ORIGIN_CALLEE: &str = "callee";
 const ORIGIN_MAIN: &str = "main";
+const ORIGIN_USER_ROOT: &str = "user_root";
+const ORIGIN_EXPORT: &str = "export";
+
+/// Exports du runtime C/C++ que `--native-roots exports` n'enracine pas.
+pub(super) const RUNTIME_PREFIXES: &[&str] = &[
+    "__cxa_",
+    "__gxx_",
+    "__gnu_",
+    "__aeabi_",
+    "_ZN10__cxxabiv1",
+    "_ZNK10__cxxabiv1",
+    "_ZNSt",
+    "_ZNKSt",
+    "_ZSt",
+    "_ZN9__gnu_cxx",
+    "_ZNK9__gnu_cxx",
+    "_ZN17__eh_globals",
+    "__clear_cache",
+    "__stack_chk",
+];
+
+const SOURCE_SYMBOL: &str = "symbol";
+const SOURCE_DISASM: &str = "disasm";
+const SOURCE_PROLOGUE: &str = "prologue";
+
+const SWEEP_MAPPING: &str = "mapping_symbols";
+const SWEEP_FUNCTIONS: &str = "function_modes";
+const SWEEP_DEFAULT_THUMB: &str = "default_thumb";
 
 const STATUS_OK: &str = "ok";
 const STATUS_TRUNCATED: &str = "truncated";
@@ -93,13 +121,19 @@ pub(super) const NORETURN_IMPORTS: &[&str] = &[
 ];
 
 /// Réglages de `--native-disasm`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisasmOptions {
     /// 0 = points d'entrée seuls ; n = fonctions internes appelées directement,
     /// jusqu'à n niveaux.
     pub depth: u8,
     /// Plafond d'instructions par fonction.
     pub max_insns: usize,
+    /// `--native-root`.
+    pub roots: Vec<RootSpec>,
+    /// `--native-roots exports`.
+    pub export_roots: bool,
+    /// `--native-string-index`.
+    pub string_index: bool,
 }
 
 impl Default for DisasmOptions {
@@ -107,6 +141,78 @@ impl Default for DisasmOptions {
         DisasmOptions {
             depth: DEFAULT_DISASM_DEPTH,
             max_insns: DEFAULT_DISASM_MAX_INSNS,
+            roots: Vec::new(),
+            export_roots: false,
+            string_index: false,
+        }
+    }
+}
+
+/// `--native-root` : symbole défini, ou adresse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootSpec {
+    Symbol(String),
+    /// `thumb` : forcé par `t:` / `a:`, sinon bit 0 de l'adresse.
+    Address {
+        address: u64,
+        thumb: Option<bool>,
+    },
+}
+
+impl std::fmt::Display for RootSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RootSpec::Symbol(name) => write!(f, "{name}"),
+            RootSpec::Address { address, thumb } => {
+                let prefix = match thumb {
+                    Some(true) => "t:",
+                    Some(false) => "a:",
+                    None => "",
+                };
+                write!(f, "{prefix}{address:#x}")
+            }
+        }
+    }
+}
+
+/// `nom`, `0x<hex>`, `t:<hex>` ou `a:<hex>` (`0x` facultatif après le préfixe).
+pub fn parse_root_spec(spec: &str) -> Result<RootSpec, String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err("racine vide".into());
+    }
+    let (thumb, rest) = match spec.split_once(':') {
+        Some(("t", rest)) => (Some(true), rest),
+        Some(("a", rest)) => (Some(false), rest),
+        _ => (None, spec),
+    };
+    let digits = match rest.strip_prefix("0x") {
+        Some(digits) => digits,
+        None if thumb.is_some() => rest,
+        None => return Ok(RootSpec::Symbol(spec.to_string())),
+    };
+    let address = u64::from_str_radix(digits, 16)
+        .map_err(|_| format!("adresse hexadécimale invalide : {rest:?}"))?;
+    Ok(RootSpec::Address { address, thumb })
+}
+
+fn is_runtime_symbol(name: &str) -> bool {
+    RUNTIME_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// WARN pour chaque `--native-root` qui n'a trouvé sa cible dans aucun ELF.
+pub(super) fn warn_unmatched_roots(elfs: &[ElfReport], options: &DisasmOptions) {
+    for (index, spec) in options.roots.iter().enumerate() {
+        let found = elfs
+            .iter()
+            .filter_map(|e| e.disasm.as_ref())
+            .any(|d| d.roots_matched.contains(&index));
+        if !found {
+            tracing::warn!(
+                root = %spec,
+                "--native-root introuvable : ni symbole défini de ce nom, ni adresse dans un \
+                 segment exécutable, dans aucun ELF"
+            );
         }
     }
 }
@@ -121,6 +227,31 @@ pub struct ElfDisasm {
     /// Entrées de `registered_by_code`, sous la forme de `jni.registered`.
     #[serde(skip)]
     pub(super) tables_by_code: Vec<RegisteredMethod>,
+    /// Index dans `DisasmOptions::roots` des racines trouvées dans cet ELF.
+    #[serde(skip)]
+    pub(super) roots_matched: Vec<usize>,
+    /// Remontés dans `ElfReport` par [`run`].
+    #[serde(skip)]
+    pub(super) string_index: Option<Vec<IndexedString>>,
+    #[serde(skip)]
+    pub(super) string_index_mode: Option<&'static str>,
+}
+
+/// Une chaîne de `--native-string-index` et les instructions qui forment son
+/// adresse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IndexedString {
+    pub value: String,
+    pub target: String,
+    pub encoding: &'static str,
+    pub refs: Vec<StringIndexRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StringIndexRef {
+    pub address: String,
+    pub function: Option<String>,
+    pub function_source: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -270,10 +401,12 @@ pub(super) fn silence_panics(job: impl FnOnce()) {
 pub(super) fn run(bytes: &[u8], report: &mut ElfReport, options: &DisasmOptions) {
     let job = AssertUnwindSafe(|| disassemble(bytes, report, options));
     match std::panic::catch_unwind(job) {
-        Ok(disasm) => {
+        Ok(mut disasm) => {
             if let Some(anomaly) = opaque_dead_code(&disasm.functions) {
                 report.anomalies.push(anomaly);
             }
+            report.string_index = disasm.string_index.take();
+            report.string_index_mode = disasm.string_index_mode.take();
             report.disasm = Some(disasm);
         }
         Err(_) => {
@@ -397,7 +530,303 @@ fn disassemble(bytes: &[u8], report: &ElfReport, options: &DisasmOptions) -> Elf
         let (address, thumb) = split_thumb(arm, parsed.entry);
         entries.push(entry(address, thumb, ORIGIN_ENTRY, Val::Opaque(0)));
     }
-    walk_functions(&ctx, entries, options)
+    let all_symbols: Vec<&DynSymbol> = parsed.symbols.iter().chain(&parsed.local_symbols).collect();
+    let mut matched = Vec::new();
+    for (index, spec) in options.roots.iter().enumerate() {
+        if let Some((address, thumb)) = resolve_root(&ctx, &all_symbols, spec) {
+            entries.push(entry(address, thumb, ORIGIN_USER_ROOT, Val::Opaque(0)));
+            matched.push(index);
+        }
+    }
+    if options.export_roots {
+        for sym in &parsed.symbols {
+            let exported = matches!(sym.bind, elf::STB_GLOBAL | elf::STB_WEAK);
+            let runtime = is_runtime_symbol(&sym.name);
+            if sym.defined && sym.func && sym.value != 0 && exported && !runtime {
+                let (address, thumb) = split_thumb(arm, sym.value);
+                entries.push(entry(address, thumb, ORIGIN_EXPORT, Val::Opaque(0)));
+            }
+        }
+    }
+    let mut out = walk_functions(&ctx, entries, options);
+    out.roots_matched = matched;
+    if options.string_index {
+        if let Some(arch) = ctx.arch {
+            let (index, mode) = string_index(&ctx, arch, &parsed.local_symbols, &out.functions);
+            out.string_index = Some(index);
+            out.string_index_mode = mode;
+        }
+    }
+    out
+}
+
+/// Adresse et mode d'une racine `--native-root` dans cet ELF ; `None` si le
+/// symbole n'y est pas défini ou si l'adresse tombe hors du code.
+fn resolve_root(ctx: &Ctx, symbols: &[&DynSymbol], spec: &RootSpec) -> Option<(u64, bool)> {
+    let arm = ctx.image.machine == elf::EM_ARM;
+    let (address, thumb) = match spec {
+        RootSpec::Symbol(name) => {
+            let sym = symbols
+                .iter()
+                .find(|s| s.defined && s.value != 0 && s.name == *name)?;
+            split_thumb(arm, sym.value)
+        }
+        RootSpec::Address { address, thumb } => {
+            let (at, bit) = split_thumb(arm, *address);
+            (at, arm && thumb.unwrap_or(bit))
+        }
+    };
+    ctx.image.is_exec(address).then_some((address, thumb))
+}
+
+/// Mode ARM 32 bits du balayage linéaire, par plages.
+struct SweepPlan {
+    /// Début de plage → Thumb, ARM, ou données (`None`), trié.
+    marks: Vec<(u64, Option<bool>)>,
+    /// Avant la première plage.
+    default: bool,
+}
+
+impl SweepPlan {
+    fn mode_at(&self, at: u64) -> Option<bool> {
+        match self.marks.partition_point(|(a, _)| *a <= at) {
+            0 => Some(self.default),
+            i => self.marks[i - 1].1,
+        }
+    }
+
+    fn next_mark(&self, at: u64) -> Option<u64> {
+        let i = self.marks.partition_point(|(a, _)| *a <= at);
+        self.marks.get(i).map(|(a, _)| *a)
+    }
+}
+
+/// `$a`, `$t`, `$d`, suffixés ou non (`$t.12`) : ARM, Thumb, données.
+fn mapping_mode(name: &str) -> Option<Option<bool>> {
+    match name.strip_prefix('$')?.split('.').next()? {
+        "a" => Some(Some(false)),
+        "t" => Some(Some(true)),
+        "d" => Some(None),
+        _ => None,
+    }
+}
+
+/// Symboles de mapping s'il y en a, sinon mode des fonctions connues, sinon
+/// Thumb ; le libellé rendu dit lequel.
+fn sweep_plan(
+    ctx: &Ctx,
+    arch: Arch,
+    local_symbols: &[DynSymbol],
+) -> (SweepPlan, Option<&'static str>) {
+    if arch != Arch::Arm {
+        let plan = SweepPlan {
+            marks: Vec::new(),
+            default: false,
+        };
+        return (plan, None);
+    }
+    let mut marks: Vec<(u64, Option<bool>)> = local_symbols
+        .iter()
+        .filter(|s| s.defined)
+        .filter_map(|s| mapping_mode(&s.name).map(|mode| (s.value & !1, mode)))
+        .collect();
+    let mut label = SWEEP_MAPPING;
+    if marks.is_empty() {
+        marks = ctx.modes.iter().map(|(&a, &t)| (a, Some(t))).collect();
+        label = SWEEP_FUNCTIONS;
+    }
+    if marks.is_empty() {
+        label = SWEEP_DEFAULT_THUMB;
+    }
+    marks.sort_by_key(|(a, _)| *a);
+    let plan = SweepPlan {
+        marks,
+        default: true,
+    };
+    (plan, Some(label))
+}
+
+/// Sections exécutables ; sans section headers, segments LOAD exécutables.
+fn code_regions(image: &Image) -> Vec<(u64, u64)> {
+    let sections: Vec<(u64, u64)> = image
+        .sections
+        .iter()
+        .filter(|s| s.has(elf::SHF_ALLOC) && s.has(elf::SHF_EXECINSTR) && s.has_file_data())
+        .map(|s| (s.addr, s.addr.saturating_add(s.size)))
+        .collect();
+    if !sections.is_empty() {
+        return sections;
+    }
+    image
+        .segments
+        .iter()
+        .filter(|s| s.p_type == elf::PT_LOAD && s.has(elf::PF_X))
+        .map(|s| (s.vaddr, s.vaddr.saturating_add(s.filesz)))
+        .collect()
+}
+
+/// Section allouée en lecture seule ; sans section headers, segment LOAD non
+/// inscriptible.
+fn read_only_data(image: &Image, at: u64) -> bool {
+    match image.data_kind(at) {
+        Some(true) => true,
+        Some(false) if image.sections.is_empty() => image
+            .segments
+            .iter()
+            .any(|s| s.p_type == elf::PT_LOAD && s.in_file(at) && !s.has(elf::PF_W)),
+        _ => false,
+    }
+}
+
+fn string_value(image: &Image, at: u64) -> Option<(String, &'static str)> {
+    let bytes = image.c_string_bytes(at)?;
+    match std::str::from_utf8(bytes).ok().filter(|t| printable(t)) {
+        Some(text) => Some((text.to_string(), "utf8")),
+        None => Some((hex_bytes(bytes), "hex")),
+    }
+}
+
+/// `push {…, lr}` (ARM, Thumb) ou `stp x29, x30, …` (AArch64).
+fn is_prologue(insn: &Insn) -> bool {
+    match insn.mnemonic.as_str() {
+        "push" | "push.w" | "stmdb" | "stmfd" => insn.operands.contains("lr"),
+        "stp" => insn.operands.starts_with("x29, x30"),
+        _ => false,
+    }
+}
+
+/// `[début, fin)` de chaque fonction désassemblée.
+fn disasm_ranges(functions: &[DisasmFunction]) -> Vec<(u64, u64)> {
+    functions
+        .iter()
+        .filter_map(|f| {
+            let start = parse_hex(&f.address)?;
+            let end = f
+                .instructions
+                .iter()
+                .filter_map(|i| Some(parse_hex(&i.address)? + i.bytes.len() as u64 / 2))
+                .max()?;
+            Some((start, end))
+        })
+        .collect()
+}
+
+/// Fonction qui contient `at` : début de symbole ou de fonction désassemblée le
+/// plus proche en amont qui la couvre, sinon le dernier prologue vu.
+fn owner(
+    ctx: &Ctx,
+    ranges: &[(u64, u64)],
+    at: u64,
+    prologue: Option<u64>,
+) -> (Option<u64>, Option<&'static str>) {
+    let symbol = ctx
+        .symbols
+        .iter()
+        .filter(|(start, (_, size))| {
+            let (start, size) = (**start, *size);
+            if start > at {
+                return false;
+            }
+            if size > 0 {
+                at - start < size
+            } else {
+                prologue.is_none_or(|p| p <= start)
+            }
+        })
+        .map(|(start, _)| *start)
+        .max();
+    let disasm = ranges
+        .iter()
+        .filter(|(s, e)| *s <= at && at < *e)
+        .map(|(s, _)| *s)
+        .max();
+    match (symbol, disasm) {
+        (Some(s), Some(d)) if d > s => (Some(d), Some(SOURCE_DISASM)),
+        (Some(s), _) => (Some(s), Some(SOURCE_SYMBOL)),
+        (None, Some(d)) => (Some(d), Some(SOURCE_DISASM)),
+        (None, None) => match prologue {
+            Some(p) => (Some(p), Some(SOURCE_PROLOGUE)),
+            None => (None, None),
+        },
+    }
+}
+
+/// `--native-string-index` : balayage linéaire du code, sans suivre aucun
+/// branchement ; l'évaluateur repart d'un état vide après chaque saut ou retour.
+fn string_index(
+    ctx: &Ctx,
+    arch: Arch,
+    local_symbols: &[DynSymbol],
+    functions: &[DisasmFunction],
+) -> (Vec<IndexedString>, Option<&'static str>) {
+    let (plan, label) = sweep_plan(ctx, arch, local_symbols);
+    let ranges = disasm_ranges(functions);
+    let mut found: BTreeMap<u64, IndexedString> = BTreeMap::new();
+    for (start, end) in code_regions(&ctx.image) {
+        let mut machine = Machine::new(arch);
+        let mut prologue = None;
+        let mut at = start;
+        while at < end {
+            let Some(thumb) = plan.mode_at(at) else {
+                at = plan.next_mark(at).unwrap_or(end);
+                machine = Machine::new(arch);
+                continue;
+            };
+            if ctx.starts.contains(&at) {
+                machine = Machine::new(arch);
+            }
+            let Some(code) = ctx.image.code_window(at) else {
+                break;
+            };
+            let insn = match decode(arch, code, at, thumb) {
+                Ok(insn) => insn,
+                Err(_) => {
+                    let step = match arch {
+                        Arch::X86 | Arch::X86_64 => 1,
+                        _ => undecoded_len(arch, code, thumb).max(2),
+                    };
+                    at = at.wrapping_add(step as u64);
+                    machine = Machine::new(arch);
+                    continue;
+                }
+            };
+            if is_prologue(&insn) {
+                prologue = Some(at);
+            }
+            machine.apply(ctx, &insn);
+            let target = insn
+                .forms_address
+                .and_then(|reg| machine.materialize(ctx, machine.get(reg)));
+            if let Some(target) = target.filter(|&t| read_only_data(&ctx.image, t)) {
+                if let Some((text, encoding)) = string_value(&ctx.image, target) {
+                    let (function, source) = owner(ctx, &ranges, at, prologue);
+                    let item = found.entry(target).or_insert_with(|| IndexedString {
+                        value: text,
+                        target: hex(target),
+                        encoding,
+                        refs: Vec::new(),
+                    });
+                    let address = hex(at);
+                    if !item.refs.iter().any(|r| r.address == address) {
+                        item.refs.push(StringIndexRef {
+                            address,
+                            function: function.map(hex),
+                            function_source: source,
+                        });
+                    }
+                }
+            }
+            let stops = matches!(
+                insn.flow,
+                Flow::Return | Flow::Jump(..) | Flow::JumpVia(_) | Flow::Stop
+            );
+            if stops {
+                machine = Machine::new(arch);
+            }
+            at = at.wrapping_add(insn.len.max(1));
+        }
+    }
+    (found.into_values().collect(), label)
 }
 
 fn init_array(ctx: &Ctx, dynamic: &[(u64, u64)]) -> Vec<u64> {
@@ -1026,6 +1455,7 @@ impl Machine {
         match via {
             Via::Reg(reg) => self.get(reg),
             Via::Mem(addr) => self.load(ctx, addr, ctx.image.ptr_size),
+            Via::Expr(expr) => self.eval(ctx, expr),
             Via::Unknown => self.fresh(),
         }
     }
@@ -1430,8 +1860,8 @@ impl Walk<'_, '_> {
                     self.record_direct(target, mode, arg0);
                 }
             }
-            Flow::CallVia(via) => self.indirect(via, true),
-            Flow::JumpVia(via) => self.indirect(via, false),
+            Flow::CallVia(via) => self.indirect(via, true, false),
+            Flow::JumpVia(via) => self.indirect(via, false, insn.branch_write_pc),
             _ => {}
         }
     }
@@ -1548,7 +1978,9 @@ impl Walk<'_, '_> {
         wrapper.map(|w| self.wrapper_call(w))
     }
 
-    fn indirect(&mut self, via: Via, is_call: bool) {
+    /// `stay_thumb` : BranchWritePC, la cible reste en Thumb sans regarder son
+    /// bit 0.
+    fn indirect(&mut self, via: Via, is_call: bool, stay_thumb: bool) {
         let ctx = self.ctx;
         let value = self.machine.via(ctx, via);
         let arg0 = self.arg(0);
@@ -1565,14 +1997,20 @@ impl Walk<'_, '_> {
                 self.calls.push(indirect_call());
                 Some(ret)
             }
-            None => self.record_value(value, arg0, is_call),
+            None => self.record_value(value, arg0, is_call, stay_thumb),
         };
         if is_call {
             self.after_call(ret);
         }
     }
 
-    fn record_value(&mut self, value: Val, arg0: Val, is_call: bool) -> Option<Val> {
+    fn record_value(
+        &mut self,
+        value: Val,
+        arg0: Val,
+        is_call: bool,
+        stay_thumb: bool,
+    ) -> Option<Val> {
         let ctx = self.ctx;
         if let Val::Mem(slot) = value {
             if let Some(name) = ctx.got.get(&slot) {
@@ -1591,7 +2029,11 @@ impl Walk<'_, '_> {
         }
         let arm = self.arch == Arch::Arm;
         let target = self.machine.materialize(ctx, value);
-        match target.map(|t| split_thumb(arm, t)) {
+        let split = |t: u64| match stay_thumb {
+            true => (t & !1, true),
+            false => split_thumb(arm, t),
+        };
+        match target.map(split) {
             Some((address, mode)) if ctx.image.is_exec(address) => {
                 self.record_direct(address, mode, arg0)
             }
@@ -2375,7 +2817,11 @@ mod tests {
     }
 
     fn options(depth: u8, max_insns: usize) -> DisasmOptions {
-        DisasmOptions { depth, max_insns }
+        DisasmOptions {
+            depth,
+            max_insns,
+            ..DisasmOptions::default()
+        }
     }
 
     fn jni_names(function: &DisasmFunction) -> Vec<(&'static str, usize, bool)> {
@@ -3041,6 +3487,200 @@ mod tests {
         assert_eq!(f.instructions[0].mnemonic, "add");
     }
 
+    /// stage2_armv7.so (BeatBanker), séquence de 0xe4a0 transposée en 0x1000 :
+    /// l'entrée de table lue en 0x1104 vaut 0x1200, paire.
+    const THUMB_MOV_PC_TABLE: &[(u16, &str)] = &[
+        (0x4803, "1000  ldr  r0, [pc, #12]    ; 0x1010"),
+        (
+            0x4478,
+            "1002  add  r0, pc           ; 0xfa + 0x1006 = 0x1100",
+        ),
+        (0x6840, "1004  ldr  r0, [r0, #4]     ; 0x1200"),
+        (0x4687, "1006  mov  pc, r0"),
+    ];
+
+    #[test]
+    fn a_thumb_mov_pc_keeps_thumb_for_an_even_table_entry() {
+        let mut data = vec![0u8; 0x2000];
+        assemble_thumb(&mut data, CODE, THUMB_MOV_PC_TABLE);
+        put(&mut data, 0x1010, &0xfau32.to_le_bytes());
+        put(&mut data, 0x1104, &0x1200u32.to_le_bytes());
+        let target = [(0xb510, "push {r4, lr}"), (0xbd10, "pop {r4, pc}")];
+        assemble_thumb(&mut data, 0x1200, &target);
+        let ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        let out = analyze(&ctx, CODE, true);
+        assert_eq!(out.callees.len(), 1);
+        let callee = out.callees[0];
+        assert_eq!((callee.address, callee.thumb), (0x1200, true));
+
+        let walked = walk_functions(&ctx, vec![jni_entry(CODE, true)], &options(1, 100));
+        let f = walked
+            .functions
+            .iter()
+            .find(|f| f.address == "0x1200")
+            .unwrap();
+        assert!(f.invalid_paths.is_empty(), "{:?}", f.invalid_paths);
+        assert_eq!(f.instructions[0].mnemonic, "push");
+        assert_eq!(walked.invalid_paths_count, 0);
+    }
+
+    const ARM_MOV_PC_ODD: &[(u32, &str)] = &[
+        (0xe59f_3000, "1000  ldr  r3, [pc, #0]    ; 0x1008"),
+        (0xe1a0_f003, "1004  mov  pc, r3"),
+        (0x0000_1101, "1008  littéral : 0x1100 | 1"),
+    ];
+
+    #[test]
+    fn an_arm_mov_pc_to_an_odd_value_switches_to_thumb() {
+        let mut data = vec![0u8; 0x2000];
+        assemble(&mut data, CODE, ARM_MOV_PC_ODD);
+        put(&mut data, 0x1100, &0x4770u16.to_le_bytes());
+        let ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        let out = analyze(&ctx, CODE, false);
+        let callee = out.callees[0];
+        assert_eq!((callee.address, callee.thumb), (0x1100, true));
+    }
+
+    #[test]
+    fn pc_writes_by_data_instructions_keep_thumb_only_in_thumb() {
+        let add = decode(Arch::Arm, &[0x87, 0x44], 0x1000, true).unwrap();
+        assert_eq!(add.flow, Flow::JumpVia(Via::Expr(Expr::AddImm(0, 0x1004))));
+        assert!(add.branch_write_pc);
+        let mov = decode(Arch::Arm, &[0x03, 0xf0, 0xa0, 0xe1], 0x1000, false).unwrap();
+        assert_eq!(mov.flow, Flow::JumpVia(Via::Reg(3)));
+        assert!(!mov.branch_write_pc);
+        let bx = decode(Arch::Arm, &[0x18, 0x47], 0x1000, true).unwrap();
+        assert!(!bx.branch_write_pc, "bx interworke");
+    }
+
+    #[test]
+    fn root_specs_parse_names_addresses_and_forced_modes() {
+        assert_eq!(parse_root_spec("init"), Ok(RootSpec::Symbol("init".into())));
+        let address = |address: u64, thumb: Option<bool>| -> Result<RootSpec, String> {
+            Ok(RootSpec::Address { address, thumb })
+        };
+        assert_eq!(parse_root_spec("0x4c79"), address(0x4c79, None));
+        assert_eq!(parse_root_spec("t:4c78"), address(0x4c78, Some(true)));
+        assert_eq!(parse_root_spec("a:0x1000"), address(0x1000, Some(false)));
+        assert!(parse_root_spec("t:zz").is_err());
+        assert!(parse_root_spec("").is_err());
+        assert_eq!(parse_root_spec("t:4c78").unwrap().to_string(), "t:0x4c78");
+    }
+
+    #[test]
+    fn a_root_resolves_by_symbol_or_by_address() {
+        let mut data = vec![0u8; 0x2000];
+        put(&mut data, 0x1100, &0x4770u16.to_le_bytes());
+        let ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        let init = DynSymbol {
+            name: "init".to_string(),
+            defined: true,
+            bind: elf::STB_GLOBAL,
+            value: 0x1101,
+            size: 2,
+            func: true,
+        };
+        let symbols = [&init];
+        let resolve = |spec: RootSpec| resolve_root(&ctx, &symbols, &spec);
+        assert_eq!(
+            resolve(RootSpec::Symbol("init".into())),
+            Some((0x1100, true))
+        );
+        assert_eq!(resolve(RootSpec::Symbol("absent".into())), None);
+        let at = |address, thumb| RootSpec::Address { address, thumb };
+        assert_eq!(resolve(at(0x1100, Some(true))), Some((0x1100, true)));
+        assert_eq!(resolve(at(0x1100, None)), Some((0x1100, false)));
+        assert_eq!(resolve(at(0x1101, None)), Some((0x1100, true)));
+        assert_eq!(resolve(at(0x1101, Some(false))), Some((0x1100, false)));
+        assert_eq!(resolve(at(0x9000, None)), None, "hors du code");
+    }
+
+    #[test]
+    fn export_roots_skip_the_c_and_cxx_runtime() {
+        for name in [
+            "__cxa_atexit",
+            "__aeabi_memcpy",
+            "_ZNSt6vectorIiE9push_backEv",
+            "__stack_chk_fail",
+            "__gnu_Unwind_Find_exidx",
+            "_ZNK10__cxxabiv117__class_type_info10__do_catchEPKSt9type_infoPPvj",
+            "_ZNK9__gnu_cxx24__concurrence_lock_error4whatEv",
+            "_ZN17__eh_globals_initD1Ev",
+        ] {
+            assert!(is_runtime_symbol(name), "{name}");
+        }
+        for name in ["init", "Java_com_a_B_c", "JNI_OnLoad", "_ZN3foo3barEv"] {
+            assert!(!is_runtime_symbol(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_added_root_never_duplicates_an_existing_entry() {
+        let mut data = vec![0u8; 0x2000];
+        put(&mut data, CODE, &0xd65f03c0u32.to_le_bytes());
+        let ctx = Ctx::new(image(&data, elf::EM_AARCH64, 8));
+        let entries = vec![
+            jni_entry(CODE, false),
+            entry(CODE, false, ORIGIN_USER_ROOT, Val::Opaque(0)),
+            entry(CODE, false, ORIGIN_EXPORT, Val::Opaque(0)),
+        ];
+        let walked = walk_functions(&ctx, entries, &options(0, 100));
+        assert_eq!(walked.functions.len(), 1);
+        assert_eq!(walked.functions[0].origin, ORIGIN_JNI_STATIC);
+    }
+
+    #[test]
+    fn the_string_index_reaches_code_no_function_disassembled() {
+        let mut data = vec![0u8; 0x3000];
+        strings(&mut data);
+        assemble_thumb(&mut data, CODE, THUMB_JNI);
+        put(&mut data, 0x1014, &0xff6u32.to_le_bytes());
+        let mut ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        let (index, mode) = string_index(&ctx, Arch::Arm, &[], &[]);
+        assert_eq!(mode, Some(SWEEP_DEFAULT_THUMB));
+        let bar = index
+            .iter()
+            .find(|s| s.value == "com/foo/Bar")
+            .expect("indexée");
+        assert_eq!((bar.target.as_str(), bar.encoding), ("0x2000", "utf8"));
+        let r = bar
+            .refs
+            .iter()
+            .find(|r| r.address == "0x1006")
+            .expect("add r1, pc");
+        assert_eq!(r.function.as_deref(), Some("0x1000"));
+        assert_eq!(r.function_source, Some(SOURCE_PROLOGUE));
+
+        ctx.symbols.insert(CODE, ("handler".to_string(), 0x14));
+        let (index, _) = string_index(&ctx, Arch::Arm, &[], &[]);
+        let bar = index.iter().find(|s| s.value == "com/foo/Bar").unwrap();
+        let r = bar.refs.iter().find(|r| r.address == "0x1006").unwrap();
+        assert_eq!(r.function_source, Some(SOURCE_SYMBOL));
+    }
+
+    #[test]
+    fn mapping_symbols_choose_the_sweep_mode() {
+        let data = [0u8; 16];
+        let ctx = Ctx::new(image(&data, elf::EM_ARM, 4));
+        let map = |name: &str, value: u64| DynSymbol {
+            name: name.to_string(),
+            defined: true,
+            bind: elf::STB_LOCAL,
+            value,
+            size: 0,
+            func: false,
+        };
+        let locals = [map("$t", 0x1000), map("$d.1", 0x1010), map("$a", 0x1020)];
+        let (plan, label) = sweep_plan(&ctx, Arch::Arm, &locals);
+        assert_eq!(label, Some(SWEEP_MAPPING));
+        assert_eq!(plan.mode_at(0x1004), Some(true));
+        assert_eq!(plan.mode_at(0x1014), None);
+        assert_eq!(plan.next_mark(0x1014), Some(0x1020));
+        assert_eq!(plan.mode_at(0x1024), Some(false));
+        let (_, other) = sweep_plan(&ctx, Arch::Aarch64, &locals);
+        assert_eq!(other, None);
+    }
+
     /// Point d'entrée ARM d'un exécutable : main (0x1100) par ldr littéral en r2,
     /// puis __libc_init par la PLT.
     const ARM_LIBC_INIT: &[(u32, &str)] = &[
@@ -3666,6 +4306,14 @@ mod tests {
             "disambiguated_by",
             "veneer",
             "e59fc000",
+            ORIGIN_USER_ROOT,
+            ORIGIN_EXPORT,
+            SOURCE_SYMBOL,
+            SOURCE_DISASM,
+            SOURCE_PROLOGUE,
+            SWEEP_MAPPING,
+            SWEEP_FUNCTIONS,
+            SWEEP_DEFAULT_THUMB,
             "disasm_failed",
             "truncated_reason",
             "string_refs",
@@ -3676,7 +4324,11 @@ mod tests {
             "imports_called",
             jni::JNI_SOURCE,
         ];
-        for label in labels.iter().chain(NORETURN_IMPORTS) {
+        for label in labels
+            .iter()
+            .chain(NORETURN_IMPORTS)
+            .chain(RUNTIME_PREFIXES)
+        {
             assert!(legend.contains(label), "{label}");
         }
         for name in &jni::JNI_INVOKE_INTERFACE[jni::INVOKE_RESERVED_SLOTS..] {
