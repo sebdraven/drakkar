@@ -29,6 +29,7 @@ use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
 use super::apkzip::TolerantZip;
+use super::output_file_name;
 
 /// Une entrée extraite de l'APK.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,9 +63,9 @@ impl ExtractedEntry {
     /// séparateurs deviennent `_`, ce qui évite de recréer l'arborescence et
     /// garde une trace de l'emplacement d'origine.
     ///
-    /// `res/raw/plugin` → `res_raw_plugin`.
+    /// `res/raw/plugin` → `res_raw_plugin`. Borné par [`output_file_name`].
     pub fn output_name(&self) -> String {
-        self.entry.replace(['/', '\\'], "_")
+        output_file_name(&self.entry.replace(['/', '\\'], "_"), &self.entry)
     }
 
     /// Écrit l'entrée dans `dir` sous [`Self::output_name`]. Le répertoire est
@@ -389,7 +390,11 @@ La comparaison est insensible à la casse.
 
 Sécurité : une entrée dont le chemin contient \"..\" ou commence par \"/\" est refusée à
 l'écriture (Zip Slip). Le nom de sortie est dérivé du chemin d'archive avec les
-séparateurs remplacés par \"_\" : res/raw/plugin -> res_raw_plugin."
+séparateurs remplacés par \"_\" : res/raw/plugin -> res_raw_plugin. Au-delà de 200
+octets : <préfixe>__<sha256 du chemin d'archive><.ext>, où préfixe = début du nom
+aplati coupé sur un caractère UTF-8, sha256 = SHA-256 COMPLET (64 hex) du chemin
+d'archive (pas du contenu), .ext = extension d'origine si elle fait au plus 16 octets.
+Le récapitulatif affiche toujours le chemin d'archive au-dessus du fichier écrit."
 }
 
 #[cfg(test)]

@@ -23,7 +23,10 @@
 //! concernées (ASCII, CJK du BMP) sont identiques dans les deux encodages.
 
 use anyhow::{Context, Result};
+use std::io::{Cursor, Read, Seek};
 use std::path::Path;
+
+use super::apkzip::TolerantZip;
 
 /// Résultat d'une extraction, avec ce qui a échoué plutôt qu'un silence.
 #[derive(Debug, Default)]
@@ -120,31 +123,96 @@ pub fn extract(path: &Path) -> Result<StringPool> {
 }
 
 /// Un APK : agrège le pool de tous les `classes*.dex`.
+///
+/// Repli sur [`TolerantZip`] dès que le crate `zip` refuse l'archive à
+/// l'ouverture, une entrée à `by_index`, ou ses octets à `read_to_end`.
 pub fn extract_from_apk(path: &Path) -> Result<StringPool> {
-    use std::io::Read;
-
     let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut zip = zip::ZipArchive::new(file).context("read apk as zip")?;
+    match from_archive(file) {
+        Ok(pool) => Ok(pool),
+        Err(e) => {
+            tracing::warn!(
+                apk = %path.display(),
+                error = %e,
+                "crate zip en échec, repli sur le lecteur tolérant"
+            );
+            let zip = TolerantZip::open(path)
+                .with_context(|| format!("lecteur tolérant sur {}", path.display()))?;
+            Ok(from_tolerant(&zip))
+        }
+    }
+}
+
+/// Même chose depuis les octets de l'archive.
+pub fn extract_from_apk_bytes(apk: &[u8]) -> Result<StringPool> {
+    match from_archive(Cursor::new(apk)) {
+        Ok(pool) => Ok(pool),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "crate zip en échec, repli sur le lecteur tolérant"
+            );
+            Ok(from_tolerant(&TolerantZip::from_bytes(apk.to_vec())?))
+        }
+    }
+}
+
+fn is_dex_entry(name: &str) -> bool {
+    name.starts_with("classes") && name.ends_with(".dex")
+}
+
+fn from_archive<R: Read + Seek>(reader: R) -> Result<StringPool> {
+    let mut zip = zip::ZipArchive::new(reader).context("read apk as zip")?;
     let mut merged = StringPool::default();
 
     for i in 0..zip.len() {
-        let mut entry = zip.by_index(i)?;
+        let mut entry = zip
+            .by_index(i)
+            .with_context(|| format!("entrée zip #{i}"))?;
         let name = entry.name().to_string();
-        if !(name.starts_with("classes") && name.ends_with(".dex")) {
+        if !is_dex_entry(&name) {
             continue;
         }
         let mut buf = Vec::with_capacity(entry.size() as usize);
-        entry.read_to_end(&mut buf)?;
-        match from_bytes(&buf) {
-            Ok(p) => {
-                merged.declared += p.declared;
-                merged.unreadable += p.unreadable;
-                merged.strings.extend(p.strings);
-            }
-            Err(e) => tracing::warn!(entry = %name, error = %e, "dex illisible, ignoré"),
-        }
+        entry
+            .read_to_end(&mut buf)
+            .with_context(|| format!("lecture {name}"))?;
+        merged.absorb(&name, &buf);
     }
     Ok(merged)
+}
+
+/// Une entrée illisible est ignorée, comme dans `parser::extract_apk_tolerant`.
+fn from_tolerant(zip: &TolerantZip) -> StringPool {
+    tracing::warn!(
+        entries = zip.len(),
+        tampered = zip.tampered_count(),
+        "lecteur tolérant actif"
+    );
+    let mut merged = StringPool::default();
+    for (i, entry) in zip.entries().iter().enumerate() {
+        if !is_dex_entry(&entry.name) {
+            continue;
+        }
+        match zip.read(i) {
+            Ok(buf) => merged.absorb(&entry.name, &buf),
+            Err(e) => tracing::warn!(entry = %entry.name, error = %e, "entrée illisible, ignorée"),
+        }
+    }
+    merged
+}
+
+impl StringPool {
+    fn absorb(&mut self, entry: &str, buf: &[u8]) {
+        match from_bytes(buf) {
+            Ok(p) => {
+                self.declared += p.declared;
+                self.unreadable += p.unreadable;
+                self.strings.extend(p.strings);
+            }
+            Err(e) => tracing::warn!(entry = %entry, error = %e, "dex illisible, ignoré"),
+        }
+    }
 }
 
 /// Route selon le contenu : APK ou DEX brut. Réutilise le reniflage de
@@ -181,5 +249,46 @@ mod tests {
     #[test]
     fn refuse_non_dex() {
         assert!(from_bytes(b"PK\x03\x04").is_err());
+    }
+
+    /// DEX minimal : une chaîne, `string_ids` en 0x70, `string_data_item` en 0x74.
+    fn dex_with(s: &str) -> Vec<u8> {
+        let mut dex = vec![0u8; 0x74];
+        dex[0..8].copy_from_slice(b"dex\n035\0");
+        dex[0x38..0x3C].copy_from_slice(&1u32.to_le_bytes());
+        dex[0x3C..0x40].copy_from_slice(&0x70u32.to_le_bytes());
+        dex[0x70..0x74].copy_from_slice(&0x74u32.to_le_bytes());
+        dex.push(s.len() as u8);
+        dex.extend_from_slice(s.as_bytes());
+        dex.push(0);
+        dex
+    }
+
+    #[test]
+    fn encryption_flag_falls_back_to_the_tolerant_reader() {
+        use std::io::Write;
+
+        let mut apk = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut apk));
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file("classes.dex", opts).unwrap();
+            zw.write_all(&dex_with("http://c2.example/gate")).unwrap();
+            zw.finish().unwrap();
+        }
+        // Bit 0 des GP flags : local header (+6) et central directory (+8).
+        for (sig, at) in [(b"PK\x03\x04", 6), (b"PK\x01\x02", 8)] {
+            let off = apk.windows(4).position(|w| w == sig).unwrap();
+            apk[off + at] |= 1;
+        }
+        let refused = zip::ZipArchive::new(Cursor::new(&apk)).map_or(true, |mut z| {
+            let refused = z.by_index(0).is_err();
+            refused
+        });
+        assert!(refused);
+
+        let pool = extract_from_apk_bytes(&apk).unwrap();
+        assert_eq!(pool.strings, vec!["http://c2.example/gate"]);
+        assert_eq!((pool.declared, pool.unreadable), (1, 0));
     }
 }
