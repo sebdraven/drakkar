@@ -71,9 +71,8 @@ md-5 = "0.10"
 # Cargo.lock.
 dex-bytecode = { git = "https://github.com/androguard/dex-bytecode" }
 
-# Décompilation Java (--decompile, --bundle). Repo Androguard, Apache-2.0.
-# Consommé UNIQUEMENT par parser::decompile.
-dex-decompiler = { git = "https://github.com/androguard/dex-decompiler", rev = "f7fa4a4853d957ebc3c54355d128a3835ef5ae22" }
+# Fork sebdraven: utf8 byte push (androguard/dex-decompiler#1) + noms hors litteraux.
+dex-decompiler = { git = "https://github.com/sebdraven/dex-decompiler", rev = "b1e8ac3510dc2964cb8b607079bb6c610f21a3f2" }
 
 # Lecture des ELF (--native, parser::native_static) : en-têtes, sections,
 # segments, table dynamique, symboles. Pur Rust, lecture seule. `unaligned` :
