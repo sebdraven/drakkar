@@ -459,7 +459,7 @@ mod tests {
 
     #[test]
     fn text_has_one_line_per_category() {
-        let r = scan(&report(), &[]);
+        let r = scan(&report(), &["Lcom/sdk/".to_string()]);
         let text = render(&r);
         assert_eq!(text.lines().count(), CATEGORIES.len());
         let sms = text.lines().find(|l| l.starts_with("sms ")).unwrap();
