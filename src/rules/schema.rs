@@ -4,15 +4,18 @@
 //! maps à clé unique (`and:` …) — il exige des tags `!and`. Pour garder un YAML
 //! de règles lisible (maps à clé unique), on désérialise `Feature` à la main
 //! depuis une map générique.
-use serde::Deserialize;
+//!
+//! `Serialize` sert à `Engine::rules_hash` : la règle telle que lue, champs dans
+//! l'ordre de déclaration.
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Rule {
     pub meta: Meta,
     pub features: Feature,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Meta {
     pub id: String,
     pub name: String,
@@ -39,7 +42,7 @@ fn default_detectability() -> String {
 ///   count: { feature: {...}, min: 2 }
 ///   sequence: [ {api: ...}, {api: ...} ]
 ///   api / string / permission / intent-action / native-symbol : scalaire
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum Feature {
     And(Vec<Feature>),
     Or(Vec<Feature>),

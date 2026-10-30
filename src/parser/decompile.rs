@@ -39,6 +39,8 @@ pub struct DexEntry {
 pub struct Input {
     pub kind: InputKind,
     pub sha256: String,
+    /// Taille du fichier d'entrée, en octets.
+    pub size: u64,
     pub dexes: Vec<DexEntry>,
     _tmp: Option<tempfile::TempDir>,
 }
@@ -176,14 +178,22 @@ pub struct Decompiled {
     pub errors: Vec<BundleError>,
 }
 
+/// Version de la structure du bundle, incrémentée à toute modification
+/// incompatible (`--bundle --legend`).
+pub const BUNDLE_SCHEMA_VERSION: u32 = 1;
+
 /// Contenu de `bundle.json`.
 #[derive(Serialize)]
 pub struct BundleInfo<'a> {
+    pub schema_version: u32,
     pub sha256: &'a str,
+    pub input_size: u64,
     pub input_kind: &'static str,
     pub dex_files: Vec<DexFileInfo<'a>>,
     pub drakkar_version: &'static str,
     pub decompiler: DecompilerInfo,
+    /// `None` quand rules.json est null.
+    pub rules_hash: Option<String>,
     pub generated_at: String,
     pub packed: Packed,
     pub stats: &'a Stats,
@@ -211,9 +221,16 @@ pub struct Packed {
 }
 
 impl<'a> BundleInfo<'a> {
-    pub fn new(input: &'a Input, stats: &'a Stats, generated_at: String) -> Self {
+    pub fn new(
+        input: &'a Input,
+        stats: &'a Stats,
+        generated_at: String,
+        rules_hash: Option<String>,
+    ) -> Self {
         Self {
+            schema_version: BUNDLE_SCHEMA_VERSION,
             sha256: &input.sha256,
+            input_size: input.size,
             input_kind: match input.kind {
                 InputKind::Apk => "apk",
                 InputKind::Dex => "dex",
@@ -231,6 +248,7 @@ impl<'a> BundleInfo<'a> {
                 krate: "dex-decompiler",
                 rev: decompiler_rev(),
             },
+            rules_hash,
             generated_at,
             packed: Packed {
                 detected: None,
@@ -291,6 +309,9 @@ pub fn open(path: &Path) -> Result<Input> {
     Ok(Input {
         kind,
         sha256: sha256_file(path)?,
+        size: std::fs::metadata(path)
+            .with_context(|| format!("stat {}", path.display()))?
+            .len(),
         dexes,
         _tmp: tmp,
     })
@@ -1150,13 +1171,22 @@ Arborescence : OUT/<sha256 complet de l'entrée>/
                        decompile_class échoue.
   classes/<id>.dasm    Désassemblage, format --disasm (--disasm --legend).
   classes/<id>.json    Une entrée par méthode.
+Avec --archive, en plus : OUT/<sha256>.bundle.zip, voir Archive plus bas.
 Les fichiers de classes/ sont nommés par id, JAMAIS par descripteur : sur un
 système de fichiers insensible à la casse (APFS par défaut), les classes
 obfusquées La; et LA; s'écraseraient. La correspondance id ↔ descripteur
 n'existe que dans index.json.
 
 bundle.json
+  schema_version   Entier, vaut 1. Version de la STRUCTURE du bundle : noms et
+                   emplacements des fichiers, champs, types et sémantique.
+                   Incrémenté à toute modification incompatible : fichier ou
+                   champ renommé, déplacé ou retiré, type ou sens d'un champ
+                   changé. Un fichier ou un champ AJOUTÉ ne l'incrémente pas :
+                   un lecteur ignore ce qu'il ne connaît pas. Absent des
+                   bundles écrits avant son introduction.
   sha256           SHA-256 complet du fichier d'entrée.
+  input_size       Taille du fichier d'entrée, en octets.
   input_kind       apk (PK\\x03\\x04) | dex (dex\\n).
   dex_files        {name, sha256} par DEX lu, dans l'ordre de l'archive. name :
                    chemin de l'entrée, `/` aplati en `__` ; nom du fichier pour
@@ -1165,6 +1195,29 @@ bundle.json
   decompiler       {crate, rev}. rev = commit complet de dex-decompiler résolu
                    dans le Cargo.lock compilé avec ce binaire ; null s'il n'y
                    figure pas.
+  rules_hash       SHA-256 complet (64 hex minuscules) du jeu de règles qui a
+                   produit rules.json et du catalogue MITRE dont il vient.
+                   Entrée hachée, octet pour octet :
+                     `drakkar-rules/1` puis \\n ;
+                     le JSON compact de catalog, puis \\n ;
+                     pour chaque règle chargée, son JSON compact puis \\n, les
+                     règles triées par ordre d'octets de ce JSON.
+                   JSON d'une règle : la règle telle que Drakkar l'a lue,
+                   {meta: {id, name, tactic, references, authors,
+                   detectability, platforms}, features}, champs dans cet
+                   ordre ; features est l'arbre lu, variantes nommées comme
+                   dans src/rules/schema.rs ({\"And\": […]}, {\"Api\": \"…\"}…).
+                   Une clé YAML que Drakkar ignore n'y entre pas, ni le nom
+                   ou l'ordre des fichiers du répertoire de règles.
+                   catalog : null avec --rules DIR (aucun catalogue chargé) ;
+                   sinon {catalog_sha256, stix_sha256} : SHA-256 du source du
+                   catalogue de détection compilé dans drakkar
+                   (src/rules/catalog.rs), et SHA-256 du STIX MITRE en cache
+                   (mobile-attack.json), null s'il en est absent.
+                   Une règle ou le catalogue change : le hash change. Mêmes
+                   règles et même catalogue : même hash, d'une exécution ou
+                   d'une machine à l'autre. null quand rules.json est null
+                   (errors.json, stage rules).
   generated_at     Date de génération, ISO 8601 UTC.
   packed           {detected, packer, evidence}. detected :
                      null  = non évalué. ⚠️ Drakkar n'a PAS de détection de
@@ -1337,6 +1390,43 @@ errors.json — {stage, dex, class_id, target, error}
   dex      Le name de dex_files concerné, null s'il n'y en a pas.
   class_id L'id de index.json concerné, null s'il n'y en a pas.
   target   Descripteur de classe ou signature de méthode, null sinon.
+
+Archive (--archive) — OUT/<sha256>.bundle.zip, écrite après le répertoire
+  Contenu        Tous les fichiers de OUT/<sha256>/, chacun sous le préfixe
+                 `<sha256>/` : <sha256>/bundle.json, <sha256>/index.json…,
+                 <sha256>/classes/000000.java… Fichiers réguliers seulement,
+                 aucune entrée de répertoire ; un lien symbolique ou tout
+                 autre fichier non régulier fait échouer l'archive.
+  Déterminisme   Entrées triées par chemin, ordre d'octets. Horodatage fixe
+                 1980-01-01 00:00:00, permissions fixes 0644, aucun champ
+                 extra (ni uid/gid, ni temps étendus), compression deflate
+                 niveau 6.
+  Garantie       Même contenu de répertoire → mêmes octets, donc même
+                 SHA-256, quels que soient les dates, propriétaires et modes
+                 des fichiers sur disque, à binaire drakkar égal (le
+                 compresseur deflate est celui compilé dedans). ⚠️ Pas
+                 « même entrée → même archive » : generated_at, dans
+                 bundle.json, change à chaque exécution, donc deux bundles
+                 d'une même entrée et leurs archives diffèrent. Pour savoir si
+                 deux bundles décrivent la même chose, comparer sha256,
+                 rules_hash et le contenu, pas l'archive.
+  Écriture       Fichier temporaire caché dans OUT, renommé en
+                 <sha256>.bundle.zip une fois complet : l'archive est entière
+                 ou absente. Existante : refus sans --overwrite, comme le
+                 répertoire, avant toute écriture. Avec --overwrite, une
+                 archive existante est remplacée avec --archive, supprimée
+                 sans, en même temps que le répertoire : elle ne survit
+                 jamais à la régénération du bundle.
+
+Rapport de --bundle, sur stdout
+  text (défaut)  Une ligne clé<TAB>valeur : bundle_dir, puis avec --archive
+                 archive_path, archive_size, archive_sha256.
+  json           --format json : {bundle_dir, stats, errors, archive} ;
+                 stats comme dans bundle.json, errors = nombre d'entrées de
+                 errors.json, archive = {path, size, sha256}, null sans
+                 --archive. --json-out FILE l'écrit dans FILE.
+  archive_size (size) est en octets ; archive_sha256 (sha256) est le SHA-256
+  complet du .bundle.zip. La ligne [OK] de stderr ne change pas.
 
 --decompile <MOTIF>
   Même sélection que --disasm : sous-chaîne du descripteur Dalvik, insensible
@@ -1527,6 +1617,30 @@ source = "git+https://github.com/androguard/dex-decompiler?rev=f7fa4a4853d957ebc
         );
         assert!(partial_markers("        // try/catch (x tries)\n").is_empty());
         assert!(partial_markers("        return v0;\n").is_empty());
+    }
+
+    /// Un DEX reconnu au magic ; `open` ne le parse pas.
+    fn dex_brut(dir: &Path) -> PathBuf {
+        let path = dir.join("classes.dex");
+        std::fs::write(&path, b"dex\n035\0").unwrap();
+        path
+    }
+
+    #[test]
+    fn bundle_json_porte_schema_version_et_taille_de_l_entree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = dex_brut(tmp.path());
+        let input = open(&path).unwrap();
+        let stats = Stats::default();
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let info = BundleInfo::new(&input, &stats, String::new(), Some(hash.into()));
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["input_size"], std::fs::metadata(&path).unwrap().len());
+        assert_eq!(json["rules_hash"], hash);
+
+        let info = BundleInfo::new(&input, &stats, String::new(), None);
+        assert!(serde_json::to_value(&info).unwrap()["rules_hash"].is_null());
     }
 
     #[test]
