@@ -5,9 +5,10 @@
 //! Android, fusionne chaque technique avec sa logique de détection embarquée
 //! (`catalog::detection_for`), et écrit un fichier YAML par technique dans le
 //! cache local. Les lancements suivants lisent directement le cache.
-use super::catalog;
+use super::{catalog, CatalogId};
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// URL du bundle STIX Mobile sans marquage de version : suit toujours la
@@ -28,6 +29,24 @@ fn catalog_hash() -> u64 {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
+}
+
+/// STIX mis en cache à côté des YAML générés.
+const STIX_FILE: &str = "mobile-attack.json";
+
+/// Catalogue d'où viennent les règles du cache `dir`. Un STIX absent donne
+/// `stix_sha256: None` ; toute autre erreur de lecture est rendue.
+pub fn catalog_id(dir: &Path) -> Result<CatalogId> {
+    let path = dir.join(STIX_FILE);
+    let stix_sha256 = match std::fs::read(&path) {
+        Ok(bytes) => Some(format!("{:x}", Sha256::digest(bytes))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    Ok(CatalogId {
+        catalog_sha256: format!("{:x}", Sha256::digest(CATALOG_SRC.as_bytes())),
+        stix_sha256,
+    })
 }
 
 /// Répertoire de cache des règles : ~/.cache/drakkar/rules/
@@ -126,7 +145,7 @@ fn generate_cache(dir: &Path, refresh: bool) -> Result<()> {
 /// serde_yaml parse aussi le JSON (JSON ⊂ YAML), ce qui évite une dépendance
 /// serde_json directe.
 fn load_or_download_stix(dir: &Path, refresh: bool) -> Result<StixBundle> {
-    let stix_path = dir.join("mobile-attack.json");
+    let stix_path = dir.join(STIX_FILE);
     if stix_path.is_file() && !refresh {
         let raw = std::fs::read_to_string(&stix_path).context("read cached STIX")?;
         return serde_yaml::from_str(&raw).context("parse cached STIX");

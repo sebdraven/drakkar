@@ -15,6 +15,7 @@ pub mod apkzip;
 pub mod arsc;
 pub mod assets;
 pub mod axml;
+pub mod bundle_archive;
 pub mod capabilities;
 pub mod cert;
 pub mod dating;

@@ -8,6 +8,7 @@ use crate::model::ApkFeatures;
 use anyhow::{Context, Result};
 use petgraph::graph::NodeIndex;
 use schema::{Feature, Rule};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 
@@ -78,8 +79,19 @@ impl Evidence {
     }
 }
 
+/// Catalogue MITRE d'où viennent les règles du cache.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CatalogId {
+    /// SHA-256 du source de `catalog.rs` compilé dans ce binaire.
+    pub catalog_sha256: String,
+    /// SHA-256 du STIX en cache, `None` s'il est absent.
+    pub stix_sha256: Option<String>,
+}
+
 pub struct Engine {
     rules: Vec<Rule>,
+    /// `None` avec `--rules DIR` : aucun catalogue n'est chargé.
+    catalog: Option<CatalogId>,
 }
 
 impl Engine {
@@ -96,13 +108,41 @@ impl Engine {
             }
         }
         tracing::info!(count = rules.len(), "rules loaded");
-        Ok(Self { rules })
+        Ok(Self {
+            rules,
+            catalog: None,
+        })
     }
 
     /// Charge depuis le cache auto-généré (DL du STIX au 1er lancement ou si refresh).
     pub fn load_cached(refresh: bool) -> Result<Self> {
         let dir = fetch::ensure_cache(refresh)?;
-        Self::load(&dir)
+        let mut engine = Self::load(&dir)?;
+        engine.catalog = Some(fetch::catalog_id(&dir)?);
+        Ok(engine)
+    }
+
+    /// SHA-256 du jeu de règles chargé et de son catalogue, indépendant de
+    /// l'ordre de lecture des fichiers. Entrée hachée : `drakkar-rules/1\n`, le
+    /// JSON compact du catalogue (`null` sans catalogue) et `\n`, puis le JSON
+    /// compact de chaque règle suivi de `\n`, règles triées par octets de ce
+    /// JSON (`--bundle --legend`, rules_hash).
+    pub fn rules_hash(&self) -> Result<String> {
+        let mut rules = self
+            .rules
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()?;
+        rules.sort();
+        let mut h = Sha256::new();
+        h.update(b"drakkar-rules/1\n");
+        h.update(serde_json::to_string(&self.catalog)?.as_bytes());
+        h.update(b"\n");
+        for r in &rules {
+            h.update(r.as_bytes());
+            h.update(b"\n");
+        }
+        Ok(format!("{:x}", h.finalize()))
     }
 
     pub fn run(&self, features: &ApkFeatures, cg: &CallGraph) -> Vec<Match> {
@@ -401,4 +441,70 @@ fn count_matches(
 fn dedup_evidence(ev: &mut Vec<Evidence>) {
     let mut seen = std::collections::HashSet::new();
     ev.retain(|e| seen.insert((e.kind.clone(), e.value.clone())));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SHA-256 de `abc`.
+    const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    fn repo_rules() -> Engine {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("rules/mitre");
+        Engine::load(&dir).expect("rules/mitre se charge")
+    }
+
+    #[test]
+    fn rules_hash_is_whole_lowercase_hex_and_stable() {
+        let a = repo_rules().rules_hash().unwrap();
+        let b = repo_rules().rules_hash().unwrap();
+        assert_eq!(a.len(), 64, "{a}");
+        assert!(
+            a.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')),
+            "{a}"
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn rules_hash_ignores_the_load_order() {
+        let mut engine = repo_rules();
+        assert!(engine.rules.len() >= 2);
+        let a = engine.rules_hash().unwrap();
+        engine.rules.reverse();
+        assert_eq!(engine.rules_hash().unwrap(), a);
+    }
+
+    #[test]
+    fn rules_hash_follows_a_rule_and_the_catalog() {
+        let mut engine = repo_rules();
+        let base = engine.rules_hash().unwrap();
+        engine.catalog = Some(CatalogId {
+            catalog_sha256: ABC.into(),
+            stix_sha256: None,
+        });
+        let with_catalog = engine.rules_hash().unwrap();
+        assert_ne!(with_catalog, base);
+        engine.catalog = Some(CatalogId {
+            catalog_sha256: ABC.into(),
+            stix_sha256: Some(ABC.into()),
+        });
+        let with_stix = engine.rules_hash().unwrap();
+        assert_ne!(with_stix, with_catalog);
+        engine.rules[0].meta.name.push('!');
+        assert_ne!(engine.rules_hash().unwrap(), with_stix);
+    }
+
+    #[test]
+    fn catalog_id_hashes_the_cached_stix_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = fetch::catalog_id(dir.path()).unwrap();
+        assert_eq!(id.catalog_sha256.len(), 64);
+        assert!(id.stix_sha256.is_none());
+        let stix = dir.path().join("mobile-attack.json");
+        fs::write(&stix, "abc").unwrap();
+        let id = fetch::catalog_id(dir.path()).unwrap();
+        assert_eq!(id.stix_sha256.as_deref(), Some(ABC));
+    }
 }

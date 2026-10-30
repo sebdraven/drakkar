@@ -67,7 +67,9 @@ struct Cli {
     recursive: bool,
 
     /// Ré-analyse même si le JSON de sortie existe déjà (mode bulk). Avec
-    /// --bundle : remplace le répertoire OUT/<sha256> existant.
+    /// --bundle : remplace le répertoire OUT/<sha256> existant ; une archive
+    /// OUT/<sha256>.bundle.zip existante est remplacée avec --archive,
+    /// supprimée sans.
     #[arg(long)]
     overwrite: bool,
 
@@ -437,9 +439,15 @@ struct Cli {
     /// désassemblée et décompilée. Accepte un APK ou un DEX brut, reconnu au
     /// contenu. Mode single : `drakkar <APK> --bundle <OUT>`. Refuse un
     /// répertoire existant sans --overwrite. --bundle --legend définit chaque
-    /// fichier et chaque champ.
+    /// fichier et chaque champ. Rapport sur stdout, --format json disponible.
     #[arg(long, value_name = "OUT", num_args = 0..=1, conflicts_with = "bulk")]
     bundle: Option<Option<PathBuf>>,
+
+    /// (--bundle) Écrit aussi OUT/<sha256>.bundle.zip : tout le répertoire du
+    /// bundle sous `<sha256>/`, octets déterministes. Refuse une archive
+    /// existante sans --overwrite. Chemin, taille et SHA-256 dans le rapport.
+    #[arg(long)]
+    archive: bool,
 
     /// Diff EXPLIQUÉ de deux DEX (ou APK), en mémoire : compare les opérandes
     /// RÉSOLUES des méthodes de même empreinte d'opcodes, index par index, et
@@ -630,6 +638,7 @@ fn main() -> Result<()> {
     if !cli.capabilities_exclude.is_empty() && cli.capabilities.is_none() {
         bail!("--capabilities-exclude n'a d'effet qu'avec --capabilities");
     }
+    check_archive(&cli)?;
 
     // Sortie rapide : audit d'architecture native seul (pas de moteur de règles,
     // pas de catalogue MITRE) — lit uniquement les en-têtes ELF, en mémoire.
@@ -1465,12 +1474,13 @@ est racine — ne pas comparer à une mesure `manifest`)",
             println!("{}", parser::decompile::legend());
             return Ok(());
         }
-        reject_format(
-            "--bundle",
-            cli.format,
-            "le bundle est une arborescence fixe de fichiers JSON, TSV et texte, décrite par \
-             --bundle --legend",
-        )?;
+        if matches!(cli.format, Format::Both | Format::Csv) {
+            bail!(
+                "le rapport de --bundle est du texte (défaut) ou du JSON : --format both et \
+                 --format csv y sont sans effet, donc refusés plutôt qu'ignorés. Le bundle \
+                 lui-même est une arborescence fixe, décrite par --bundle --legend"
+            );
+        }
         let Some(out) = out else {
             bail!("--bundle requiert un répertoire de sortie : drakkar <APK> --bundle <OUT>");
         };
@@ -2215,7 +2225,7 @@ fn dyn_entrypoints_tsv(
 fn run_bundle(input: &std::path::Path, out: &std::path::Path, cli: &Cli) -> Result<()> {
     use parser::decompile::{self, BundleError, BundleInfo};
     use parser::dyn_entrypoints::InputKind;
-    use parser::{cert, dating, manifest_info};
+    use parser::{bundle_archive, cert, dating, manifest_info};
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2225,16 +2235,12 @@ fn run_bundle(input: &std::path::Path, out: &std::path::Path, cli: &Cli) -> Resu
 
     let src = decompile::open(input)?;
     let root = out.join(&src.sha256);
-    if root.exists() {
-        if !cli.overwrite {
-            bail!(
-                "{} existe déjà — --overwrite pour le remplacer",
-                root.display()
-            );
-        }
-        std::fs::remove_dir_all(&root)
-            .with_context(|| format!("suppression {}", root.display()))?;
+    let zip = bundle_archive::archive_path(out, &src.sha256);
+    refuse_existing(&root, cli.overwrite)?;
+    if cli.archive {
+        refuse_existing(&zip, cli.overwrite)?;
     }
+    clear_previous(&root, &zip, cli.overwrite, cli.archive)?;
     let classes_dir = root.join("classes");
     std::fs::create_dir_all(&classes_dir)
         .with_context(|| format!("création {}", classes_dir.display()))?;
@@ -2266,14 +2272,22 @@ fn run_bundle(input: &std::path::Path, out: &std::path::Path, cli: &Cli) -> Resu
         Some(dir) => Engine::load(dir),
         None => Engine::load_cached(cli.refresh),
     };
-    let matches = match engine {
-        Ok(engine) => bundle_part("rules", &mut errors, || {
-            let parsed = parser::parse_any(input)?;
-            Ok(engine.run(&parsed.features, &parsed.call_graph))
-        }),
+    let (matches, rules_hash) = match engine {
+        Ok(engine) => {
+            let matches = bundle_part("rules", &mut errors, || {
+                let parsed = parser::parse_any(input)?;
+                Ok(engine.run(&parsed.features, &parsed.call_graph))
+            });
+            let hash = if matches.is_some() {
+                bundle_part("rules", &mut errors, || engine.rules_hash())
+            } else {
+                None
+            };
+            (matches, hash)
+        }
         Err(e) => {
             errors.push(BundleError::new("rules", format!("{e:#}")));
-            None
+            (None, None)
         }
     };
     write_bundle_json(&root, "rules.json", &matches)?;
@@ -2305,12 +2319,17 @@ fn run_bundle(input: &std::path::Path, out: &std::path::Path, cli: &Cli) -> Resu
     }
     write_bundle_json(&root, "index.json", &index)?;
 
-    let info = BundleInfo::new(&src, &decompiled.stats, generated_at);
+    let info = BundleInfo::new(&src, &decompiled.stats, generated_at, rules_hash);
     write_bundle_json(&root, "bundle.json", &info)?;
 
     let mut all_errors = decompiled.errors;
     all_errors.extend(errors);
     write_bundle_json(&root, "errors.json", &all_errors)?;
+
+    let archive = cli
+        .archive
+        .then(|| bundle_archive::write(&root, &zip, cli.overwrite))
+        .transpose()?;
 
     let s = &decompiled.stats;
     eprintln!(
@@ -2323,6 +2342,75 @@ fn run_bundle(input: &std::path::Path, out: &std::path::Path, cli: &Cli) -> Resu
         s.decompile_failed,
         all_errors.len()
     );
+    let report = BundleReport {
+        bundle_dir: root.display().to_string(),
+        stats: s,
+        errors: all_errors.len(),
+        archive,
+    };
+    if cli.format == Format::Json {
+        emit_json(&report, cli.json_out.as_deref())?;
+    } else {
+        print!("{}", bundle_report_text(&report));
+    }
+    Ok(())
+}
+
+/// Rapport de `--bundle` sur stdout (`--bundle --legend`).
+#[derive(serde::Serialize)]
+struct BundleReport<'a> {
+    bundle_dir: String,
+    stats: &'a parser::decompile::Stats,
+    errors: usize,
+    archive: Option<parser::bundle_archive::ArchiveInfo>,
+}
+
+fn bundle_report_text(r: &BundleReport) -> String {
+    let mut s = format!("bundle_dir\t{}\n", r.bundle_dir);
+    if let Some(a) = &r.archive {
+        s.push_str(&format!("archive_path\t{}\n", a.path));
+        s.push_str(&format!("archive_size\t{}\n", a.size));
+        s.push_str(&format!("archive_sha256\t{}\n", a.sha256));
+    }
+    s
+}
+
+/// `--archive` n'a d'effet qu'avec `--bundle` : refusé plutôt qu'ignoré.
+fn check_archive(cli: &Cli) -> Result<()> {
+    if cli.archive && cli.bundle.is_none() {
+        bail!("--archive requiert --bundle : drakkar <APK> --bundle <OUT> --archive");
+    }
+    Ok(())
+}
+
+/// Une sortie de `--bundle` déjà présente n'est remplacée qu'avec --overwrite.
+fn refuse_existing(path: &std::path::Path, overwrite: bool) -> Result<()> {
+    if path.exists() && !overwrite {
+        bail!(
+            "{} existe déjà — --overwrite pour le remplacer",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Avec --overwrite, efface le bundle précédent : le répertoire, et l'archive
+/// quand --archive ne la remplace pas par renommage.
+fn clear_previous(
+    root: &std::path::Path,
+    zip: &std::path::Path,
+    overwrite: bool,
+    archive: bool,
+) -> Result<()> {
+    if !overwrite {
+        return Ok(());
+    }
+    if root.exists() {
+        std::fs::remove_dir_all(root).with_context(|| format!("suppression {}", root.display()))?;
+    }
+    if !archive && zip.exists() {
+        std::fs::remove_file(zip).with_context(|| format!("suppression {}", zip.display()))?;
+    }
     Ok(())
 }
 
@@ -3481,5 +3569,79 @@ mod tests {
         assert_eq!(c["Landroid/telephony/SmsManager;"].direct, ["R1"]);
         assert!(c["Landroid/telephony/SmsManager;"].path.is_empty());
         assert!(!c.contains_key("Landroid/os/Bundle;"));
+    }
+
+    // --- --archive : seulement avec --bundle, jamais d'écrasement implicite ---
+
+    #[test]
+    fn archive_without_bundle_is_refused() {
+        let argv = ["drakkar", "sample.apk", "--archive"];
+        let cli = Cli::try_parse_from(argv).unwrap();
+        let message = check_archive(&cli).unwrap_err().to_string();
+        assert!(message.contains("--bundle"), "{message}");
+    }
+
+    #[test]
+    fn archive_with_bundle_is_accepted() {
+        let argv = ["drakkar", "sample.apk", "--bundle", "/out", "--archive"];
+        let cli = Cli::try_parse_from(argv).unwrap();
+        assert!(check_archive(&cli).is_ok());
+    }
+
+    #[test]
+    fn an_existing_output_needs_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("x.bundle.zip");
+        assert!(refuse_existing(&zip, false).is_ok());
+        std::fs::write(&zip, "").unwrap();
+        assert!(refuse_existing(&zip, false).is_err());
+        assert!(refuse_existing(&zip, true).is_ok());
+    }
+
+    #[test]
+    fn overwrite_without_archive_removes_the_previous_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("b");
+        let zip = dir.path().join("b.bundle.zip");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("bundle.json"), "{}").unwrap();
+        std::fs::write(&zip, "").unwrap();
+
+        clear_previous(&root, &zip, false, false).unwrap();
+        assert!(root.exists() && zip.exists());
+
+        clear_previous(&root, &zip, true, true).unwrap();
+        assert!(!root.exists());
+        assert!(zip.exists(), "--archive la remplace par renommage");
+
+        std::fs::create_dir_all(&root).unwrap();
+        clear_previous(&root, &zip, true, false).unwrap();
+        assert!(!root.exists());
+        assert!(!zip.exists());
+    }
+
+    #[test]
+    fn the_text_report_names_the_archive_whole() {
+        let sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let stats = parser::decompile::Stats::default();
+        let mut report = BundleReport {
+            bundle_dir: "/out/b".into(),
+            stats: &stats,
+            errors: 0,
+            archive: None,
+        };
+        assert_eq!(bundle_report_text(&report), "bundle_dir\t/out/b\n");
+        report.archive = Some(parser::bundle_archive::ArchiveInfo {
+            path: "/out/b.bundle.zip".into(),
+            size: 42,
+            sha256: sha256.into(),
+        });
+        let expected = format!(
+            "bundle_dir\t/out/b\narchive_path\t/out/b.bundle.zip\narchive_size\t42\narchive_sha256\t{sha256}\n"
+        );
+        assert_eq!(bundle_report_text(&report), expected);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["archive"]["sha256"], sha256);
+        assert_eq!(json["archive"]["size"], 42);
     }
 }
