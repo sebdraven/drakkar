@@ -1,134 +1,247 @@
 # Drakkar
 
-Static MITRE ATT&CK for Mobile detection on Android APKs.
+Static analysis of Android applications, built for stalkerware and mobile
+malware research.
 
-Pipeline : **LIEF** (DEX / ELF / manifest) → **CFG inter-procédural** →
-**matching MITRE** (DSL composable style capa) → export **NetworkX**
-(pour APKolgomorov) + confirmation dynamique optionnelle via **Kharon**.
+Drakkar reads an APK, or a raw DEX, and answers one question per mode: which
+MITRE ATT&CK for Mobile behaviours it implements, whether they are reachable,
+who signed it, when it was built, what its native code does at the JNI
+boundary, how close it is to another sample. Every mode prints its own legend:
+`drakkar --<mode> --legend` defines each label and each field it emits, and
+states the limits of each metric.
 
-## Build
+Nothing is executed. Samples are parsed, never run, never emulated.
+
+## Install
+
+Each release ships one bare executable per target, with nothing to unpack:
+
+| Target | Asset |
+|---|---|
+| macOS arm64 | `drakkar-vX.Y.Z-aarch64-apple-darwin` |
+| macOS x86_64 | `drakkar-vX.Y.Z-x86_64-apple-darwin` |
+| Linux x86_64 | `drakkar-vX.Y.Z-x86_64-unknown-linux-gnu` |
+| Linux arm64 | `drakkar-vX.Y.Z-aarch64-unknown-linux-gnu` |
+| Windows x86_64 | `drakkar-vX.Y.Z-x86_64-pc-windows-msvc.exe` |
+| Windows arm64 | `drakkar-vX.Y.Z-aarch64-pc-windows-msvc.exe` |
+
+Each binary comes with a `BUILD-INFO.txt`, and `SHA256SUMS` holds the full
+SHA-256 of every asset:
 
 ```sh
-cargo build                          # backend stub (instantané, sans LIEF)
-cargo build --features lief-backend  # backend LIEF (C++/CMake, build lourd)
+shasum -a 256 -c --ignore-missing SHA256SUMS   # macOS
+sha256sum -c --ignore-missing SHA256SUMS       # Linux
 ```
 
-## Run
+From source:
 
 ```sh
-drakkar app.apk --rules rules/mitre \
-  --export-graph cfg.json \
-  --kharon kharon_summary.json
+cargo build --release
 ```
 
-## Hooks git
+The optional `lief-backend` feature (`cargo build --features lief-backend`)
+pulls LIEF, a C++ build. Release binaries are built without it.
+
+## Inputs
+
+- **APK or raw DEX, recognised by content, never by extension** (`PK\x03\x04`,
+  `dex\n`). Most modes take either, which is how the DEX recovered from a
+  packed sample is analysed.
+- **Single or bulk.** One sample as the positional argument, or `--bulk DIR`
+  (with `--recursive`) for the modes that support it; bulk output goes to
+  `--out` (default `./reports`, `-` for stdout), one file per sample.
+- **Tampered archives.** When the `zip` crate refuses an APK (patched
+  general-purpose flags, non-standard compression methods, false sizes), a
+  tolerant reader takes over (`src/parser/apkzip.rs`). It never activates on a
+  well-formed archive.
+
+## Modes
+
+### Detection
+
+| Flag | What it answers |
+|---|---|
+| *(default)* | MITRE ATT&CK for Mobile detections, each with its evidence (declared permission, resolved API with its path from a manifest entry point, string, intimacy score). `--export-graph FILE` writes the call graph as NetworkX node-link JSON. |
+| `--capabilities [PATTERN…]` | invoke, `const-string` and `sget` sites matching capability patterns (accessibility, SMS, overlay, execution, DEX loading…). A site found is not proof of reachability. |
+| `--probe API` | is this API a node of the graph, and is it reachable from the roots — with the paths. |
+| `--orphan-audit` | methods unreachable from the entry points, grouped in weakly connected components, over four root stages (manifest, dynamic, UI handlers, `<clinit>`). |
+| `--dyn-entrypoints` | components reached other than by a manifest declaration: `registerReceiver`, `startActivity`, `new Intent(ctx, X.class)`, `Class.forName`… |
+| `--reflection-inputs` | where the name of each reflection target comes from (constant, decryptable constant, runtime, parameter…). |
+
+### Inventory
+
+| Flag | What it answers |
+|---|---|
+| `--manifest` | permissions, components, intent filters, derived entry points. |
+| `--cert` | signature schemes v1/v2/v3/v3.1 and the X.509 certificates, with full fingerprints. |
+| `--dating` | raw dating indicators: signing dates, build-chain floors (DEX format, schemes, compileSdk, library versions), archive timestamps, date literals in code, API targets. No date is ever estimated. |
+| `--strings [PATTERN…]` | the DEX string pool, whole or filtered (case-insensitive). |
+| `--api-surface` | the protocol declared by annotations: Retrofit verbs and routes, `@Path` / `@Query` names, Gson `@SerializedName` keys. An empty output means "not Retrofit", not "no route". |
+| `--resource NAME`, `--resource-id ID`, `--resources [TYPE…]` | resolve or dump `resources.arsc`. |
+| `--resource-xref`, `--resource-orphans` | join DEX constants to real resource entries; list resources no code constant references ("orphan" means unreferenced from code, not unused). |
+| `--list-entries` | every entry path of the archive; nothing extracted. |
+| `--list-assets`, `--extract-assets DIR`, `--assets-fingerprint` | the `assets/` entries: sizes, declared method, full SHA-256 of the decompressed content, sniffed type, entropy; a set fingerprint emitted only when it covers every asset. Filters: `--assets-include`, `--assets-max-size`, `--assets-hash[-file]`, `--assets-hash-exclude[-file]`. |
+| `--extract-entry PATTERN…` | extract matching entries only (exact path, glob or substring) — the archive is never unpacked whole. |
+| `--extract-libs` | every native ELF, including the ones outside `lib/` (packer stubs under `assets/`). |
+
+### Code
+
+| Flag | What it answers |
+|---|---|
+| `--disasm [PATTERN…]` | selected classes disassembled, indexed operands resolved (strings, types, methods, fields). Not a decompiler. |
+| `--decompile [PATTERN…]` | selected classes decompiled to Java by [dex-decompiler](https://github.com/sebdraven/dex-decompiler). |
+| `--bundle OUT` | everything Drakkar extracts from one sample, every class disassembled and decompiled, under `OUT/<sha256>/`. See below. |
+
+### Comparison
+
+| Flag | What it answers |
+|---|---|
+| `--diff-dex A B` | same source tree? Per-method opcode fingerprints, robust to package renaming and ProGuard, blind to operands by design. |
+| `--diff-explain A B` | what actually differs in the resolved operands of matched methods (string, method target, type, real or renamed field). |
+| `--diff-strings A B` | what differs in the string pools — where `static final` values, C2 endpoints included, live. |
+| `--diff-matrix DIR` | all-against-all similarity over a directory, each sample parsed once, plus single-linkage groups (`--matrix-metric opcodes\|strings`). |
+
+The `--*-normalize FROM=TO` options rewrite descriptors before matching, so two
+lots built under different namespaces (`com/duiyun=com/dy`) are compared on
+their code rather than on their package names. The similarity thresholds
+(`--diff-threshold`, `--matrix-threshold`) are parameters of this tool, not
+published empirical values.
+
+### Native code
+
+| Flag | What it answers |
+|---|---|
+| `--native-arch` | ABI, word size and machine of each `.so`. |
+| `--native` | every ELF of the APK, found by content (`lib/`, `assets/`, `res/raw/`, elsewhere): sections with entropy, segments, `DT_NEEDED`, classified imports and strings, demangled `Java_*` exports, `JNINativeMethod` tables rebuilt through relative relocations (RELA, REL, RELR), and the binding of each DEX `native` method to its implementation. A raw ELF can be passed directly, with `--native-dex` for the DEX to bind. |
+| `--native --native-disasm` | static disassembly (AArch64, ARM, Thumb-2, x86, x86_64) of the functions at the Java↔native boundary — bound functions, `JNI_OnLoad` / `JNI_OnUnload`, `DT_INIT`, `DT_INIT_ARRAY`, `e_entry` — and of the internal functions they call, up to `--disasm-depth`: `JNIEnv` calls decoded with class, name and signature when the strings are local, PLT/GOT imports called, strings referenced, system calls. |
+
+`--native-disasm` follows paths, not bytes: a function stops at a return, a
+jump, a tail call or a call to a no-return function, and an instruction the
+decoder refuses ends only its own path (recorded in `invalid_paths`). The same
+junk bytes hit by several functions are reported as `opaque_dead_code`, the
+usual trace of OLLVM flattening. Extra roots: `--native-root`,
+`--native-roots exports`; listings: `--native-listing`; heuristic string
+index: `--native-string-index`.
+
+It does not execute, emulate or run symbolically; it does not follow `JNIEnv`
+past the first argument of a callee; strings built or decrypted at run time,
+and native code absent from the APK, are invisible.
+
+### Enrichment
+
+`--enrich vt,koodous` enriches a list of SHA-256 (a dating CSV, one hash per
+line, a directory of `*.dating.json`, or stdin) from VirusTotal and Koodous.
+Tokens are read from `VT_API_KEY` and `KOODOUS_TOKEN`, never from arguments.
+Raw responses are cached under `--cache`, so a batch resumes where it stopped;
+`--rate` sets the requests per minute per service (default 4, the public
+VirusTotal quota). AV labels are a starting signal, never the measurement.
+
+## Output
+
+Inventory and native modes print text by default; `--format json` writes JSON
+to stdout, or to `--json-out FILE`; `--format both` prints the text and requires
+`--json-out`. Modes without JSON print TSV with a header. Coloured output
+follows `--color auto|always|never` and `NO_COLOR`.
+
+Failures are never silent: each sample that fails is reported on stderr
+(`[FAIL]`, `[PANIC]`), and a part that cannot be read is recorded rather than
+omitted.
+
+## Bundle
+
+```sh
+drakkar sample.apk --bundle /cases/bundles --archive
+```
+
+writes `OUT/<sha256>/`: `bundle.json` (identity, provenance, statistics),
+`manifest.json`, `cert.json`, `dating.json`, `rules.json`, `strings.json`
+(string pool and static field values, where compile-time constants live),
+`dyn_entrypoints.tsv`, `index.json` (one entry per class), `errors.json`, and
+per class `classes/<id>.java`, `.class.java`, `.dasm` and `.json`. Files are
+named by class id, never by descriptor, so obfuscated classes `La;` and `LA;`
+do not overwrite each other on a case-insensitive file system.
+
+`bundle.json` carries:
+
+- `schema_version` — version of the bundle's structure, raised on any
+  incompatible change; an added file or field does not raise it;
+- `sha256` and `input_size` of the input;
+- `drakkar_version` and the full commit of dex-decompiler;
+- `rules_hash` — full SHA-256 of the rule set and MITRE catalogue behind
+  `rules.json`, null when `rules.json` is null.
+
+`--archive` also writes `OUT/<sha256>.bundle.zip`: the whole directory under
+`<sha256>/`, entries sorted, fixed timestamps and permissions, no extra fields
+— the same directory content always gives the same bytes. It is the file to
+hand to an import service. Two bundles of the same input still differ, through
+`generated_at`. `--overwrite` replaces an existing bundle; an existing archive
+is replaced with `--archive` and deleted without, so it never outlives the
+bundle it was made from.
+
+`drakkar --bundle --legend` defines every file and field.
+
+## Rules
+
+The detection catalogue is generated from MITRE ATT&CK for Mobile (STIX) merged
+with the detection logic compiled into Drakkar (`src/rules/catalog.rs`), then
+cached as one YAML file per technique under the user cache directory
+(`~/Library/Caches/drakkar/rules` on macOS, `~/.cache/drakkar/rules` on Linux).
+
+- The first run downloads the STIX bundle from MITRE's repository; later runs
+  read the cache. `--refresh` downloads it again.
+- The cache is regenerated automatically when `catalog.rs` changes.
+- `--rules DIR` uses a rule directory instead of the cache (`rules/mitre/`
+  holds examples).
+
+Rules are written in a composable DSL: `and`, `or`, `not`, `count`,
+`sequence`, `api`, `string`, `permission`, `intent-action`, `native-symbol`,
+`service`, `accessibility-service`, two coupling features over the call graph
+— `co-reachable` (boolean) and `intimacy` (a score, for instance between
+collection and exfiltration primitives, adapted from IntDroid) — and
+`unsupported`, an explicit marker for a technique static analysis cannot
+decide, always false, so the gap is documented rather than silent. A matched API carries its reachability: a capability
+whose code is present but which no entry point reaches is reported as such.
+
+The STIX bundle follows MITRE's latest release, so two caches downloaded at
+different times may differ; `rules_hash` in a bundle records which one was
+used.
+
+## Documentation
+
+In French, under [`docs/`](docs/README.md):
+
+- [`architecture.md`](docs/architecture.md) — the pipeline, from APK to report;
+- [`intimacy.md`](docs/intimacy.md) — the `intimacy` feature: formula,
+  safeguards, effective diameter, empirical results;
+- [`calibration.md`](docs/calibration.md) — calibrating `min-score`:
+  corpus, Mann-Whitney test, per-label thresholds.
+
+## Development
 
 ```sh
 git config core.hooksPath .githooks
 ```
 
-Les deux hooks lancent les mêmes commandes que la CI (`.github/workflows/ci.yml`) :
-`cargo fmt --all --check`, puis `cargo clippy --locked --all-targets -- -D warnings`.
+`pre-commit` and `pre-push` run the lint steps of CI: `cargo fmt --all
+--check`, then `cargo clippy --locked --all-targets -- -D warnings`. They never
+reformat: on a fmt failure, run `cargo fmt --all` and commit again.
 
-- `pre-commit` bloque un commit mal formaté ou qui déclenche un avertissement clippy.
-- `pre-push` refait les mêmes vérifications avant de pousser. Il couvre les commits
-  créés par un rebase ou par un outil, qui ne passent pas par `pre-commit`.
+CI runs fmt, clippy, tests and builds on Linux; the macOS test leg runs on manual
+dispatch only, and tags go through the release workflow, which builds every target.
+Releases are cut from a tag `vX.Y.Z`, refused when it disagrees with the
+version in `Cargo.toml`; a version bump goes in its own `release/vX.Y.Z` pull
+request.
 
-Aucun hook ne reformate. En cas d'échec de fmt, lancer `cargo fmt --all`, puis
-recommiter.
+## Related
 
-## Analyse native statique (`--native`)
+- [mcp-drakkar](https://github.com/sebdraven/mcp-drakkar) — an MCP server
+  exposing each Drakkar mode as a typed tool.
 
-```sh
-drakkar app.apk --native                         # texte
-drakkar app.apk --native --format json           # JSON sur stdout
-drakkar app.apk --native --format both --json-out reports/app.native.json
-drakkar --native --legend                        # définition de chaque champ
-```
+## Acknowledgements
 
-Inventorie **tous** les ELF de l'APK, reconnus à leurs octets (`\x7FELF`) et
-non à leur chemin : `lib/`, mais aussi `assets/`, `res/raw/` ou la racine. Pour
-chacun : SHA-256 du contenu décompressé, architecture, sections (avec
-entropie), segments, `DT_NEEDED`, imports classés par catégorie, chaînes
-classées, exports `Java_*` démanglés, et tables `JNINativeMethod` reconstruites
-à travers les relocations relatives (RELA, REL, RELR). Relie ensuite chaque
-méthode `native` du DEX à son export ou à son entrée de table, et signale les
-fonctions natives sans méthode Java. Mode single, comme `--native-arch`.
+This work is part of the DEFMAL project, funded by the French National
+Research Agency (ANR) under France 2030, reference ANR-22-PECY-0007.
 
-Ce qu'il ne fait pas :
+## Licence
 
-- aucun désassemblage, aucune exécution, aucune émulation ;
-- une table `JNINativeMethod` dont les noms ou signatures sont chiffrés, ou
-  construits à l'exécution, n'est pas retrouvée : le statut est alors
-  `unresolved`, rien n'est inventé ;
-- les relocations packées Android (APS2) ne sont pas décodées, elles sont
-  signalées en anomalie ;
-- seuls les ELF de `lib/` sont liés au DEX ; les autres sont inventoriés.
-
-### Désassemblage de la frontière JNI (`--native-disasm`)
-
-```sh
-drakkar app.apk --native --native-disasm                       # texte, sans les instructions
-drakkar app.apk --native --native-disasm --disasm-full         # texte, avec les instructions
-drakkar app.apk --native --native-disasm --disasm-depth 0 \
-  --disasm-max-insns 2000 --format json --json-out reports/app.native.json
-```
-
-Désassemble statiquement, dans chaque ELF (AArch64, ARM, Thumb-2, x86,
-x86_64), les fonctions qui portent la frontière Java↔natif : celles des lignes
-de liaison et les exports `Java_*`, les entrées de tables `JNINativeMethod`,
-`JNI_OnLoad` / `JNI_OnUnload`, `DT_INIT`, `DT_INIT_ARRAY`, `e_entry` d'un
-exécutable, puis les fonctions internes qu'elles appellent jusqu'à
-`--disasm-depth` (défaut 1). Pour chaque fonction : instructions, appels
-(internes, imports par PLT ou GOT, indirects), chaînes référencées, appels par
-la table de `JNIEnv` (`FindClass`, `GetMethodID`, `RegisterNatives`…, avec
-classe, nom et signature quand les chaînes sont dans la fonction) et appels
-système. Par ELF : les upcalls vers Java, les méthodes enregistrées par
-`RegisterNatives` (qui lèvent, quand c'est possible, l'ambiguïté d'une ligne
-`registered_ambiguous`) et les imports appelés par catégorie.
-`drakkar --native --legend` définit chaque champ.
-
-Une fonction s'arrête où ses chemins s'arrêtent : retour, saut, tail-call, ou
-appel direct à une fonction sans retour (`__stack_chk_fail`, `abort`,
-`__cxa_throw`… liste dans la légende) ; le code qui suit n'est jamais lu en
-séquence. Les stubs PLT AArch64, ARM et x86 sont reconnus, l'import nommé par
-la relocation `JUMP_SLOT`. Une instruction que le décodeur refuse, ou sur
-laquelle il panique, n'abandonne que son chemin : elle va dans `invalid_paths`
-(adresse, octets, raison, branchement qui y mène) et les autres chemins sont
-parcourus ; la fonction reste `ok`. C'est la trace typique d'un code aplati
-(OLLVM) : prédicats opaques menant à des octets poubelle. Quand au moins trois
-fonctions d'un ELF butent sur les mêmes octets, l'anomalie `opaque_dead_code`
-le signale. `truncated` ne marque plus qu'un plafond atteint
-(`--disasm-max-insns`), `truncated_at` donnant alors la première instruction
-non lue. Les instructions VFP et Advanced SIMD (ARM, Thumb-2), que yaxpeax-arm
-ne décode pas, sont sautées à leur longueur sous le mnémonique `coproc`.
-
-Ce qu'il ne fait pas :
-
-- aucune exécution, aucune émulation, aucune exécution symbolique ;
-- l'env n'est pas suivi d'une fonction à l'autre au-delà du premier argument
-  d'un callee, ni au-delà de `--disasm-depth` ;
-- un appel par la table de `JNIEnv` dont le registre n'est pas suivi sort avec
-  `resolved = false` : la même forme est celle d'un appel virtuel C++ ;
-- les chaînes construites ou déchiffrées à l'exécution sont invisibles ;
-- le code natif absent de l'APK (téléchargé, déchiffré au chargement) est
-  invisible.
-
-## Architecture
-
-| Module        | Rôle                                             |
-|---------------|--------------------------------------------------|
-| `parser/dex`  | DEX → methods + call edges (LIEF Android)         |
-| `parser/elf`  | `.so` → symboles natifs (LIEF ELF)                |
-| `parser/manifest` | permissions / intent / services (LIEF axml)   |
-| `cfg`         | call graph inter-proc (petgraph) + reachability   |
-| `rules`       | DSL `and/or/not/count/sequence/api/...` + moteur  |
-| `export`      | node-link JSON compatible `networkx`              |
-| `kharon`      | confirmation DSE des candidats statiques          |
-
-## Statut
-
-Scaffold : pipeline end-to-end compile et tourne en mode stub.
-Reste à câbler : extraction réelle LIEF (`TODO(lief)` dans `parser/*`).
-
-Licence : AGPL-3.0-or-later.
+AGPL-3.0-or-later. See [LICENSE.md](LICENSE.md).
