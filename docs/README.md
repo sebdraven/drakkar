@@ -1,26 +1,30 @@
-# Documentation Drakkar
+# Drakkar documentation
 
-Analyse statique d'APK Android pour la détection de comportements ATT&CK, avec
-un accent sur le stalkerware.
+Static analysis of Android APKs for detecting ATT&CK behaviours, with a focus
+on stalkerware.
 
 ## Index
 
-- [`architecture.md`](architecture.md) — vue d'ensemble du pipeline : parsing
-  APK → call graph → moteur de règles → sortie.
-- [`intimacy.md`](intimacy.md) — la feature `intimacy` : détection de couplage
-  (crypto↔réseau, collecte↔exfiltration) par intimité de call graph, adaptée
-  d'IntDroid. Formule, garde-fous, diamètre effectif, résultats empiriques.
-- [`calibration.md`](calibration.md) — protocole de calibration du seuil
-  `min-score` : constitution du corpus, test de Mann-Whitney, choix et validation
-  du seuil par label.
+- [`architecture.md`](architecture.md) — overview of the pipeline: APK parsing
+  → call graph → rule engine → output.
+- [`intimacy.md`](intimacy.md) — the `intimacy` feature: coupling detection
+  (crypto↔network, collection↔exfiltration) by call-graph intimacy, adapted
+  from IntDroid. Formula, safeguards, effective diameter, empirical results.
+- [`calibration.md`](calibration.md) — protocol for calibrating the
+  `min-score` threshold: building the corpus, Mann-Whitney test, choosing and
+  validating the threshold per label.
 
-## En bref
+The command-line modes, their output and the bundle format are described in the
+[top-level README](../README.md); each mode's own legend
+(`drakkar --<mode> --legend`) defines every label and field it emits.
 
-Drakkar prend un APK, en extrait les features (DEX, manifest, symboles natifs),
-construit un call graph inter-procédural, puis évalue un catalogue de règles
-dérivé de MITRE ATT&CK Mobile. Chaque détection est justifiée par des **preuves**
-(`evidence`) traçables — permission déclarée, API résolue avec son chemin
-d'atteignabilité depuis un entrypoint manifest, string, score d'intimité, etc.
+## In short
 
-Le catalogue de règles est régénéré automatiquement quand le code du catalogue
-change (invalidation par hash, cf. `architecture.md` § Cache).
+Drakkar takes an APK, extracts its features (DEX, manifest, native symbols),
+builds an inter-procedural call graph, then evaluates a rule catalogue derived
+from MITRE ATT&CK Mobile. Every detection is justified by traceable
+**evidence** — declared permission, resolved API with its reachability path
+from a manifest entry point, string, intimacy score, and so on.
+
+The rule catalogue is regenerated automatically when the catalogue code
+changes (hash-based invalidation, see `architecture.md` § Cache).
