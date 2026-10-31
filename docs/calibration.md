@@ -1,178 +1,179 @@
-# Calibration du seuil d'intimité
+# Calibrating the intimacy threshold
 
-> **État.** Ce document décrit le **protocole** de calibration. Il ne contient
-> pas encore de seuil calibré ni de distributions de corpus : à ce stade on ne
-> dispose que de deux APK de référence (§ 6), ce qui est une amorce, pas une
-> calibration. Les valeurs chiffrées seront ajoutées une fois le mode bulk passé
-> sur un corpus complet.
+> **Status.** This document describes the calibration **protocol**. It does not
+> yet contain a calibrated threshold or corpus distributions: at this stage only
+> two reference APKs are available (§ 8), which is a starting point, not a
+> calibration. The figures will be added once bulk mode has been run on a full
+> corpus.
 
-L'objectif : transformer le score d'intimité continu (cf.
-[`intimacy.md`](intimacy.md)) en une décision, via un seuil `min-score` **justifié
-statistiquement** plutôt que fixé a priori.
-
----
-
-## 1. Principe
-
-Le score d'intimité sépare, sur les deux échantillons de référence, le couplage
-applicatif bénin (bas) du couplage malveillant (haut). La calibration consiste à :
-
-1. mesurer les **distributions** de scores sur un corpus bénin vs stalkerware ;
-2. **tester** que les deux distributions diffèrent significativement ;
-3. **choisir** le seuil qui optimise un critère de décision explicite ;
-4. **valider** ce seuil sur des données non vues.
-
-Chaque `label` d'intimité (`crypto-network`, `collection-network`,
-`digest-network`…) a sa propre échelle et doit être calibré **séparément** — un
-score de 3 ne signifie pas la même chose d'un label à l'autre.
+The goal: turn the continuous intimacy score (see
+[`intimacy.md`](intimacy.md)) into a decision, through a `min-score` threshold
+that is **statistically justified** rather than fixed a priori.
 
 ---
 
-## 2. Constitution du corpus
+## 1. Principle
 
-La qualité de la calibration dépend entièrement du corpus. Trois exigences :
+On the two reference samples, the intimacy score separates benign application
+coupling (low) from malicious coupling (high). Calibration consists in:
 
-- **Étiquetage fiable.** Bénins et stalkerware confirmés (source connue,
-  idéalement recoupée VirusTotal / dépôt de référence). Ne pas mélanger
-  « monitoring parental légitime » et stalkerware sans décision explicite —
-  c'est précisément la frontière que la thèse discute.
-- **Déduplication.** Les datasets Android publics contiennent des doublons quasi
-  identiques qui gonflent artificiellement les performances ; l'impact est
-  documenté [2]. Dédupliquer par hash **et** par similarité de call graph avant
-  toute mesure.
-- **Découpage famille-aware.** Si un même famille/SDK stalkerware apparaît à la
-  fois en calibration et en test, le seuil sur-apprend cette famille. Séparer
-  train/test **par famille**, pas par échantillon, pour estimer la
-  généralisation à des familles non vues.
+1. measuring the score **distributions** on a benign vs stalkerware corpus;
+2. **testing** that the two distributions differ significantly;
+3. **choosing** the threshold that optimises an explicit decision criterion;
+4. **validating** that threshold on unseen data.
 
-Viser un corpus équilibré (ou rééquilibré à l'analyse) et de taille suffisante
-pour que le test statistique ait de la puissance (ordre de grandeur : ≥ quelques
-dizaines par classe, idéalement plus).
+Each intimacy `label` (`crypto-network`, `collection-network`,
+`digest-network`…) has its own scale and must be calibrated **separately** — a
+score of 3 does not mean the same thing from one label to another.
 
 ---
 
-## 3. Extraction des scores
+## 2. Building the corpus
 
-Le **mode bulk** (`src/bulk.rs`) produit un JSON par APK. On en extrait, pour
-chaque APK et chaque `label` d'intimité, le champ `score` (score normalisé) — et
-optionnellement `score_raw`, `n`, `ad`, `eff` pour l'analyse de sensibilité.
+The quality of the calibration depends entirely on the corpus. Three
+requirements:
 
-Un APK sans match sur un label donné compte comme **score 0** pour ce label
-(absence de couplage qualifié), et non comme donnée manquante — l'absence est une
-information.
+- **Reliable labelling.** Confirmed benign apps and stalkerware (known source,
+  ideally cross-checked against VirusTotal or a reference repository). Do not
+  mix "legitimate parental monitoring" and stalkerware without an explicit
+  decision — that is precisely the boundary the thesis discusses.
+- **Deduplication.** Public Android datasets contain near-identical duplicates
+  that artificially inflate performance; the impact is documented [2].
+  Deduplicate by hash **and** by call-graph similarity before any measurement.
+- **Family-aware split.** If the same stalkerware family or SDK appears in both
+  calibration and test, the threshold overfits that family. Split train/test
+  **by family**, not by sample, to estimate generalisation to unseen families.
 
-Sortie de travail conseillée : une table `apk_id, label, score, score_raw, n, ad, eff, class`
-(class ∈ {benign, stalkerware}), traitée hors ligne (Python/pandas).
-
----
-
-## 4. Analyse des distributions
-
-Par label :
-
-- **Descriptif** : médiane, IQR, min/max par classe ; les moyennes sont peu
-  informatives sur des distributions asymétriques.
-- **Visualisation** : box-plots ou violons bénin vs stalkerware ; histogrammes
-  superposés en échelle log si les queues sont longues (le score peut atteindre
-  plusieurs dizaines).
-- **Chevauchement** : identifier la plage où les deux classes se recouvrent —
-  c'est la zone où le choix du seuil est critique.
+Aim for a balanced corpus (or rebalance at analysis time) large enough for the
+statistical test to have power (order of magnitude: at least a few dozen per
+class, ideally more).
 
 ---
 
-## 5. Test de séparation : Mann-Whitney U
+## 3. Extracting the scores
 
-On teste si les scores des deux classes proviennent de distributions
-différentes. Le test retenu est le **U de Mann-Whitney** [3] :
+**Bulk mode** (`src/bulk.rs`) produces one JSON per APK. From it, extract for
+each APK and each intimacy `label` the `score` field (normalised score) — and
+optionally `score_raw`, `n`, `ad`, `eff` for sensitivity analysis.
 
-- **non paramétrique** : aucune hypothèse de normalité (les scores sont
-  asymétriques, à queue longue) ;
-- **robuste aux tailles inégales** et aux échelles ordinales ;
-- H₀ : les deux distributions sont identiques ; un p-value faible indique une
-  séparation significative.
+An APK with no match on a given label counts as **score 0** for that label
+(absence of qualified coupling), not as missing data — absence is information.
 
-Rapporter, en plus du p-value, une **taille d'effet** : la corrélation
-rang-bisériale, ou de façon équivalente l'AUC (probabilité qu'un stalkerware tiré
-au hasard ait un score supérieur à un bénin tiré au hasard). L'AUC résume le
-pouvoir discriminant du label indépendamment du seuil.
-
-> La significativité (p-value) ne suffit pas : sur un grand corpus, une
-> séparation minime devient « significative ». C'est la **taille d'effet / AUC**
-> qui dit si le label est utile en pratique.
+Recommended working output: a table
+`apk_id, label, score, score_raw, n, ad, eff, class`
+(class ∈ {benign, stalkerware}), processed offline (Python/pandas).
 
 ---
 
-## 6. Choix du seuil
+## 4. Analysing the distributions
 
-À partir de la courbe ROC (TPR vs FPR sur toute la plage de seuils) :
+Per label:
 
-- **Contrainte opérationnelle (recommandé ici).** En détection de stalkerware,
-  un faux positif accuse à tort une app bénigne : coût élevé. Fixer d'abord un
-  **FPR cible** acceptable (p. ex. ≤ 1–5 %), puis prendre le seuil qui maximise
-  le TPR sous cette contrainte.
-- **Indice J de Youden.** Seuil maximisant `TPR − FPR` : équilibre
-  symétrique, utile comme point de référence neutre.
-- **Maximisation du F₁.** Si l'on privilégie le compromis précision/rappel.
+- **Descriptive**: median, IQR, min/max per class; means are not very
+  informative on skewed distributions.
+- **Visualisation**: box plots or violins, benign vs stalkerware; overlaid
+  histograms on a log scale if the tails are long (the score can reach several
+  dozen).
+- **Overlap**: identify the range where the two classes overlap — that is
+  where the choice of threshold is critical.
 
-Documenter le critère choisi et le seuil `min-score` qui en résulte, **par
-label**. Reporter ce seuil dans les règles du catalogue.
+---
+
+## 5. Separation test: Mann-Whitney U
+
+We test whether the scores of the two classes come from different
+distributions. The test chosen is the **Mann-Whitney U** [3]:
+
+- **non-parametric**: no normality assumption (the scores are skewed,
+  long-tailed);
+- **robust to unequal sizes** and to ordinal scales;
+- H₀: the two distributions are identical; a low p-value indicates a
+  significant separation.
+
+Report, in addition to the p-value, an **effect size**: the rank-biserial
+correlation, or equivalently the AUC (probability that a randomly drawn
+stalkerware has a higher score than a randomly drawn benign app). The AUC
+summarises the discriminating power of the label independently of the
+threshold.
+
+> Significance (p-value) is not enough: on a large corpus, a tiny separation
+> becomes "significant". It is the **effect size / AUC** that says whether the
+> label is useful in practice.
+
+---
+
+## 6. Choosing the threshold
+
+From the ROC curve (TPR vs FPR over the whole range of thresholds):
+
+- **Operational constraint (recommended here).** In stalkerware detection, a
+  false positive wrongly accuses a benign app: a high cost. First set an
+  acceptable **target FPR** (e.g. ≤ 1–5 %), then take the threshold that
+  maximises the TPR under that constraint.
+- **Youden's J index.** The threshold maximising `TPR − FPR`: a symmetric
+  balance, useful as a neutral reference point.
+- **Maximising F₁.** If the precision/recall trade-off is preferred.
+
+Document the criterion chosen and the resulting `min-score` threshold, **per
+label**. Carry that threshold into the catalogue rules.
 
 ---
 
 ## 7. Validation
 
-- **Hold-out ou k-fold famille-aware** : le seuil est fixé sur la partie
-  calibration, puis évalué sur la partie test (familles non vues).
-- **Métriques sur le test** : TPR, FPR, précision, F₁, AUC — jamais sur les
-  données ayant servi à fixer le seuil.
-- **Analyse d'erreurs** : inspecter les faux positifs (couplage bénin à score
-  élevé : quel SDK/quelle logique ?) et les faux négatifs (stalkerware à score
-  bas : obfuscation du sink ? couplage hors des groupes définis ?). Ces cas
-  nourrissent les groupes de sinks (§ 6 d'`intimacy.md`) et l'allowlist.
+- **Family-aware hold-out or k-fold**: the threshold is set on the calibration
+  part, then evaluated on the test part (unseen families).
+- **Metrics on the test set**: TPR, FPR, precision, F₁, AUC — never on the data
+  used to set the threshold.
+- **Error analysis**: inspect the false positives (benign coupling with a high
+  score: which SDK, which logic?) and the false negatives (stalkerware with a
+  low score: obfuscated sink? coupling outside the defined groups?). These
+  cases feed the sink groups (§ 6 of `intimacy.md`) and the allowlist.
 
 ---
 
-## 8. État préliminaire (2 APK — illustratif, non calibré)
+## 8. Preliminary state (2 APKs — illustrative, not calibrated)
 
-Amorce sur les échantillons de référence, à titre indicatif **uniquement** :
+A starting point on the reference samples, for indication **only**:
 
-| classe | APK | label | score |
+| class | APK | label | score |
 |---|---|---|---|
-| bénin | Flixoid | collection-network | 1.0 |
-| bénin | Flixoid | digest-network | 2.0 |
+| benign | Flixoid | collection-network | 1.0 |
+| benign | Flixoid | digest-network | 2.0 |
 | stalkerware | iKeyMonitor | digest-network | 3.6 |
 | stalkerware | iKeyMonitor | crypto-network | 28.2 |
 | stalkerware | iKeyMonitor | collection-network | 35.5 |
 
-La séparation est nette sur les couplages forts (≥ 28) et étroite en bas
-(bénin 2.0 vs stalkerware 3.6). Deux points ne permettent **ni** de poser un
-seuil **ni** de lancer un test — ils motivent seulement le passage au corpus.
+Separation is clear on strong couplings (≥ 28) and narrow at the bottom (benign
+2.0 vs stalkerware 3.6). Two data points allow **neither** setting a threshold
+**nor** running a test — they only motivate moving to the corpus.
 
 ---
 
-## 9. Reproductibilité
+## 9. Reproducibility
 
-- Figer la version du binaire (le hash du catalogue, cf. `architecture.md`
-  § Cache) et la version du bundle STIX utilisés pour l'extraction.
-- Figer la liste des APK du corpus (hashes) et le découpage train/test.
-- Le calcul du diamètre effectif est déterministe (RNG seedé), donc les scores
-  sont reproductibles à binaire constant.
+- Freeze the binary version (the catalogue hash, see `architecture.md`
+  § Cache) and the version of the STIX bundle used for extraction. A bundle
+  records both in `rules_hash` (`drakkar --bundle --legend`).
+- Freeze the list of corpus APKs (hashes) and the train/test split.
+- The effective-diameter computation is deterministic (seeded RNG), so scores
+  are reproducible for a given binary.
 
 ---
 
-## 10. Références
+## 10. References
 
-[1] IntDroid — cf. [`intimacy.md`](intimacy.md), réf. [1]. Méthodologie de
-validation bénin/malveillant de référence.
+[1] IntDroid — see [`intimacy.md`](intimacy.md), ref. [1]. Reference
+benign/malicious validation methodology.
 
 [2] Y. Zhao, L. Li, H. Wang, H. Cai, T. F. Bissyandé, J. Klein, J. Grundy.
-« On the Impact of Sample Duplication in Machine-Learning-Based Android Malware
-Detection. » *ACM Transactions on Software Engineering and Methodology (TOSEM)*,
-vol. 30, n° 3, 2021, p. 1–38.
+"On the Impact of Sample Duplication in Machine-Learning-Based Android Malware
+Detection." *ACM Transactions on Software Engineering and Methodology (TOSEM)*,
+vol. 30, no. 3, 2021, pp. 1–38.
 
-[3] H. B. Mann, D. R. Whitney. « On a Test of Whether One of Two Random Variables
-is Stochastically Larger than the Other. » *Annals of Mathematical Statistics*,
-vol. 18, n° 1, 1947, p. 50–60.
+[3] H. B. Mann, D. R. Whitney. "On a Test of Whether One of Two Random Variables
+is Stochastically Larger than the Other." *Annals of Mathematical Statistics*,
+vol. 18, no. 1, 1947, pp. 50–60.
 
-> L'indice J de Youden et les métriques ROC/AUC sont des outils statistiques
-> standard ; référence bibliographique à compléter au source si citée en thèse.
+> Youden's J index and ROC/AUC metrics are standard statistical tools; a
+> bibliographic reference is to be added at the source if cited in the thesis.

@@ -1,164 +1,180 @@
 # Architecture
 
-Vue d'ensemble du pipeline Drakkar, du fichier APK à la sortie JSON.
+Overview of the Drakkar pipeline, from the APK file to the JSON output.
 
 ```
 APK
  │
- ├─ parser::dex       → méthodes, arêtes d'appel, strings
- ├─ parser::manifest  → package, permissions, services, intent-actions, composants
- └─ parser (natif)    → symboles des .so
+ ├─ parser::dex       → methods, call edges, strings
+ ├─ parser::manifest  → package, permissions, services, intent actions, components
+ └─ parser (native)   → symbols of the .so files
         │
         ▼
    model::ApkFeatures        +        cfg::CallGraph
-   (features plates)                  (graphe inter-procédural, petgraph)
+   (flat features)                    (inter-procedural graph, petgraph)
         │                                   │
         └───────────────┬───────────────────┘
                         ▼
               rules::Engine::run
-        (entrypoints manifest → eval des règles → enrichissement reachability)
+        (manifest entry points → rule evaluation → reachability enrichment)
                         │
                         ▼
                  Vec<rules::Match>  → JSON
 ```
 
+This is the default pipeline, the one behind the ATT&CK detections. The other
+modes (inventories, diffs, bundle, native analysis) reuse the same parsers but
+stop before the rule engine, or never reach it; the top-level
+[README](../README.md) lists them.
+
 ---
 
 ## Parsing (`src/parser/`)
 
-- **`dex.rs`** : extrait chaque DEX de l'APK (crates `dex` + `dex-bytecode`),
-  produit les méthodes et les arêtes d'appel du call graph, ainsi que les
-  strings. Les classes illisibles (id de string invalide, CESU-8 malformé) sont
-  ignorées avec un `WARN` plutôt que d'interrompre l'analyse.
-- **`manifest.rs`** : décode le manifest binaire (AXML) → package, permissions,
-  services (dont le marqueur `accessibility`), intent-actions, composants
-  déclarés.
-- **`axml.rs`** : décodeur AXML. Chemin nominal `axmldecoder`, repli tolérant
-  quand celui-ci refuse le manifest ou panique — chunk de type inconnu ignoré,
-  string pool borné, éléments non refermés rattachés. Même motif qu'`apkzip`
-  pour le ZIP : le repli ne s'active jamais sur un APK sain. Les rapports
-  `--manifest` issus du repli le signalent dans `anomalies`.
-- **`assets.rs`** : inventaire (`--list-assets`) et export (`--extract-assets`)
-  des entrées `assets/` — taille déclarée/réelle, méthode de compression
-  déclarée, SHA-256 complet, type reniflé sur les octets de tête, entropie de
-  Shannon. Même repli qu'ailleurs : lecteur `apkzip` quand le crate `zip` refuse
-  l'archive, sans quoi les APK trafiqués ressortiraient avec un `assets/` vide.
-  Produit une empreinte d'ensemble (SHA-256 de la liste triée `chemin\tsha256`)
-  qui sert d'axe de regroupement, absente — et non vide — quand l'APK n'a aucun
-  asset. Ne déballe pas récursivement : un asset qui est lui-même un ZIP, un APK
-  ou un DEX est typé et écrit tel quel. Le `sha256` porte sur le contenu
-  **décompressé** — seule forme requêtable sur VT/MalwareBazaar/Koodous, et seule
-  forme stable quand le lecteur tolérant essaie deflate puis stored. Filtrage par
-  ensemble de hashes connus (`--assets-hash*`), sans effet sur l'empreinte.
-- Les symboles des bibliothèques natives (`.so`) sont extraits pour les règles
-  `native-symbol`.
+- **`dex.rs`**: extracts every DEX of the APK (crates `dex-parser` and
+  `dex-bytecode`), and produces the methods and the call edges of the call
+  graph, as well as the strings. Unreadable classes (invalid string id,
+  malformed CESU-8) are skipped with a `WARN` rather than aborting the
+  analysis.
+- **`manifest.rs`**: decodes the binary manifest (AXML) → package,
+  permissions, services (including the `accessibility` marker), intent
+  actions, declared components.
+- **`axml.rs`**: AXML decoder. The nominal path is `axmldecoder`, with a
+  tolerant fallback when it refuses the manifest or panics — chunk of unknown
+  type skipped, bounded string pool, unclosed elements reattached. Same pattern
+  as `apkzip` for the ZIP: the fallback never activates on a sound APK.
+  `--manifest` reports produced by the fallback say so in `anomalies`.
+- **`assets.rs`**: inventory (`--list-assets`) and export (`--extract-assets`)
+  of the `assets/` entries — declared and real size, declared compression
+  method, full SHA-256, type sniffed from the leading bytes, Shannon entropy.
+  Same fallback as elsewhere: the `apkzip` reader when the `zip` crate refuses
+  the archive, without which tampered APKs would come out with an empty
+  `assets/`. Produces a set fingerprint (SHA-256 of the sorted list of
+  `path\tsha256`) that serves as a grouping axis, absent — not empty — when the
+  APK has no asset. No recursive unpacking: an asset that is itself a ZIP, an
+  APK or a DEX is typed and written as is. The `sha256` covers the
+  **decompressed** content — the only form that can be queried on
+  VT/MalwareBazaar/Koodous, and the only stable form when the tolerant reader
+  tries deflate then stored. Filtering by a set of known hashes
+  (`--assets-hash*`), with no effect on the fingerprint.
+- The symbols of native libraries (`.so`) are extracted for the
+  `native-symbol` rules. The static analysis of native code (`--native`,
+  `--native-disasm`) lives in `elf.rs` and `native_static/`, and is described
+  by `drakkar --native --legend`.
 
-## Modèle (`src/model`)
+## Model (`src/model`)
 
-`ApkFeatures` agrège les features « plates » (méthodes, strings, permissions,
-intent-actions, symboles natifs, services, composants). `MethodRef` porte deux
-vues d'une méthode :
+`ApkFeatures` gathers the "flat" features (methods, strings, permissions,
+intent actions, native symbols, services, components). `MethodRef` carries two
+views of a method:
 
-- `signature()` — signature complète (classe → nom + descripteur), pour
-  l'affichage et les chemins ;
-- `api()` — clé `classe->nom` **sans descripteur**, utilisée comme clé de nœud
-  du call graph et pour le matching des règles par sous-chaîne.
+- `signature()` — full signature (class → name + descriptor), for display and
+  paths;
+- `api()` — `class->name` key **without descriptor**, used as the node key of
+  the call graph and for substring matching of rules.
 
-> Le choix de `api()` comme clé de nœud est délibéré : le descripteur diverge
-> entre la vue appelant (exacte) et la vue appelé (shorty), ce qui fragmenterait
-> le graphe si l'on utilisait `signature()`.
+> Choosing `api()` as the node key is deliberate: the descriptor differs
+> between the caller's view (exact) and the callee's view (shorty), which would
+> fragment the graph if `signature()` were used.
 
 ## Call graph (`src/cfg/mod.rs`)
 
-`CallGraph` enveloppe un `petgraph::DiGraph`. Primitives principales :
+`CallGraph` wraps a `petgraph::DiGraph`. Main primitives:
 
-- **`entrypoints(components)`** : nœuds correspondant aux composants déclarés au
-  manifest (activities, services, receivers…) — la racine de toute reachability
-  *validée*.
-- **`reachability(api, entrypoints)`** : une API est-elle atteignable depuis un
-  entrypoint manifest, et par quels chemins.
-- **`reaches(a, b)`** / **`reaches_both(a, b, …)`** : atteignabilité simple /
-  co-atteignabilité depuis un pivot commun.
-- **`intimacy(first, second, …)`** : score de couplage entre deux groupes de
-  primitives (voir [`intimacy.md`](intimacy.md)).
-- Support : `reverse_bfs_dist` (BFS multi-source inversé), `bfs_path`,
-  `wcc_labels` (composantes faiblement connexes, union-find),
-  `effective_diameter_directed` (diamètre effectif dirigé), `is_allowlisted_pkg`
-  (allowlist `BENIGN_SDK_PREFIXES` des SDK bénins).
+- **`entrypoints(components)`**: nodes matching the components declared in the
+  manifest (activities, services, receivers…) — the root of any *validated*
+  reachability.
+- **`reachability(api, entrypoints)`**: is an API reachable from a manifest
+  entry point, and through which paths.
+- **`reaches(a, b)`** / **`reaches_both(a, b, …)`**: simple reachability /
+  co-reachability from a common pivot.
+- **`intimacy(first, second, …)`**: coupling score between two groups of
+  primitives (see [`intimacy.md`](intimacy.md)).
+- Support: `reverse_bfs_dist` (reverse multi-source BFS), `bfs_path`,
+  `wcc_labels` (weakly connected components, union-find),
+  `effective_diameter_directed` (directed effective diameter),
+  `is_allowlisted_pkg` (allowlist `BENIGN_SDK_PREFIXES` of benign SDKs).
 
-L'analyse est **flow- et context-insensitive** : un compromis assumé pour la
-scalabilité (cf. IntDroid, même choix), au prix de ne pas suivre la réflexion ni
-le chargement dynamique.
+The analysis is **flow- and context-insensitive**: a deliberate trade-off for
+scalability (IntDroid makes the same choice), at the cost of following neither
+reflection nor dynamic loading.
 
-## Moteur de règles (`src/rules/`)
+## Rule engine (`src/rules/`)
 
 ### DSL (`schema.rs`)
 
-Une règle a un bloc `meta` (id, name, tactic, detectability, references…) et un
-bloc `features` : une expression composable, désérialisée à la main depuis un
-YAML à maps à clé unique. Variantes de `Feature` :
+A rule has a `meta` block (id, name, tactic, detectability, references…) and a
+`features` block: a composable expression, deserialised by hand from YAML with
+single-key maps. Variants of `Feature`:
 
-- combinateurs : `and`, `or`, `not`, `count { feature, min }`, `sequence` ;
-- atomes : `api`, `string`, `permission`, `intent-action`, `native-symbol`,
-  `service`, `accessibility-service` ;
-- couplage : `co-reachable` (booléen), `intimacy` (score) ;
-- `unsupported` : marqueur explicite d'une technique hors périmètre de l'analyse
-  statique (toujours faux) — documente l'out-of-scope au lieu de laisser un trou.
+- combinators: `and`, `or`, `not`, `count { feature, min }`, `sequence`;
+- atoms: `api`, `string`, `permission`, `intent-action`, `native-symbol`,
+  `service`, `accessibility-service`;
+- coupling: `co-reachable` (boolean), `intimacy` (score);
+- `unsupported`: explicit marker of a technique outside the scope of static
+  analysis (always false) — it documents what is out of scope instead of
+  leaving a gap.
 
 ### Catalogue (`catalog.rs`)
 
-`detection_for(id)` renvoie le bloc `features` YAML embarqué pour une technique
-ATT&CK donnée, ou `None` (→ la technique est marquée `out-of-scope`). C'est le
-cœur métier : la logique de détection propre à Drakkar.
+`detection_for(id)` returns the embedded YAML `features` block for a given
+ATT&CK technique, or `None` (→ the technique is marked `out-of-scope`). This is
+the core of the domain logic: Drakkar's own detection logic.
 
 ### Cache (`fetch.rs`)
 
-Au premier lancement, `ensure_cache` télécharge le bundle STIX 2.1 de MITRE
-ATT&CK Mobile, en extrait les techniques Android actives, les fusionne avec le
-catalogue (`detection_for`), et écrit un YAML par technique dans
-`~/…/Caches/drakkar/rules/`.
+On first run, `ensure_cache` downloads the STIX 2.1 bundle of MITRE ATT&CK
+Mobile, extracts the active Android techniques, merges them with the catalogue
+(`detection_for`), and writes one YAML per technique into the user cache
+directory (`~/Library/Caches/drakkar/rules/` on macOS,
+`~/.cache/drakkar/rules/` on Linux).
 
-**Invalidation par hash.** Le source de `catalog.rs` est haché à la compilation
-(`include_str!` + FNV-1a) et stocké dans `.catalog_hash`. À chaque lancement, si
-le hash embarqué diffère du hash stocké, le cache est **régénéré
-automatiquement** — plus besoin de purge manuelle après un changement de règles.
-Le bundle STIX brut est mis en cache séparément (`mobile-attack.json`) : un
-changement de catalogue régénère les YAML sans retélécharger, et fonctionne
-hors-ligne une fois le STIX récupéré.
+**Hash-based invalidation.** The source of `catalog.rs` is hashed at compile
+time (`include_str!` + FNV-1a) and stored in `.catalog_hash`. On every run, if
+the embedded hash differs from the stored one, the cache is **regenerated
+automatically** — no manual purge is needed after a rule change. The raw STIX
+bundle is cached separately (`mobile-attack.json`): a catalogue change
+regenerates the YAML without downloading again, and works offline once the
+STIX has been fetched.
 
-### Évaluation (`mod.rs`)
+The STIX bundle is downloaded from MITRE's repository without a version pin,
+so it follows their latest release: two caches downloaded at different times
+may differ. In a bundle, `rules_hash` records the exact rule set and catalogue
+used (`drakkar --bundle --legend`).
 
-`Engine::run(features, cg)` :
+### Evaluation (`mod.rs`)
 
-1. calcule une fois les entrypoints validés par le manifest ;
-2. pour chaque règle, `eval` l'expression `features` et collecte les preuves des
-   seules branches vraies ;
-3. dédoublonne les preuves, puis **enrichit** les preuves de type `api` avec leur
-   atteignabilité et leurs chemins depuis un entrypoint ;
-4. émet un `Match` (id, name, tactic, evidence) par règle satisfaite.
+`Engine::run(features, cg)`:
 
-Chaque `Evidence` porte son `kind`, la `value` observée, et selon le cas
-`reachable`, `score` (intimité) et `paths`.
+1. computes once the entry points validated by the manifest;
+2. for each rule, `eval`s the `features` expression and collects the evidence
+   of the true branches only;
+3. deduplicates the evidence, then **enriches** the evidence of kind `api`
+   with its reachability and its paths from an entry point;
+4. emits one `Match` (id, name, tactic, evidence) per satisfied rule.
 
-## Modes d'exécution
+Each `Evidence` carries its `kind`, the observed `value`, and depending on the
+case `reachable`, `score` (intimacy) and `paths`.
 
-- **Single** (`main.rs`) : un APK → un JSON sur la sortie standard.
-- **Bulk** (`bulk.rs`) : un répertoire d'APK, parcouru en parallèle (`rayon`),
-  un JSON par APK. L'`Engine` (donc le cache de règles) est chargé une seule
-  fois ; chaque APK est isolé (`catch_unwind`) pour qu'un échec de parsing
-  n'interrompe pas le lot. Utile pour constituer les distributions de scores
-  nécessaires à la calibration (cf. [`intimacy.md`](intimacy.md) § 9).
+## Execution modes
 
-## Choix de conception, en résumé
+- **Single** (`main.rs`): one APK → one JSON on standard output.
+- **Bulk** (`bulk.rs`): a directory of APKs, processed in parallel (`rayon`),
+  one JSON per APK. The `Engine` (hence the rule cache) is loaded once; each
+  APK is isolated (`catch_unwind`) so that a parsing failure does not stop the
+  batch. Useful for building the score distributions needed for calibration
+  (see [`intimacy.md`](intimacy.md) § 9).
 
-- **Traçabilité d'abord** : toute détection s'accompagne de ses preuves et, pour
-  les API, du chemin d'atteignabilité — pas de verdict boîte noire.
-- **Reachability validée par le manifest** : on ne part que d'entrypoints
-  réellement déclarés, ce qui écarte le code mort et les faux positifs de simple
-  présence.
-- **Matching par sous-chaîne d'`api()`** : simple et robuste à l'ordre des
-  paramètres, mais sensible à l'obfuscation des bibliothèques bundlées — d'où le
-  choix, pour les sinks réseau, de cibler des API système non-obfuscables (voir
+## Design choices, in short
+
+- **Traceability first**: every detection comes with its evidence and, for
+  APIs, the reachability path — no black-box verdict.
+- **Reachability validated by the manifest**: only entry points actually
+  declared are used as roots, which rules out dead code and the false
+  positives of mere presence.
+- **Substring matching on `api()`**: simple and robust to parameter order, but
+  sensitive to the obfuscation of bundled libraries — hence the choice, for
+  network sinks, of targeting system APIs that cannot be obfuscated (see
   [`intimacy.md`](intimacy.md) § 6).
-- **Catalogue versionné par hash** : l'itération sur les règles ne demande aucun
-  entretien de cache.
+- **Catalogue versioned by hash**: iterating on the rules requires no cache
+  maintenance.
