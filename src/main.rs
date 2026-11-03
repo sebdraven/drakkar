@@ -640,6 +640,18 @@ fn main() -> Result<()> {
     }
     check_archive(&cli)?;
 
+    // Point de normalisation unique : un XAPK devient son base en mémoire, et
+    // `src` est ce que reçoivent les analyses. --list-entries et --extract-entry
+    // lisent le conteneur brut.
+    let raw_container = cli.list_entries || !cli.extract_entry.is_empty();
+    let resolved = match &cli.apk {
+        Some(path) if raw_container => Some(parser::xapk::Input::plain(path)),
+        Some(path) => Some(parser::xapk::resolve(path)?),
+        None => None,
+    };
+    let src = resolved.as_ref().map(|i| i.source());
+    let splits = resolved.as_ref().map_or(&[][..], |i| i.splits());
+
     // Sortie rapide : audit d'architecture native seul (pas de moteur de règles,
     // pas de catalogue MITRE) — lit uniquement les en-têtes ELF, en mémoire.
     if cli.native_arch {
@@ -649,10 +661,10 @@ fn main() -> Result<()> {
             "cet audit d'en-têtes ELF n'a pas de forme structurée ; pour un inventaire des \
              binaires natifs, passer par --list-assets (TSV) ou --extract-libs",
         )?;
-        let Some(apk) = &cli.apk else {
+        let Some(apk) = src else {
             bail!("--native-arch requiert un APK (mode single)");
         };
-        let summary = parser::native_arch::scan_apk_file(apk)?;
+        let summary = parser::native_arch::scan_apk_file(apk, splits)?;
         print_native_arch(&summary);
         return Ok(());
     }
@@ -674,7 +686,7 @@ fn main() -> Result<()> {
             );
         }
         check_json_dest(cli.format, cli.json_out.as_deref())?;
-        let Some(input) = &cli.apk else {
+        let Some(input) = src else {
             bail!("--native requiert un APK ou un ELF (mode single)");
         };
         let mut listings = Vec::new();
@@ -703,13 +715,24 @@ fn main() -> Result<()> {
         options.export_roots = cli.native_roots == Some(NativeRoots::Exports);
         options.string_index = cli.native_string_index;
         let disasm = cli.native_disasm.then_some(&options);
-        let dex = &cli.native_dex;
-        let mut report = if parser::native_static::is_elf_file(input) {
-            parser::native_static::analyze_elf_file(input, dex, disasm)?
-        } else {
-            parser::native_static::analyze_apk(input, dex, disasm)?
+        let mut dex = Vec::new();
+        for path in &cli.native_dex {
+            dex.push(parser::xapk::resolve(path)?.source().clone());
+        }
+        let elf = input
+            .as_path()
+            .filter(|p| parser::native_static::is_elf_file(p));
+        let mut report = match elf {
+            Some(elf) => parser::native_static::analyze_elf_file(elf, &dex, disasm)?,
+            None => parser::native_static::analyze_apk(input, splits, &dex, disasm)?,
         };
-        parser::native_static::add_listings(&mut report, input, &listings, options.max_insns);
+        parser::native_static::add_listings(
+            &mut report,
+            input,
+            splits,
+            &listings,
+            options.max_insns,
+        );
         if cli.format.wants_text() {
             print_native(&report, cli.disasm_full);
         }
@@ -754,7 +777,8 @@ fn main() -> Result<()> {
             // Un DEX malformé peut faire paniquer le crate : on isole pour qu'un
             // échantillon pourri ne tue pas le lot.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                parser::dyn_entrypoints::extract_any(apk)
+                let input = resolve_item(apk, resolved.as_ref())?;
+                parser::dyn_entrypoints::extract_any(input.source())
             }));
             let report = match outcome {
                 Ok(Ok(r)) => r,
@@ -807,7 +831,8 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| "unknown".into());
 
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                parser::reflection_inputs::extract_any(input)
+                let input = resolve_item(input, resolved.as_ref())?;
+                parser::reflection_inputs::extract_any(input.source())
             }));
             let report = match outcome {
                 Ok(Ok(r)) => r,
@@ -842,12 +867,12 @@ fn main() -> Result<()> {
             setup_jobs(cli.jobs)?;
             return bulk::run_orphan_audit(dir, &bulk_options(&cli));
         }
-        let Some(apk) = &cli.apk else {
+        let Some(apk) = src else {
             bail!("--orphan-audit requiert un APK ou un DEX brut (mode single) ou --bulk <DIR>");
         };
         check_json_dest(cli.format, cli.json_out.as_deref())?;
 
-        let parsed = parser::parse_any(apk)?;
+        let parsed = parser::parse_any(apk, splits)?;
         let cg = &parsed.call_graph;
         let roots = bulk::build_orphan_roots(apk, &parsed)?;
         let bulk::OrphanRoots {
@@ -956,10 +981,10 @@ est racine — ne pas comparer à une mesure `manifest`)",
             "cette sonde rend un verdict et ses chemins en texte ; pour du JSON sur le graphe, \
              utiliser --orphan-audit --format json",
         )?;
-        let Some(apk) = &cli.apk else {
+        let Some(apk) = src else {
             bail!("--probe requiert un APK ou un DEX brut (mode single)");
         };
-        let parsed = parser::parse_any(apk)?;
+        let parsed = parser::parse_any(apk, splits)?;
         let cg = &parsed.call_graph;
 
         let roots = bulk::build_orphan_roots(apk, &parsed)?;
@@ -1034,7 +1059,8 @@ est racine — ne pas comparer à une mesure `manifest`)",
             // Un DEX malformé peut faire paniquer le crate : on isole pour
             // qu'un échantillon pourri ne tue pas le lot.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                parser::api_surface::scan_any(input)
+                let input = resolve_item(input, resolved.as_ref())?;
+                parser::api_surface::scan_any(input.source())
             }));
             let report = match outcome {
                 Ok(Ok(r)) => r,
@@ -1141,7 +1167,8 @@ est racine — ne pas comparer à une mesure `manifest`)",
                 .unwrap_or_else(|| "unknown".into());
 
             let pool = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                parser::dex_strings::extract_any(input)
+                let input = resolve_item(input, resolved.as_ref())?;
+                parser::dex_strings::extract_any(input.source())
             })) {
                 Ok(Ok(p)) => p,
                 Ok(Err(e)) => {
@@ -1236,6 +1263,7 @@ est racine — ne pas comparer à une mesure `manifest`)",
         run_resources(
             &inputs,
             &rejected,
+            resolved.as_ref(),
             &mode,
             bulk_mode,
             cli.format,
@@ -1259,7 +1287,9 @@ est racine — ne pas comparer à une mesure `manifest`)",
             ngram: cli.diff_ngram,
             normalize: parse_substitutions(&cli.diff_normalize, "--diff-normalize")?,
         };
-        let report = parser::diff_dex::run(&pair[0], &pair[1], &opts)?;
+        let a = parser::xapk::resolve(&pair[0])?;
+        let b = parser::xapk::resolve(&pair[1])?;
+        let report = parser::diff_dex::run(a.source(), b.source(), &opts)?;
         if cli.format.wants_text() {
             print_diff_dex(&report);
         }
@@ -1292,7 +1322,9 @@ est racine — ne pas comparer à une mesure `manifest`)",
             color,
             ..Default::default()
         };
-        let report = parser::diff_strings::run(&pair[0], &pair[1], &opts)?;
+        let a = parser::xapk::resolve(&pair[0])?;
+        let b = parser::xapk::resolve(&pair[1])?;
+        let report = parser::diff_strings::run(a.source(), b.source(), &opts)?;
         if cli.format.wants_text() {
             print!("{}", parser::diff_strings::render(&report, &opts));
         }
@@ -1329,7 +1361,9 @@ est racine — ne pas comparer à une mesure `manifest`)",
             ..Default::default()
         };
 
-        let report = parser::diff_explain::run(&pair[0], &pair[1], &opts)?;
+        let a = parser::xapk::resolve(&pair[0])?;
+        let b = parser::xapk::resolve(&pair[1])?;
+        let report = parser::diff_explain::run(a.source(), b.source(), &opts)?;
         if cli.format.wants_text() {
             print!("{}", parser::diff_explain::render_report(&report, &opts));
         }
@@ -1382,7 +1416,7 @@ est racine — ne pas comparer à une mesure `manifest`)",
             bail!("--format csv n'existe pas pour --capabilities : passer --format json ou both");
         }
         check_json_dest(cli.format, cli.json_out.as_deref())?;
-        let Some(input) = &cli.apk else {
+        let Some(input) = src else {
             bail!("--capabilities requiert un APK ou un DEX en argument (mode single)");
         };
         let report = parser::capabilities::run(input, patterns, &cli.capabilities_exclude)?;
@@ -1414,7 +1448,7 @@ est racine — ne pas comparer à une mesure `manifest`)",
              comparaison structurée, utiliser --diff-explain (opérandes résolues) ou \
              --diff-dex (empreintes d'opcodes), qui ont tous deux --format json",
         )?;
-        let Some(input) = &cli.apk else {
+        let Some(input) = src else {
             bail!("--disasm requiert un APK ou un DEX en argument (mode single)");
         };
 
@@ -1449,7 +1483,7 @@ est racine — ne pas comparer à une mesure `manifest`)",
             "le Java est du texte ; pour une sortie structurée par méthode, utiliser \
              --bundle <OUT>",
         )?;
-        let Some(input) = &cli.apk else {
+        let Some(input) = src else {
             bail!("--decompile requiert un APK ou un DEX en argument (mode single)");
         };
         let report = parser::decompile::decompile_matching(input, patterns)?;
@@ -1484,7 +1518,7 @@ est racine — ne pas comparer à une mesure `manifest`)",
         let Some(out) = out else {
             bail!("--bundle requiert un répertoire de sortie : drakkar <APK> --bundle <OUT>");
         };
-        let Some(input) = &cli.apk else {
+        let Some(input) = &resolved else {
             bail!("--bundle requiert un APK ou un DEX en argument (mode single)");
         };
         setup_jobs(cli.jobs)?;
@@ -1548,15 +1582,15 @@ est racine — ne pas comparer à une mesure `manifest`)",
             bulk::Inventory::Dating
         };
 
-        match (&cli.apk, &cli.bulk) {
-            (Some(apk), None) => {
+        match (&resolved, &cli.bulk) {
+            (Some(input), None) => {
                 if cli.format == Format::Csv {
                     bail!("--format csv n'existe qu'en mode bulk (--bulk <DIR>)");
                 }
                 check_json_dest(cli.format, cli.json_out.as_deref())?;
                 match what {
                     bulk::Inventory::Manifest => {
-                        let report = parser::manifest_info::extract(apk)?;
+                        let report = input.manifest_report()?;
                         if cli.format.wants_text() {
                             print_manifest(&report);
                         }
@@ -1565,7 +1599,7 @@ est racine — ne pas comparer à une mesure `manifest`)",
                         }
                     }
                     bulk::Inventory::Cert => {
-                        let report = parser::cert::extract(apk)?;
+                        let report = input.cert_report()?;
                         if cli.format.wants_text() {
                             print_cert(&report);
                         }
@@ -1574,7 +1608,7 @@ est racine — ne pas comparer à une mesure `manifest`)",
                         }
                     }
                     bulk::Inventory::Dating => {
-                        let report = parser::dating::extract(apk)?;
+                        let report = input.dating_report()?;
                         if cli.format.wants_text() {
                             print_dating(&report);
                         }
@@ -1648,6 +1682,7 @@ est racine — ne pas comparer à une mesure `manifest`)",
         run_assets(
             &inputs,
             &rejected,
+            resolved.as_ref(),
             &opts,
             cli.extract_assets.as_deref(),
             bulk_mode,
@@ -1665,10 +1700,10 @@ est racine — ne pas comparer à une mesure `manifest`)",
             "les bibliothèques sont écrites dans --out et récapitulées en texte ; il n'existe \
              pas de forme structurée de ce récapitulatif",
         )?;
-        let Some(apk) = &cli.apk else {
+        let Some(apk) = src else {
             bail!("--extract-libs requiert un APK (mode single)");
         };
-        let extraction = parser::native_extract::extract_apk_file(apk)?;
+        let extraction = parser::native_extract::extract_apk_file(apk, splits)?;
         print_and_dump_extract(&extraction, &cli.out)?;
         return Ok(());
     }
@@ -1715,7 +1750,7 @@ est racine — ne pas comparer à une mesure `manifest`)",
         None => Engine::load_cached(cli.refresh)?,
     };
 
-    match (&cli.apk, &cli.bulk) {
+    match (src, &cli.bulk) {
         // ── Mode bulk : répertoire d'APK, parallèle ──
         (None, Some(dir)) => {
             setup_jobs(cli.jobs)?;
@@ -1727,9 +1762,9 @@ est racine — ne pas comparer à une mesure `manifest`)",
             reject_non_json_format(cli.format)?;
             // Pas parse_any : il refuse une archive dont le premier local header
             // est abîmé, que parse_apk ouvre par le lecteur tolérant.
-            let parsed = match parser::dyn_entrypoints::sniff(apk) {
+            let parsed = match apk.sniff() {
                 Some(parser::dyn_entrypoints::InputKind::Dex) => parser::parse_dex(apk)?,
-                _ => parser::parse_apk(apk)?,
+                _ => parser::parse_apk(apk, splits)?,
             };
             let matches = engine.run(&parsed.features, &parsed.call_graph);
 
@@ -1770,7 +1805,7 @@ fn print_native_arch(s: &drakkar::parser::native_arch::NativeArchSummary) {
         let flag = if l.abi_mismatch { "  ⚠ MISMATCH" } else { "" };
         println!(
             "  {:<40} {:<8} {}{}",
-            l.entry,
+            l.location(),
             l.machine.label(),
             bits,
             flag
@@ -1872,7 +1907,10 @@ fn print_native_elf(e: &drakkar::parser::native_static::ElfReport, full: bool) {
     let (machine, bits, endian) = (&e.machine, e.bits, e.endian);
     let (elf_type, pie, stripped) = (e.elf_type, e.pie, e.stripped);
 
-    println!("\n{}", e.path);
+    match &e.split {
+        Some(split) => println!("\n{split}!{}", e.path),
+        None => println!("\n{}", e.path),
+    }
     println!("  sha256        {}", e.sha256);
     println!("  origine       {origin}  abi {abi}  taille {size} o");
     println!("  machine       {machine}  {bits} bits  {endian}");
@@ -2066,12 +2104,12 @@ fn print_and_dump_extract(
             ""
         };
         // nom de sortie aplati : lib/arm64-v8a/foo.so -> lib__arm64-v8a__foo.so
-        let flat = parser::flat_output_name(&l.entry);
+        let flat = l.output_name();
         let dest = out_dir.join(&flat);
         std::fs::write(&dest, &l.bytes).with_context(|| format!("écriture {}", dest.display()))?;
         println!(
             "  {:<38} {:<8} {:<7} {:>9} o  {}  -> {}{}",
-            l.entry,
+            l.location(),
             l.arch.machine.label(),
             bits,
             l.bytes.len(),
@@ -2220,20 +2258,33 @@ fn dyn_entrypoints_tsv(
     out
 }
 
+/// Entrée d'un mode qui tourne en single comme en bulk. En single, l'entrée a
+/// déjà été résolue en tête de `main` et la résolution est reprise ; en bulk,
+/// chaque entrée est résolue ici, une par une.
+fn resolve_item(
+    path: &std::path::Path,
+    single: Option<&parser::xapk::Input>,
+) -> Result<parser::xapk::Input> {
+    match single {
+        Some(input) if input.origin() == path => Ok(input.clone()),
+        _ => parser::xapk::resolve(path),
+    }
+}
+
 /// Mode `--bundle` : `out/<sha256>/`, arborescence définie par
 /// `--bundle --legend`.
-fn run_bundle(input: &std::path::Path, out: &std::path::Path, cli: &Cli) -> Result<()> {
+fn run_bundle(input: &parser::xapk::Input, out: &std::path::Path, cli: &Cli) -> Result<()> {
+    use parser::bundle_archive;
     use parser::decompile::{self, BundleError, BundleInfo};
     use parser::dyn_entrypoints::InputKind;
-    use parser::{bundle_archive, cert, dating, manifest_info};
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let generated_at = cert::fmt_unix_utc(now);
+    let generated_at = parser::cert::fmt_unix_utc(now);
 
-    let src = decompile::open(input)?;
+    let src = decompile::open(input.source())?;
     let root = out.join(&src.sha256);
     let zip = bundle_archive::archive_path(out, &src.sha256);
     refuse_existing(&root, cli.overwrite)?;
@@ -2250,19 +2301,19 @@ fn run_bundle(input: &std::path::Path, out: &std::path::Path, cli: &Cli) -> Resu
     let apk = src.kind == InputKind::Apk;
 
     let manifest = if apk {
-        bundle_part("manifest", &mut errors, || manifest_info::extract(input))
+        bundle_part("manifest", &mut errors, || input.manifest_report())
     } else {
         None
     };
     write_bundle_json(&root, "manifest.json", &manifest)?;
     let signing = if apk {
-        bundle_part("cert", &mut errors, || cert::extract(input))
+        bundle_part("cert", &mut errors, || input.cert_report())
     } else {
         None
     };
     write_bundle_json(&root, "cert.json", &signing)?;
     let datation = if apk {
-        bundle_part("dating", &mut errors, || dating::extract(input))
+        bundle_part("dating", &mut errors, || input.dating_report())
     } else {
         None
     };
@@ -2275,7 +2326,7 @@ fn run_bundle(input: &std::path::Path, out: &std::path::Path, cli: &Cli) -> Resu
     let (matches, rules_hash) = match engine {
         Ok(engine) => {
             let matches = bundle_part("rules", &mut errors, || {
-                let parsed = parser::parse_any(input)?;
+                let parsed = parser::parse_any(input.source(), input.splits())?;
                 Ok(engine.run(&parsed.features, &parsed.call_graph))
             });
             let hash = if matches.is_some() {
@@ -2294,7 +2345,7 @@ fn run_bundle(input: &std::path::Path, out: &std::path::Path, cli: &Cli) -> Resu
 
     let mut tsv = format!("{DYN_ENTRYPOINTS_HEADER}\n");
     let dyn_report = bundle_part("dyn_entrypoints", &mut errors, || {
-        parser::dyn_entrypoints::extract_any(input)
+        parser::dyn_entrypoints::extract_any(input.source())
     });
     if let Some(report) = &dyn_report {
         tsv.push_str(&dyn_entrypoints_tsv(&src.sha256, report));
@@ -2627,6 +2678,9 @@ fn print_manifest(r: &drakkar::parser::manifest_info::ManifestReport) {
         }
     }
 
+    if let Some(c) = &r.container {
+        print_container(c);
+    }
     println!("\n(légende des étiquettes : --manifest --legend)");
 }
 
@@ -2694,7 +2748,42 @@ fn print_cert(r: &drakkar::parser::cert::SigningReport) {
         }
     }
 
+    if let Some(same) = r.splits_same_signer {
+        println!(
+            "\nSplits ({}) — même signataire que le base : {same}",
+            r.split_signers.len()
+        );
+        for sp in &r.split_signers {
+            let certs = if sp.cert_sha256.is_empty() {
+                "(signature illisible)".to_string()
+            } else {
+                sp.cert_sha256.join(", ")
+            };
+            println!("  {:<32} {certs}", sp.entry);
+        }
+    }
+
+    if let Some(c) = &r.container {
+        print_container(c);
+    }
     println!("\n(légende des champs : --cert --legend)");
+}
+
+/// Bloc `container` d'un rapport d'inventaire.
+fn print_container(c: &drakkar::parser::xapk::ContainerInfo) {
+    println!("\nConteneur {} : {}", c.kind.as_str(), c.path);
+    println!("  sha256         {}", c.sha256);
+    println!("  base           {}  {}", c.base_entry, c.base_sha256);
+    for sp in &c.splits {
+        let native = if sp.native { "  natif" } else { "" };
+        println!(
+            "  split          {}  {}  (id {}){native}",
+            sp.entry, sp.sha256, sp.id
+        );
+    }
+    for a in &c.anomalies {
+        println!("  écarté         {a}");
+    }
 }
 
 /// Rendu console des indicateurs de datation (mode `--dating`).
@@ -2798,6 +2887,9 @@ fn print_dating(r: &drakkar::parser::dating::DatingReport) {
         }
     }
 
+    if let Some(c) = &r.container {
+        print_container(c);
+    }
     println!("\n(nature exacte de chaque indicateur : --dating --legend)");
 }
 
@@ -2906,6 +2998,7 @@ enum AssetsOutput {
 fn run_assets(
     inputs: &[PathBuf],
     rejected: &[(PathBuf, String)],
+    single: Option<&drakkar::parser::xapk::Input>,
     opts: &drakkar::parser::assets::AssetsOptions,
     out: Option<&std::path::Path>,
     bulk_mode: bool,
@@ -2969,8 +3062,10 @@ fn run_assets(
 
         // Une archive pourrie peut faire paniquer un décodeur : on isole pour
         // qu'elle ne tue pas le lot.
-        let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| assets::collect(apk, opts)));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let input = resolve_item(apk, single)?;
+            assets::collect(input.source(), opts)
+        }));
         let mut report = match outcome {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
@@ -3118,6 +3213,7 @@ enum ResourceOutput {
 fn run_resources(
     inputs: &[PathBuf],
     rejected: &[(PathBuf, String)],
+    single: Option<&drakkar::parser::xapk::Input>,
     mode: &ResourceOutput,
     bulk_mode: bool,
     format: Format,
@@ -3158,6 +3254,8 @@ fn run_resources(
         // Une table trafiquée peut faire paniquer un décodeur : on isole pour
         // qu'un échantillon ne tue pas le lot.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let input = resolve_item(apk, single)?;
+            let apk = input.source();
             let table = arsc::extract(apk)?;
             let xref = if needs_xref {
                 Some(resource_xref::scan(apk, &table)?)

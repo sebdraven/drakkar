@@ -49,14 +49,13 @@
 //! qui n'est PAS une citation : c'était un raccourci vers le laboratoire Argus,
 //! rattachement non confirmé.)
 
-use crate::parser::dex_facade::DexValue;
+use crate::parser::dex_facade::{DexBin, DexValue};
+use crate::parser::source::Source;
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::io::Read;
-use std::path::{Path, PathBuf};
 
 /// Paramètres du diff.
 pub struct DiffOptions {
@@ -188,9 +187,14 @@ pub struct DiffReport {
 }
 
 /// Point d'entrée : diff de deux entrées (DEX brut ou APK).
-pub fn run(input_a: &Path, input_b: &Path, opts: &DiffOptions) -> Result<DiffReport> {
-    let (a, statics_a, _tmp_a) = load_class_prints(input_a, opts)?;
-    let (b, statics_b, _tmp_b) = load_class_prints(input_b, opts)?;
+pub fn run(
+    input_a: impl Into<Source>,
+    input_b: impl Into<Source>,
+    opts: &DiffOptions,
+) -> Result<DiffReport> {
+    let (input_a, input_b) = (input_a.into(), input_b.into());
+    let (a, statics_a) = load_class_prints(&input_a, opts)?;
+    let (b, statics_b) = load_class_prints(&input_b, opts)?;
 
     let (static_fields_compared, static_fields_diverging) = compare_statics(&statics_a, &statics_b);
 
@@ -337,8 +341,8 @@ pub fn run(input_a: &Path, input_b: &Path, opts: &DiffOptions) -> Result<DiffRep
     });
 
     Ok(DiffReport {
-        input_a: input_a.display().to_string(),
-        input_b: input_b.display().to_string(),
+        input_a: input_a.to_string(),
+        input_b: input_b.to_string(),
         classes_a: a.len(),
         classes_b: b.len(),
         methods_a,
@@ -433,26 +437,26 @@ fn hash_window(w: &[u64]) -> u64 {
 }
 
 /// Charge les empreintes de classes applicatives d'une entrée (DEX brut ou APK).
-/// Retourne aussi le tempdir éventuel, à garder vivant tant qu'on lit les DEX.
 fn load_class_prints(
-    input: &Path,
+    input: &Source,
     opts: &DiffOptions,
-) -> Result<(Vec<ClassPrint>, StaticsByClass, Option<tempfile::TempDir>)> {
-    let (dex_paths, tmp) = collect_dex_paths(input)?;
+) -> Result<(Vec<ClassPrint>, StaticsByClass)> {
+    let dexes = crate::parser::dex_inputs(input)?;
     let mut prints = Vec::new();
     let mut statics = StaticsByClass::new();
-    for dp in &dex_paths {
-        collect_from_dex(dp, opts, &mut prints, &mut statics)
-            .with_context(|| format!("parse {}", dp.display()))?;
+    for dex in &dexes {
+        DexBin::from_bytes(&dex.bytes, &dex.name)
+            .and_then(|bin| collect_from_dex(bin, opts, &mut prints, &mut statics))
+            .with_context(|| format!("parse {}", dex.name))?;
     }
     if prints.is_empty() {
         bail!(
             "aucune classe applicative retenue dans {} — vérifie --diff-include \
              (préfixes au format descripteur Dalvik, ex. Lcom/dy/)",
-            input.display()
+            input
         );
     }
-    Ok((prints, statics, tmp))
+    Ok((prints, statics))
 }
 
 /// Une classe est-elle applicative (à comparer) selon les options ?
@@ -503,13 +507,11 @@ pub(crate) fn opcode_fingerprint(instructions: &[dex_bytecode::Instruction]) -> 
 
 /// Parse un DEX et accumule les ClassPrint des classes applicatives.
 fn collect_from_dex(
-    path: &Path,
+    dex: DexBin,
     opts: &DiffOptions,
     out: &mut Vec<ClassPrint>,
     statics: &mut StaticsByClass,
 ) -> Result<()> {
-    let dex = crate::parser::dex_facade::DexBin::open(path)?;
-
     for class in dex.classes() {
         let class = match class {
             Ok(c) => c,
@@ -589,60 +591,6 @@ fn collect_from_dex(
         });
     }
     Ok(())
-}
-
-/// Résout l'entrée en une liste de chemins de DEX à lire. DEX brut → lui-même ;
-/// APK (zip) → ses `classes*.dex` extraits dans un tempdir. Le type est reniflé
-/// sur les octets de tête, jamais sur l'extension.
-fn collect_dex_paths(input: &Path) -> Result<(Vec<PathBuf>, Option<tempfile::TempDir>)> {
-    let mut magic = [0u8; 8];
-    {
-        let mut f =
-            std::fs::File::open(input).with_context(|| format!("open {}", input.display()))?;
-        let n = f.read(&mut magic)?;
-        if n < 4 {
-            bail!("{} trop court pour être un DEX ou un APK", input.display());
-        }
-    }
-
-    // DEX : magic "dex\n" (0x64 65 78 0a).
-    if &magic[0..4] == b"dex\n" {
-        return Ok((vec![input.to_path_buf()], None));
-    }
-    // ZIP/APK : signature locale "PK\x03\x04".
-    if magic[0..4] == [0x50, 0x4b, 0x03, 0x04] {
-        let tmp = tempfile::tempdir().context("create tempdir")?;
-        let paths = extract_dexes(input, tmp.path())?;
-        if paths.is_empty() {
-            bail!("aucun classes*.dex dans l'APK {}", input.display());
-        }
-        return Ok((paths, Some(tmp)));
-    }
-    bail!(
-        "{} n'est ni un DEX (dex\\n) ni un APK (PK) — magic {:02x?}",
-        input.display(),
-        &magic[0..4]
-    )
-}
-
-/// Extrait les seuls `classes*.dex` d'un APK vers `out_dir`.
-fn extract_dexes(apk: &Path, out_dir: &Path) -> Result<Vec<PathBuf>> {
-    let file = std::fs::File::open(apk).with_context(|| format!("open {}", apk.display()))?;
-    let mut zip = zip::ZipArchive::new(file).context("read apk as zip")?;
-    let mut out = Vec::new();
-    for i in 0..zip.len() {
-        let mut entry = zip.by_index(i)?;
-        let name = entry.name().to_string();
-        if !(name.starts_with("classes") && name.ends_with(".dex")) {
-            continue;
-        }
-        let dest = out_dir.join(name.replace('/', "__"));
-        let mut buf = Vec::with_capacity(entry.size() as usize);
-        entry.read_to_end(&mut buf)?;
-        std::fs::write(&dest, &buf)?;
-        out.push(dest);
-    }
-    Ok(out)
 }
 
 /// Légende des mesures (mode `--diff-dex --legend`).

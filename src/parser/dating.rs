@@ -31,7 +31,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::path::Path;
+
+use super::source::Source;
 
 // ---------------------------------------------------------------------------
 // Modèle
@@ -40,8 +41,8 @@ use std::path::Path;
 /// Ensemble des indicateurs de datation d'un APK.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DatingReport {
-    /// SHA-256 du fichier APK lui-même — clé de jointure du corpus et des
-    /// services d'enrichissement (VirusTotal, Koodous).
+    /// SHA-256 de l'APK analysé — pour un XAPK, des octets du base — clé de
+    /// jointure du corpus et des services d'enrichissement (VirusTotal, Koodous).
     pub file_sha256: String,
     pub package: String,
     pub version_name: Option<String>,
@@ -65,6 +66,9 @@ pub struct DatingReport {
     /// Plancher d'API déduit des seuls marqueurs de format (jamais du contenu) :
     /// le build est nécessairement postérieur à cette version de plateforme.
     pub toolchain_floor_api: Option<u32>,
+    /// Conteneur XAPK d'où vient l'APK analysé ; absent pour un APK simple.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<super::xapk::ContainerInfo>,
 }
 
 /// Niveaux d'API et marqueurs de build issus du manifest.
@@ -215,17 +219,18 @@ const SENTINELS: &[(&str, &str)] = &[
 /// Aucune étape ne fait échouer les autres : une source illisible laisse son
 /// champ vide plutôt que d'interrompre l'extraction — sur un corpus, une valeur
 /// manquante est exploitable, une ligne absente ne l'est pas.
-pub fn extract(apk_path: &Path) -> Result<DatingReport> {
+pub fn extract(src: impl Into<Source>) -> Result<DatingReport> {
+    let src = src.into();
     let mut r = DatingReport::default();
 
     // Empreinte du fichier : clé de jointure.
-    match file_sha256(apk_path) {
+    match src.sha256() {
         Ok(h) => r.file_sha256 = h,
         Err(e) => tracing::warn!(error = %e, "empreinte du fichier illisible"),
     }
 
     // Manifest : cibles d'API et marqueurs de build.
-    match manifest_info::extract(apk_path) {
+    match manifest_info::extract(&src) {
         Ok(m) => {
             r.package = m.package;
             r.version_name = m.version_name;
@@ -248,7 +253,7 @@ pub fn extract(apk_path: &Path) -> Result<DatingReport> {
     }
 
     // Signature : bornes de validité des certificats.
-    match cert::extract(apk_path) {
+    match cert::extract(&src) {
         Ok(c) => {
             r.signing_schemes = c.schemes.labels().iter().map(|s| s.to_string()).collect();
             for certificate in &c.certificates {
@@ -270,7 +275,7 @@ pub fn extract(apk_path: &Path) -> Result<DatingReport> {
     }
 
     // Archive : horodatages, DEX, versions de bibliothèques, métadonnées.
-    match scan_archive(apk_path) {
+    match scan_archive(&src) {
         Ok(scan) => {
             r.archive = scan.timestamps;
             r.dex_files = scan.dex_files;
@@ -331,9 +336,8 @@ const BUILD_METADATA_ENTRIES: &[&str] = &[
 /// Taille max de contenu conservé pour un fichier de métadonnées.
 const METADATA_MAX: usize = 4096;
 
-fn scan_archive(apk_path: &Path) -> Result<ArchiveScan> {
-    let file = std::fs::File::open(apk_path)
-        .with_context(|| format!("ouverture {}", apk_path.display()))?;
+fn scan_archive(src: &Source) -> Result<ArchiveScan> {
+    let file = src.reader().with_context(|| format!("ouverture {src}"))?;
     let mut zip = zip::ZipArchive::new(file).context("lecture de l'APK comme zip")?;
 
     let timestamps = archive_timestamps(&mut zip);
@@ -538,29 +542,6 @@ fn u32_le(buf: &[u8], off: usize) -> Option<u32> {
     Some(u32::from_le_bytes(slice.try_into().ok()?))
 }
 
-/// SHA-256 du fichier entier, lu par blocs pour ne pas charger l'APK en mémoire.
-fn file_sha256(path: &Path) -> Result<String> {
-    use sha2::{Digest, Sha256};
-
-    let mut f =
-        std::fs::File::open(path).with_context(|| format!("ouverture {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let digest = hasher.finalize();
-    let mut s = String::with_capacity(64);
-    for b in digest {
-        s.push_str(&format!("{b:02x}"));
-    }
-    Ok(s)
-}
-
 // ---------------------------------------------------------------------------
 // Horodatages de l'archive
 // ---------------------------------------------------------------------------
@@ -664,6 +645,8 @@ pub fn legend() -> String {
     s.push_str("    sdk.target_sdk            niveau d'API dont les comportements s'appliquent\n");
     s.push_str("    sdk.compile_minus_target  compile_sdk - target_sdk ; les deux viennent de\n");
     s.push_str("                              la meme config de build, l'ecart mesure un choix\n");
+    s.push('\n');
+    s.push_str(super::xapk::container_legend());
     s
 }
 

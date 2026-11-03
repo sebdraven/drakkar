@@ -27,6 +27,7 @@ use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 
 use super::apkzip::TolerantZip;
+use super::source::Source;
 
 /// Résultat d'une extraction, avec ce qui a échoué plutôt qu'un silence.
 #[derive(Debug, Default)]
@@ -126,18 +127,19 @@ pub fn extract(path: &Path) -> Result<StringPool> {
 ///
 /// Repli sur [`TolerantZip`] dès que le crate `zip` refuse l'archive à
 /// l'ouverture, une entrée à `by_index`, ou ses octets à `read_to_end`.
-pub fn extract_from_apk(path: &Path) -> Result<StringPool> {
-    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+pub fn extract_from_apk(src: impl Into<Source>) -> Result<StringPool> {
+    let src = src.into();
+    let file = src.reader().with_context(|| format!("open {src}"))?;
     match from_archive(file) {
         Ok(pool) => Ok(pool),
         Err(e) => {
             tracing::warn!(
-                apk = %path.display(),
+                apk = %src,
                 error = %e,
                 "crate zip en échec, repli sur le lecteur tolérant"
             );
-            let zip = TolerantZip::open(path)
-                .with_context(|| format!("lecteur tolérant sur {}", path.display()))?;
+            let what = format!("lecteur tolérant sur {src}");
+            let zip = src.tolerant().context(what)?;
             Ok(from_tolerant(&zip))
         }
     }
@@ -217,15 +219,13 @@ impl StringPool {
 
 /// Route selon le contenu : APK ou DEX brut. Réutilise le reniflage de
 /// `dyn_entrypoints` — reconnaissance au contenu, jamais à l'extension.
-pub fn extract_any(path: &Path) -> Result<StringPool> {
-    use super::dyn_entrypoints::{sniff, InputKind};
-    match sniff(path) {
-        Some(InputKind::Apk) => extract_from_apk(path),
-        Some(InputKind::Dex) => extract(path),
-        None => anyhow::bail!(
-            "{} n'est ni un APK ni un DEX (reconnu au contenu)",
-            path.display()
-        ),
+pub fn extract_any(input: impl Into<Source>) -> Result<StringPool> {
+    use super::dyn_entrypoints::InputKind;
+    let src = input.into();
+    match src.sniff() {
+        Some(InputKind::Apk) => extract_from_apk(src),
+        Some(InputKind::Dex) => from_bytes(&src.read_all()?),
+        None => anyhow::bail!("{src} n'est ni un APK ni un DEX (reconnu au contenu)"),
     }
 }
 

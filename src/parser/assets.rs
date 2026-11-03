@@ -77,6 +77,8 @@ use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use super::source::Source;
+
 /// Préfixe d'archive retenu. La comparaison est insensible à la casse : les
 /// archives trafiquées mélangent les conventions et rater `Assets/` serait un
 /// faux négatif silencieux.
@@ -390,18 +392,19 @@ impl AssetsReport {
 
 /// Inventorie les assets d'un APK. Rien n'est écrit sur disque : les octets
 /// restent en mémoire, l'écriture est un appel séparé ([`write_all`]).
-pub fn collect(apk: &Path, opts: &AssetsOptions) -> Result<AssetsReport> {
-    let apk_sha256 = file_sha256(apk)?;
+pub fn collect(apk: impl Into<Source>, opts: &AssetsOptions) -> Result<AssetsReport> {
+    let apk = apk.into();
+    let apk_sha256 = apk.sha256()?;
 
-    let (reader, scanned, assets_seen, mut entries, skipped) = match collect_nominal(apk, opts) {
+    let (reader, scanned, assets_seen, mut entries, skipped) = match collect_nominal(&apk, opts) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
-                apk = %apk.display(),
+                apk = %apk,
                 error = %e,
                 "crate zip en échec sur les assets, repli sur le lecteur tolérant"
             );
-            collect_tolerant(apk, opts)?
+            collect_tolerant(&apk, opts)?
         }
     };
 
@@ -427,7 +430,7 @@ pub fn collect(apk: &Path, opts: &AssetsOptions) -> Result<AssetsReport> {
     }
 
     Ok(AssetsReport {
-        apk: apk.display().to_string(),
+        apk: apk.to_string(),
         apk_sha256,
         reader,
         scanned,
@@ -449,8 +452,8 @@ type Collected = (Reader, usize, usize, Vec<AssetEntry>, Vec<SkippedAsset>);
 /// Chemin nominal. Toute erreur — ouverture, entrée refusée, lecture — remonte
 /// et déclenche le repli complet : un inventaire partiel serait pire qu'un
 /// inventaire tolérant, parce qu'il se lit comme un inventaire complet.
-fn collect_nominal(apk: &Path, opts: &AssetsOptions) -> Result<Collected> {
-    let file = std::fs::File::open(apk).with_context(|| format!("ouverture {}", apk.display()))?;
+fn collect_nominal(apk: &Source, opts: &AssetsOptions) -> Result<Collected> {
+    let file = apk.reader().with_context(|| format!("ouverture {apk}"))?;
     let mut archive = zip::ZipArchive::new(file).context("lecture APK (zip)")?;
 
     let scanned = archive.len();
@@ -523,9 +526,9 @@ fn collect_nominal(apk: &Path, opts: &AssetsOptions) -> Result<Collected> {
 /// Repli tolérant. Ici, contrairement au chemin nominal, une entrée illisible
 /// est consignée et le parcours continue : c'est tout l'intérêt du lecteur, et
 /// il n'y a plus de troisième niveau de repli derrière.
-fn collect_tolerant(apk: &Path, opts: &AssetsOptions) -> Result<Collected> {
-    let zip = super::apkzip::TolerantZip::open(apk)
-        .with_context(|| format!("lecteur tolérant sur {}", apk.display()))?;
+fn collect_tolerant(apk: &Source, opts: &AssetsOptions) -> Result<Collected> {
+    let what = format!("lecteur tolérant sur {apk}");
+    let zip = apk.tolerant().context(what)?;
     tracing::warn!(
         entries = zip.len(),
         tampered = zip.tampered_count(),
@@ -790,22 +793,6 @@ fn fingerprint(
         h.update(b"\n");
     }
     (Some(format!("{:x}", h.finalize())), FP_COMPLETE.to_string())
-}
-
-/// SHA-256 du fichier entier, lu par blocs pour ne pas charger l'APK en mémoire.
-fn file_sha256(path: &Path) -> Result<String> {
-    let mut f =
-        std::fs::File::open(path).with_context(|| format!("ouverture {}", path.display()))?;
-    let mut h = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", h.finalize()))
 }
 
 // ---------------------------------------------------------------------------

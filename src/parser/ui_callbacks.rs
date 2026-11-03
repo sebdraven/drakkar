@@ -27,6 +27,7 @@ use crate::parser::dyn_entrypoints::{
     backtrack_new_instance, dest_register, index_field_assignments, operand_index, registers,
     this_register, writes_register, FieldAssignments, Provenance,
 };
+use crate::parser::source::Source;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::Path;
@@ -83,15 +84,13 @@ impl UiHandlerReport {
 /// Sans archive il n'y a pas de layout : le volet `android:onClick` est
 /// silencieusement vide. C'est `extract_from_apk` qui l'alimente.
 pub fn extract(path: &Path) -> Result<UiHandlerReport> {
-    extract_with_layouts(path, &HashSet::new())
+    extract_with_layouts(DexBin::open(path)?, &HashSet::new())
 }
 
 /// Variante interne : `xml_on_click` porte les noms de handlers cités par les
 /// layouts de l'APK d'origine. Une méthode du DEX qui porte l'un de ces noms
 /// ET la signature exigée par Android (`(Landroid/view/View;)V`) est retenue.
-fn extract_with_layouts(path: &Path, xml_on_click: &HashSet<String>) -> Result<UiHandlerReport> {
-    let dex = DexBin::open(path)?;
-
+fn extract_with_layouts(dex: DexBin, xml_on_click: &HashSet<String>) -> Result<UiHandlerReport> {
     let mut report = UiHandlerReport::default();
 
     // Passe 1 : classe CONCRÈTE assignée à chaque champ — c'est elle qui donne
@@ -301,7 +300,7 @@ fn takes_view_returns_void(method: &DexMethod<'_>) -> bool {
 /// celle qui déclare une méthode de ce nom et de la bonne signature — toutes
 /// les déclarantes si elles sont plusieurs. Sur-approximation bornée par la
 /// signature, et jamais silencieuse : provenance `xml`.
-fn xml_on_click_names(apk: &Path) -> HashSet<String> {
+fn xml_on_click_names(apk: &Source) -> HashSet<String> {
     let mut names = HashSet::new();
     for raw in read_res_xml(apk) {
         match crate::parser::axml::decode(&raw) {
@@ -343,11 +342,11 @@ fn looks_like_method_name(s: &str) -> bool {
 /// Contenu brut des `res/**/*.xml`. Même repli que le manifeste : crate `zip`
 /// d'abord, `apkzip::TolerantZip` dès qu'il refuse quoi que ce soit — c'est à
 /// la lecture d'entrée que le bit de chiffrement trafiqué frappe.
-fn read_res_xml(apk: &Path) -> Vec<Vec<u8>> {
+fn read_res_xml(apk: &Source) -> Vec<Vec<u8>> {
     use std::io::Read;
 
     let nominal = (|| -> Result<Vec<Vec<u8>>> {
-        let file = std::fs::File::open(apk)?;
+        let file = apk.reader()?;
         let mut zip = zip::ZipArchive::new(file)?;
         let mut out = Vec::new();
         for i in 0..zip.len() {
@@ -366,7 +365,7 @@ fn read_res_xml(apk: &Path) -> Vec<Vec<u8>> {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
-                apk = %apk.display(),
+                apk = %apk,
                 error = %e,
                 "res/*.xml refusés par le crate zip, repli sur le lecteur tolérant"
             );
@@ -375,12 +374,12 @@ fn read_res_xml(apk: &Path) -> Vec<Vec<u8>> {
     }
 }
 
-fn read_res_xml_tolerant(apk: &Path) -> Vec<Vec<u8>> {
-    let zip = match crate::parser::apkzip::TolerantZip::open(apk) {
+fn read_res_xml_tolerant(apk: &Source) -> Vec<Vec<u8>> {
+    let zip = match apk.tolerant() {
         Ok(z) => z,
         Err(e) => {
             tracing::warn!(
-                apk = %apk.display(),
+                apk = %apk,
                 error = %e,
                 "lecteur tolérant en échec, volet android:onClick abandonné"
             );
@@ -404,20 +403,21 @@ fn is_res_xml(name: &str) -> bool {
     name.starts_with("res/") && name.ends_with(".xml")
 }
 
-/// Variante APK : relève les `android:onClick` des ressources, puis dézippe les
-/// `classes*.dex` via `parser::extract_dex_files` (donc avec le repli
+/// Variante APK : relève les `android:onClick` des ressources, puis lit les
+/// `classes*.dex` en mémoire via `parser::read_dex_files` (donc avec le repli
 /// `TolerantZip`) et agrège.
-pub fn extract_from_apk(apk: &Path) -> Result<UiHandlerReport> {
+pub fn extract_from_apk(apk: impl Into<Source>) -> Result<UiHandlerReport> {
+    let apk = apk.into();
     // Relevé des layouts d'abord : les noms alimentent le scan de chaque DEX.
-    let xml_on_click = xml_on_click_names(apk);
+    let xml_on_click = xml_on_click_names(&apk);
 
-    let tmp = tempfile::tempdir().context("create tempdir")?;
-    let dex_files = crate::parser::extract_dex_files(apk, tmp.path())?;
+    let dex_files = crate::parser::read_dex_files(&apk)?;
     let mut merged = UiHandlerReport::default();
 
     for dex in &dex_files {
-        let r = extract_with_layouts(dex, &xml_on_click)
-            .with_context(|| format!("scan {}", dex.display()))?;
+        let r = DexBin::from_bytes(&dex.bytes, &dex.name)
+            .and_then(|bin| extract_with_layouts(bin, &xml_on_click))
+            .with_context(|| format!("scan {}", dex.name))?;
         merged.handlers.extend(r.handlers);
     }
 
@@ -426,15 +426,13 @@ pub fn extract_from_apk(apk: &Path) -> Result<UiHandlerReport> {
 
 /// Accepte un APK ou un DEX brut, reconnu au contenu (réutilise le renifleur de
 /// `dyn_entrypoints`).
-pub fn extract_any(path: &Path) -> Result<UiHandlerReport> {
-    use crate::parser::dyn_entrypoints::{sniff, InputKind};
-    match sniff(path) {
-        Some(InputKind::Apk) => extract_from_apk(path),
-        Some(InputKind::Dex) => extract(path),
-        None => anyhow::bail!(
-            "{} n'est ni un APK ni un DEX (reconnu au contenu)",
-            path.display()
-        ),
+pub fn extract_any(input: impl Into<Source>) -> Result<UiHandlerReport> {
+    use crate::parser::dyn_entrypoints::InputKind;
+    let src = input.into();
+    match src.sniff() {
+        Some(InputKind::Apk) => extract_from_apk(src),
+        Some(InputKind::Dex) => extract_with_layouts(DexBin::read(&src)?, &HashSet::new()),
+        None => anyhow::bail!("{src} n'est ni un APK ni un DEX (reconnu au contenu)"),
     }
 }
 

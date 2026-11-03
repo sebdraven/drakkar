@@ -34,11 +34,10 @@
 //! successives. **Ne pas persister ces valeurs ni les publier comme IOC.**
 
 use crate::parser::dex_facade::{DexBin, DexClass, DexValue};
+use crate::parser::source::Source;
 use anyhow::{bail, Context, Result};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
-use std::path::{Path, PathBuf};
 
 /// Paramètres du désassemblage.
 #[derive(Default)]
@@ -105,18 +104,20 @@ pub struct DisasmReport {
 }
 
 /// Point d'entrée : accepte un APK ou un DEX brut, reconnu au contenu.
-pub fn run(input: &Path, opts: &DisasmOptions) -> Result<DisasmReport> {
-    let (dex_paths, _tmp) = collect_dex_paths(input)?;
+pub fn run(input: impl Into<Source>, opts: &DisasmOptions) -> Result<DisasmReport> {
+    let input = input.into();
+    let dexes = crate::parser::dex_inputs(&input)?;
 
     let mut report = DisasmReport {
-        input: input.display().to_string(),
+        input: input.to_string(),
         classes: Vec::new(),
         scanned: 0,
     };
 
-    for dp in &dex_paths {
-        collect_from_dex(dp, opts, &mut report)
-            .with_context(|| format!("parse {}", dp.display()))?;
+    for dex in &dexes {
+        DexBin::from_bytes(&dex.bytes, &dex.name)
+            .and_then(|bin| collect_from_dex(bin, opts, &mut report))
+            .with_context(|| format!("parse {}", dex.name))?;
     }
 
     if report.classes.is_empty() {
@@ -124,16 +125,14 @@ pub fn run(input: &Path, opts: &DisasmOptions) -> Result<DisasmReport> {
             "aucune classe ne correspond à {:?} dans {} ({} classes lues) — le motif est \
              comparé au descripteur Dalvik, essaie `services/g` ou `Lcom/dy/`",
             opts.patterns,
-            input.display(),
+            input,
             report.scanned
         );
     }
     Ok(report)
 }
 
-fn collect_from_dex(path: &Path, opts: &DisasmOptions, out: &mut DisasmReport) -> Result<()> {
-    let dex = DexBin::open(path)?;
-
+fn collect_from_dex(dex: DexBin, opts: &DisasmOptions, out: &mut DisasmReport) -> Result<()> {
     for class in dex.classes() {
         let class = match class {
             Ok(c) => c,
@@ -409,56 +408,6 @@ pub fn escape(s: &str) -> String {
         .replace('\r', "\\r")
         .replace('\t', "\\t")
         .replace('"', "\\\"")
-}
-
-/// Résout l'entrée en DEX à lire. DEX brut → lui-même ; APK → ses
-/// `classes*.dex` extraits dans un tempdir. Reconnaissance au contenu.
-fn collect_dex_paths(input: &Path) -> Result<(Vec<PathBuf>, Option<tempfile::TempDir>)> {
-    let mut magic = [0u8; 8];
-    {
-        let mut f =
-            std::fs::File::open(input).with_context(|| format!("open {}", input.display()))?;
-        let n = f.read(&mut magic)?;
-        if n < 4 {
-            bail!("{} trop court pour être un DEX ou un APK", input.display());
-        }
-    }
-
-    if &magic[0..4] == b"dex\n" {
-        return Ok((vec![input.to_path_buf()], None));
-    }
-    if magic[0..4] == [0x50, 0x4b, 0x03, 0x04] {
-        let tmp = tempfile::tempdir().context("create tempdir")?;
-        let paths = extract_dexes(input, tmp.path())?;
-        if paths.is_empty() {
-            bail!("aucun classes*.dex dans l'APK {}", input.display());
-        }
-        return Ok((paths, Some(tmp)));
-    }
-    bail!(
-        "{} n'est ni un DEX (dex\\n) ni un APK (PK) — magic {:02x?}",
-        input.display(),
-        &magic[0..4]
-    )
-}
-
-fn extract_dexes(apk: &Path, out_dir: &Path) -> Result<Vec<PathBuf>> {
-    let file = std::fs::File::open(apk).with_context(|| format!("open {}", apk.display()))?;
-    let mut zip = zip::ZipArchive::new(file).context("read apk as zip")?;
-    let mut out = Vec::new();
-    for i in 0..zip.len() {
-        let mut entry = zip.by_index(i)?;
-        let name = entry.name().to_string();
-        if !(name.starts_with("classes") && name.ends_with(".dex")) {
-            continue;
-        }
-        let dest = out_dir.join(name.replace('/', "__"));
-        let mut buf = Vec::with_capacity(entry.size() as usize);
-        entry.read_to_end(&mut buf)?;
-        std::fs::write(&dest, &buf)?;
-        out.push(dest);
-    }
-    Ok(out)
 }
 
 /// Rendu texte, une instruction par ligne. Sortie conçue pour être passée à

@@ -37,10 +37,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek};
-use std::path::Path;
 
 use super::apkzip::TolerantZip;
 use super::native_arch::{parse_elf_header, Abi, Bits, ElfArch, Machine};
+use super::source::Source;
 
 /// Une bibliothèque native extraite (octets complets, en mémoire).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,12 +67,32 @@ pub struct ExtractedLib {
     /// potentiellement volumineux).
     #[serde(skip)]
     pub bytes: Vec<u8>,
+    /// Split XAPK porteur (`xapk::Split::id`) ; absent pour le base ou un APK.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<String>,
 }
 
 impl ExtractedLib {
     /// `true` si la lib est rangée hors `lib/<abi>/` (signal packer).
     pub fn out_of_lib(&self) -> bool {
         self.source != "lib"
+    }
+
+    /// `<split>!<entry>` pour une lib de split, `entry` sinon.
+    pub fn location(&self) -> String {
+        match &self.split {
+            Some(split) => format!("{split}!{}", self.entry),
+            None => self.entry.clone(),
+        }
+    }
+
+    /// Nom de fichier pour `--extract-libs` : chemin aplati, préfixé par le
+    /// split pour qu'une lib de split ne collisionne jamais avec celle du base.
+    pub fn output_name(&self) -> String {
+        match &self.split {
+            Some(split) => super::flat_output_name(&format!("{split}/{}", self.entry)),
+            None => super::flat_output_name(&self.entry),
+        }
     }
 }
 
@@ -90,6 +110,9 @@ pub struct NativeExtraction {
     /// Entrées en `.so` de longueur nulle : lues, vides, ni ELF ni illisibles.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub empty: Vec<String>,
+    /// Splits ABI d'un XAPK dont l'archive n'a pas pu être ouverte.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub split_errors: Vec<String>,
 }
 
 impl NativeExtraction {
@@ -130,14 +153,42 @@ pub fn extract_apk_bytes(apk: &[u8]) -> Result<NativeExtraction> {
     }
 }
 
-/// Extrait les `.so` natifs d'un APK sur disque. L'archive est lue, mais aucun
+/// Extrait les `.so` natifs d'un APK, puis des splits ABI d'un XAPK dont il est
+/// le base (`splits`, vide pour un APK simple). L'archive est lue, mais aucun
 /// `.so` n'est réécrit : les octets partent en RAM dans `ExtractedLib::bytes`.
+/// Un split illisible va dans `split_errors`, les autres sont extraits.
 ///
 /// Repli sur [`TolerantZip`] dès que le crate `zip` refuse l'archive à
 /// l'ouverture, une entrée à `by_index`, ou ses octets à `read_to_end`.
-pub fn extract_apk_file(path: &Path) -> Result<NativeExtraction> {
-    let file =
-        std::fs::File::open(path).with_context(|| format!("ouverture {}", path.display()))?;
+pub fn extract_apk_file(
+    src: impl Into<Source>,
+    splits: &[super::xapk::Split],
+) -> Result<NativeExtraction> {
+    let mut out = extract_file(&src.into())?;
+    for split in splits.iter().filter(|s| s.native) {
+        let id = split.id.as_str();
+        let found = match extract_file(&split.source) {
+            Ok(found) => found,
+            Err(e) => {
+                out.split_errors
+                    .push(format!("split {id} : illisible ({e:#})"));
+                continue;
+            }
+        };
+        let tag = |names: Vec<String>| names.into_iter().map(move |n| format!("{id}!{n}"));
+        out.libs.extend(found.libs.into_iter().map(|mut lib| {
+            lib.split = Some(id.to_string());
+            lib
+        }));
+        out.skipped_non_elf.extend(tag(found.skipped_non_elf));
+        out.unreadable.extend(tag(found.unreadable));
+        out.empty.extend(tag(found.empty));
+    }
+    Ok(out)
+}
+
+fn extract_file(src: &Source) -> Result<NativeExtraction> {
+    let file = src.reader().with_context(|| format!("ouverture {src}"))?;
     let nominal = zip::ZipArchive::new(file)
         .context("lecture APK (zip)")
         .and_then(|mut archive| extract_archive(&mut archive));
@@ -145,11 +196,11 @@ pub fn extract_apk_file(path: &Path) -> Result<NativeExtraction> {
         Ok(extraction) => Ok(extraction),
         Err(e) => {
             tracing::warn!(
-                apk = %path.display(),
+                apk = %src,
                 error = %e,
                 "extraction native en échec par le crate zip, repli sur le lecteur tolérant"
             );
-            Ok(extract_tolerant(&TolerantZip::open(path)?))
+            Ok(extract_tolerant(&src.tolerant()?))
         }
     }
 }
@@ -245,6 +296,7 @@ impl NativeExtraction {
             arch,
             sha256,
             bytes,
+            split: None,
         });
     }
 }
@@ -267,7 +319,15 @@ sha256           SHA-256 COMPLET (64 caractères hexadécimaux) du contenu DÉCO
 bytes            Octets complets du .so, en mémoire (jamais écrits sur disque, sauf
                  --extract-libs : nom = chemin aplati, / -> __ ; au-delà de 200 octets,
                  <préfixe>__<sha256 du chemin d'archive, 64 hex><.ext d'origine>, affiché
-                 après le chemin d'archive).
+                 après le chemin d'archive ; lib de split : chemin <split>/<entry>
+                 aplati de même).
+split            Lib lue dans un split ABI d'un XAPK : id du split (attribut split de
+                 son manifeste). Absent pour le base APK ou un APK simple. Les entrées
+                 de split listées dans skipped_non_elf, unreadable et empty
+                 s'écrivent <split>!<entry>.
+split_errors     Splits ABI dont l'archive n'a pu être ouverte par aucun lecteur :
+                 « split <id> : illisible (<raison>) ». Leurs .so manquent. Absent si
+                 vide.
 skipped_non_elf  Entrées en .so qui ne sont pas des ELF (ressources, .so chiffré non déballé…).
 unreadable       Entrées en .so illisibles, y compris par le lecteur ZIP tolérant (repli quand
                  le crate zip refuse l'archive ou une entrée : local header abîmé, drapeau de

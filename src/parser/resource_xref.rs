@@ -69,10 +69,10 @@ use super::arsc::{ResourceEntry, ResourceTable};
 use super::dex_facade::{DexBin, DexValue};
 use super::disasm::{resolve, Operand};
 use super::dyn_entrypoints::{dest_register, registers, writes_register};
-use anyhow::{Context, Result};
+use super::source::Source;
+use anyhow::Result;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 /// `const vAA, #+BBBBBBBB`.
 const OP_CONST: u8 = 0x14;
@@ -286,17 +286,18 @@ pub fn orphans<'a>(table: &'a ResourceTable, report: &XrefReport) -> Vec<&'a Res
 }
 
 /// Balaye les `classes*.dex` d'un APK et joint les constantes contre `table`.
-pub fn scan(apk: &Path, table: &ResourceTable) -> Result<XrefReport> {
-    let tmp = tempfile::tempdir().context("create tempdir")?;
-    let dex_files = crate::parser::extract_dex_files(apk, tmp.path())?;
+pub fn scan(apk: impl Into<Source>, table: &ResourceTable) -> Result<XrefReport> {
+    let dex_files = crate::parser::read_dex_files(&apk.into())?;
 
     let mut report = XrefReport::default();
     let mut rejected: HashSet<u32> = HashSet::new();
 
-    for path in &dex_files {
+    for dex in &dex_files {
         report.stats.dex_files += 1;
-        if let Err(e) = scan_dex(path, table, &mut report, &mut rejected) {
-            tracing::warn!(dex = %path.display(), error = %e, "DEX ignoré");
+        let scanned = DexBin::from_bytes(&dex.bytes, &dex.name)
+            .and_then(|bin| scan_dex(bin, table, &mut report, &mut rejected));
+        if let Err(e) = scanned {
+            tracing::warn!(dex = %dex.name, error = %e, "DEX ignoré");
         }
     }
 
@@ -316,13 +317,11 @@ pub fn scan(apk: &Path, table: &ResourceTable) -> Result<XrefReport> {
 }
 
 fn scan_dex(
-    path: &Path,
+    dex: DexBin,
     table: &ResourceTable,
     report: &mut XrefReport,
     rejected: &mut HashSet<u32>,
 ) -> Result<()> {
-    let dex = DexBin::open(path)?;
-
     // Passe 1 : valeur des champs statiques entiers, par (classe, nom). C'est
     // le seul moyen d'atteindre `encoded_static_values`, où vivent les
     // identifiants des APK non minifiés. Seconde passe de décodage sur tout le

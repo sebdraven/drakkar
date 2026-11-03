@@ -32,7 +32,8 @@
 //! visible dans les statistiques, jamais silencieux.
 
 use super::dex_facade::{Annotation, DexBin, DexValue};
-use anyhow::{Context, Result};
+use super::source::Source;
+use anyhow::Result;
 use serde::Serialize;
 use std::path::Path;
 
@@ -238,7 +239,10 @@ fn verb_of(a: &Annotation) -> Option<(String, Option<String>)> {
 
 /// Balaye un DEX et rend la surface déclarée.
 pub fn scan(path: &Path) -> Result<ApiSurfaceReport> {
-    let dex = DexBin::open(path)?;
+    scan_bin(DexBin::open(path)?)
+}
+
+fn scan_bin(dex: DexBin) -> Result<ApiSurfaceReport> {
     let mut report = ApiSurfaceReport {
         stats: ApiSurfaceStats {
             dex_files: 1,
@@ -388,31 +392,30 @@ pub fn scan(path: &Path) -> Result<ApiSurfaceReport> {
 }
 
 /// Variante APK : agrège sur tous les `classes*.dex`.
-pub fn scan_from_apk(apk: &Path) -> Result<ApiSurfaceReport> {
-    let tmp = tempfile::tempdir().context("create tempdir")?;
-    let dex_files = crate::parser::extract_dex_files(apk, tmp.path())?;
+pub fn scan_from_apk(apk: impl Into<Source>) -> Result<ApiSurfaceReport> {
+    let dex_files = crate::parser::read_dex_files(&apk.into())?;
 
     let mut merged = ApiSurfaceReport::default();
     for dex in &dex_files {
-        match scan(dex) {
+        match DexBin::from_bytes(&dex.bytes, &dex.name).and_then(scan_bin) {
             Ok(r) => merged.merge(r),
-            Err(e) => tracing::warn!(dex = %dex.display(), error = %e, "DEX ignoré"),
+            Err(e) => tracing::warn!(dex = %dex.name, error = %e, "DEX ignoré"),
         }
     }
     Ok(merged)
 }
 
 /// Accepte un APK ou un DEX brut, reconnu au CONTENU.
-pub fn scan_any(path: &Path) -> Result<ApiSurfaceReport> {
-    use super::dyn_entrypoints::{sniff, InputKind};
+pub fn scan_any(input: impl Into<Source>) -> Result<ApiSurfaceReport> {
+    use super::dyn_entrypoints::InputKind;
 
-    match sniff(path) {
-        Some(InputKind::Apk) => scan_from_apk(path),
-        Some(InputKind::Dex) => scan(path),
+    let src = input.into();
+    match src.sniff() {
+        Some(InputKind::Apk) => scan_from_apk(src),
+        Some(InputKind::Dex) => scan_bin(DexBin::read(&src)?),
         None => anyhow::bail!(
-            "{} n'est ni un APK (PK\\x03\\x04) ni un DEX (dex\\n) — reconnu au contenu, \
-             l'extension n'entre pas en compte",
-            path.display()
+            "{src} n'est ni un APK (PK\\x03\\x04) ni un DEX (dex\\n) — reconnu au contenu, \
+             l'extension n'entre pas en compte"
         ),
     }
 }

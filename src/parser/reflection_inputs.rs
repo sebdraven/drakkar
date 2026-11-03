@@ -46,6 +46,7 @@ use crate::parser::dyn_entrypoints::{
     dest_register, index_field_assignments, operand_index, registers, writes_register,
     FieldAssignments,
 };
+use crate::parser::source::Source;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
@@ -171,7 +172,7 @@ impl Sink {
 /// mais `CallResult` porte l'INDEX de l'invoke producteur — c'est ce qui permet
 /// d'aller regarder ses arguments.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Source {
+enum RegSource {
     /// `const-string` : le nom est en clair.
     ConstString,
     /// Autre littéral (`const-class`, `const/4`, tableau rempli par
@@ -246,7 +247,7 @@ fn index_const_fields(dex: &DexBin) -> ConstFields {
                 };
                 let is_const = matches!(
                     trace(&instructions[..i], src),
-                    Source::ConstString | Source::ConstOther
+                    RegSource::ConstString | RegSource::ConstOther
                 );
                 let entry = map.entry(field_id).or_insert(is_const);
                 *entry = *entry && is_const;
@@ -260,8 +261,10 @@ fn index_const_fields(dex: &DexBin) -> ConstFields {
 
 /// Scanne un DEX et classe chaque site de réflexion.
 pub fn extract(path: &Path) -> Result<ReflectionInputReport> {
-    let dex = DexBin::open(path)?;
+    extract_bin(DexBin::open(path)?)
+}
 
+fn extract_bin(dex: DexBin) -> Result<ReflectionInputReport> {
     let assign = index_field_assignments(&dex);
     let consts = index_const_fields(&dex);
     let fields = Fields {
@@ -361,7 +364,7 @@ fn classify_invoke(
         None => return Category::Indirect,
     };
     let producer = match trace(window, recv) {
-        Source::CallResult(k) => k,
+        RegSource::CallResult(k) => k,
         _ => return Category::Indirect,
     };
     match reflection_sink(dex, &window[producer]) {
@@ -382,21 +385,21 @@ fn classify_invoke(
 /// appel imbriqué, d'où `depth`) et le déchiffreur est rejouable localement.
 fn classify(
     window: &[dex_bytecode::Instruction],
-    source: Source,
+    source: RegSource,
     fields: &Fields,
     depth: usize,
 ) -> Category {
     match source {
-        Source::ConstString | Source::ConstOther => Category::Const,
-        Source::Param => Category::Param,
-        Source::Field(f) => {
+        RegSource::ConstString | RegSource::ConstOther => Category::Const,
+        RegSource::Param => Category::Param,
+        RegSource::Field(f) => {
             if fields.is_const(f) {
                 Category::Const
             } else {
                 Category::Runtime
             }
         }
-        Source::CallResult(k) => {
+        RegSource::CallResult(k) => {
             // Budget épuisé : on ne conclut pas au constant sans l'avoir vu.
             if depth == 0 {
                 return Category::Runtime;
@@ -415,14 +418,14 @@ fn classify(
                 Category::Runtime
             }
         }
-        Source::Unknown => Category::Unknown,
+        RegSource::Unknown => Category::Unknown,
     }
 }
 
 /// Remonte `target` dans `window` et CLASSE sa source. Même parcours que
 /// `dyn_entrypoints::backtrack_literal` : on traverse tout ce qui n'écrit pas
 /// (dont `check-cast`, omniprésent après un déchiffreur) et on suit `move-object`.
-fn trace(window: &[dex_bytecode::Instruction], target: u32) -> Source {
+fn trace(window: &[dex_bytecode::Instruction], target: u32) -> RegSource {
     let mut target = target;
 
     for (i, ins) in window.iter().enumerate().rev() {
@@ -444,9 +447,9 @@ fn trace(window: &[dex_bytecode::Instruction], target: u32) -> Source {
                     if window[p].mnemonic().starts_with("invoke-")
                         || window[p].mnemonic().starts_with("filled-new-array") =>
                 {
-                    Source::CallResult(p)
+                    RegSource::CallResult(p)
                 }
-                _ => Source::Unknown,
+                _ => RegSource::Unknown,
             };
         }
         if m.starts_with("move") {
@@ -456,36 +459,36 @@ fn trace(window: &[dex_bytecode::Instruction], target: u32) -> Source {
                     target = src;
                     continue;
                 }
-                None => return Source::Unknown,
+                None => return RegSource::Unknown,
             }
         }
         if m.starts_with("const-string") {
-            return Source::ConstString;
+            return RegSource::ConstString;
         }
         if m.starts_with("const") {
             // `const-class`, `const/4`, `const/16`, `const-wide`, `const/high16`…
-            return Source::ConstOther;
+            return RegSource::ConstOther;
         }
         if m.starts_with("new-array") {
             // Un tableau n'est constant que s'il est rempli par un bloc de
             // données littéral — motif des clés d'un déchiffreur.
             return if filled_with_data(&window[i + 1..], target) {
-                Source::ConstOther
+                RegSource::ConstOther
             } else {
-                Source::Unknown
+                RegSource::Unknown
             };
         }
         if m.starts_with("iget") || m.starts_with("sget") {
             return match operand_index(ins, "field@") {
-                Some(f) => Source::Field(f),
-                None => Source::Unknown,
+                Some(f) => RegSource::Field(f),
+                None => RegSource::Unknown,
             };
         }
-        return Source::Unknown;
+        return RegSource::Unknown;
     }
 
     // Aucune écriture dans toute la méthode : paramètre ou `this`.
-    Source::Param
+    RegSource::Param
 }
 
 /// Le tableau `array` est-il rempli par un `fill-array-data` en aval ?
@@ -530,13 +533,14 @@ fn reflection_sink(dex: &DexBin, ins: &dex_bytecode::Instruction) -> Option<Sink
 }
 
 /// Variante APK : agrège sur tous les `classes*.dex`.
-pub fn extract_from_apk(apk: &Path) -> Result<ReflectionInputReport> {
-    let tmp = tempfile::tempdir().context("create tempdir")?;
-    let dex_files = crate::parser::extract_dex_files(apk, tmp.path())?;
+pub fn extract_from_apk(apk: impl Into<Source>) -> Result<ReflectionInputReport> {
+    let dex_files = crate::parser::read_dex_files(&apk.into())?;
 
     let mut merged = ReflectionInputReport::default();
     for dex in &dex_files {
-        let r = extract(dex).with_context(|| format!("scan {}", dex.display()))?;
+        let r = DexBin::from_bytes(&dex.bytes, &dex.name)
+            .and_then(extract_bin)
+            .with_context(|| format!("scan {}", dex.name))?;
         merged.merge(r);
     }
     Ok(merged)
@@ -544,16 +548,16 @@ pub fn extract_from_apk(apk: &Path) -> Result<ReflectionInputReport> {
 
 /// Accepte un APK ou un DEX brut, reconnu au CONTENU — même routage que
 /// `dyn_entrypoints::extract_any`, pour rester utilisable sur les DEX déballés.
-pub fn extract_any(path: &Path) -> Result<ReflectionInputReport> {
-    use crate::parser::dyn_entrypoints::{sniff, InputKind};
+pub fn extract_any(input: impl Into<Source>) -> Result<ReflectionInputReport> {
+    use crate::parser::dyn_entrypoints::InputKind;
 
-    match sniff(path) {
-        Some(InputKind::Apk) => extract_from_apk(path),
-        Some(InputKind::Dex) => extract(path),
+    let src = input.into();
+    match src.sniff() {
+        Some(InputKind::Apk) => extract_from_apk(src),
+        Some(InputKind::Dex) => extract_bin(DexBin::read(&src)?),
         None => anyhow::bail!(
-            "{} n'est ni un APK (PK\\x03\\x04) ni un DEX (dex\\n) — reconnu au contenu, \
-             l'extension n'entre pas en compte",
-            path.display()
+            "{src} n'est ni un APK (PK\\x03\\x04) ni un DEX (dex\\n) — reconnu au contenu, \
+             l'extension n'entre pas en compte"
         ),
     }
 }

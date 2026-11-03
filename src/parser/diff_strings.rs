@@ -34,10 +34,10 @@
 
 use crate::parser::diff_explain::ColorMode;
 use crate::parser::disasm::normalize;
+use crate::parser::source::Source;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::HashSet;
-use std::path::Path;
 
 // ── Classement ───────────────────────────────────────────────────────────────
 
@@ -242,11 +242,16 @@ impl Default for StringDiffOptions {
 
 // ── Traitement ───────────────────────────────────────────────────────────────
 
-pub fn run(a: &Path, b: &Path, opts: &StringDiffOptions) -> Result<StringDiffReport> {
-    let pa = super::dex_strings::extract_any(a)
-        .with_context(|| format!("pool de chaînes de {}", a.display()))?;
-    let pb = super::dex_strings::extract_any(b)
-        .with_context(|| format!("pool de chaînes de {}", b.display()))?;
+pub fn run(
+    a: impl Into<Source>,
+    b: impl Into<Source>,
+    opts: &StringDiffOptions,
+) -> Result<StringDiffReport> {
+    let (a, b) = (a.into(), b.into());
+    let pa =
+        super::dex_strings::extract_any(&a).with_context(|| format!("pool de chaînes de {a}"))?;
+    let pb =
+        super::dex_strings::extract_any(&b).with_context(|| format!("pool de chaînes de {b}"))?;
 
     let sa: HashSet<String> = pa
         .strings
@@ -281,8 +286,8 @@ pub fn run(a: &Path, b: &Path, opts: &StringDiffOptions) -> Result<StringDiffRep
     kinds.sort_by_key(|(k, _)| *k);
 
     Ok(StringDiffReport {
-        input_a: a.display().to_string(),
-        input_b: b.display().to_string(),
+        input_a: a.to_string(),
+        input_b: b.to_string(),
         distinct_a: sa.len(),
         distinct_b: sb.len(),
         declared_a: pa.declared,
