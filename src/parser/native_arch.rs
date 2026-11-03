@@ -20,7 +20,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek};
-use std::path::Path;
+
+use super::source::Source;
 
 /// Nombre d'octets d'en-tête lus par `.so` (suffit pour EI_CLASS/EI_DATA/e_machine).
 const ELF_HEADER_PROBE: usize = 64;
@@ -195,6 +196,19 @@ pub struct NativeLib {
     /// `true` si la machine/bits de l'ELF ne correspond pas au répertoire ABI
     /// (lib mal rangée / APK repackagé — signal CTI).
     pub abi_mismatch: bool,
+    /// Split XAPK porteur (`xapk::Split::id`) ; absent pour le base ou un APK.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<String>,
+}
+
+impl NativeLib {
+    /// `<split>!<entry>` pour une lib de split, `entry` sinon.
+    pub fn location(&self) -> String {
+        match &self.split {
+            Some(split) => format!("{split}!{}", self.entry),
+            None => self.entry.clone(),
+        }
+    }
 }
 
 /// Classe une entrée d'archive :
@@ -233,6 +247,7 @@ pub fn classify(entry: &str, header: &[u8]) -> Option<std::result::Result<Native
         endian: arch.endian,
         machine: arch.machine,
         abi_mismatch,
+        split: None,
     }))
 }
 
@@ -281,7 +296,7 @@ impl NativeArchSummary {
             if l.abi_mismatch {
                 anomalies.push(format!(
                     "{}: ELF {} {} rangé dans lib/{}/ (attendu {})",
-                    l.entry,
+                    l.location(),
                     l.machine.label(),
                     bits_label(l.bits),
                     l.declared_abi.label(),
@@ -329,35 +344,61 @@ fn calling_convention(machine: Machine, bits: Bits) -> String {
     }
 }
 
+/// Libs classées et anomalies d'une archive, avant agrégation.
+type Scan = (Vec<NativeLib>, Vec<String>);
+
 /// Scanne un APK déjà chargé en mémoire (octets de l'archive zip).
 pub fn scan_apk_bytes(apk: &[u8]) -> Result<NativeArchSummary> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(apk))
         .context("lecture APK (zip) depuis la mémoire")?;
-    scan_archive(&mut archive)
+    let (libs, anomalies) = scan_archive(&mut archive)?;
+    Ok(NativeArchSummary::build(libs, anomalies))
 }
 
-/// Scanne un APK sur disque. Ne lit que les en-têtes ELF — l'APK n'est pas
-/// chargé en entier, aucun `.so` n'est extrait.
+/// Scanne un APK, puis les splits ABI d'un XAPK dont il est le base (`splits`,
+/// vide pour un APK simple). Ne lit que les en-têtes ELF — l'APK n'est pas
+/// chargé en entier, aucun `.so` n'est extrait. Un split illisible devient une
+/// anomalie.
 ///
 /// Repli sur le lecteur tolérant si le crate `zip` refuse l'archive ou l'une de
 /// ses entrées : sur un APK trafiqué, une seule entrée chiffrée en apparence
 /// faisait échouer tout le scan.
-pub fn scan_apk_file(path: &Path) -> Result<NativeArchSummary> {
-    let file =
-        std::fs::File::open(path).with_context(|| format!("ouverture {}", path.display()))?;
+pub fn scan_apk_file(
+    src: impl Into<Source>,
+    splits: &[super::xapk::Split],
+) -> Result<NativeArchSummary> {
+    let (mut libs, mut anomalies) = scan_file(&src.into())?;
+    for split in splits.iter().filter(|s| s.native) {
+        let id = &split.id;
+        match scan_file(&split.source) {
+            Ok((found, notes)) => {
+                libs.extend(found.into_iter().map(|mut lib| {
+                    lib.split = Some(id.clone());
+                    lib
+                }));
+                anomalies.extend(notes.into_iter().map(|a| format!("{id}!{a}")));
+            }
+            Err(e) => anomalies.push(format!("split {id} : illisible ({e:#})")),
+        }
+    }
+    Ok(NativeArchSummary::build(libs, anomalies))
+}
+
+fn scan_file(src: &Source) -> Result<Scan> {
+    let file = src.reader().with_context(|| format!("ouverture {src}"))?;
     let nominal = zip::ZipArchive::new(file)
         .context("lecture APK (zip)")
         .and_then(|mut archive| scan_archive(&mut archive));
 
     match nominal {
-        Ok(summary) => Ok(summary),
+        Ok(scan) => Ok(scan),
         Err(e) => {
             tracing::warn!(
-                apk = %path.display(),
+                apk = %src,
                 error = %e,
                 "scan natif en échec par le crate zip, repli sur le lecteur tolérant"
             );
-            scan_apk_tolerant(path)
+            scan_apk_tolerant(src)
         }
     }
 }
@@ -365,8 +406,8 @@ pub fn scan_apk_file(path: &Path) -> Result<NativeArchSummary> {
 /// Repli via le lecteur ZIP tolérant. Une entrée illisible devient une anomalie
 /// au lieu de faire échouer le scan entier — un `.so` perdu vaut mieux qu'un
 /// échantillon perdu.
-fn scan_apk_tolerant(path: &Path) -> Result<NativeArchSummary> {
-    let zip = super::apkzip::TolerantZip::open(path)?;
+fn scan_apk_tolerant(src: &Source) -> Result<Scan> {
+    let zip = src.tolerant()?;
     let mut libs = Vec::new();
     let mut anomalies = Vec::new();
 
@@ -390,10 +431,10 @@ fn scan_apk_tolerant(path: &Path) -> Result<NativeArchSummary> {
         }
     }
 
-    Ok(NativeArchSummary::build(libs, anomalies))
+    Ok((libs, anomalies))
 }
 
-fn scan_archive<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<NativeArchSummary> {
+fn scan_archive<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<Scan> {
     let mut libs = Vec::new();
     let mut anomalies = Vec::new();
 
@@ -414,7 +455,7 @@ fn scan_archive<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<Nati
         }
     }
 
-    Ok(NativeArchSummary::build(libs, anomalies))
+    Ok((libs, anomalies))
 }
 
 /// Lit au plus `buf.len()` octets ; tolère les lectures courtes du décompresseur.
@@ -442,6 +483,10 @@ Abi          Répertoire NDK lib/<abi>/ : armeabi-v7a, arm64-v8a, x86, x86_64, �
 abi_mismatch La machine/bits de l'ELF ne colle pas au répertoire ABI (lib mal
              rangée ou APK repackagé — signal CTI).
 is_fat       L'APK embarque à la fois du 32 et du 64 bits.
+split        Lib lue dans un split ABI d'un XAPK : id du split (attribut split de
+             son manifeste). Absent pour le base APK ou un APK simple. Les
+             anomalies d'une lib de split sont préfixées <split>!<entry> ; un
+             split illisible donne « split <id> : illisible (<raison>) ».
 calling_conventions
              Convention d'appel native à poser côté SE (registres d'arguments,
              position de JNIEnv*/this, largeur de jlong, Thumb éventuel) — un

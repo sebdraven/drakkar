@@ -3,18 +3,19 @@
 //! -> ApkFeatures.
 use crate::model::{ApkFeatures, ServiceDecl};
 use crate::parser::axml::{self, Element};
+use crate::parser::source::Source;
 use anyhow::{Context, Result};
 use std::io::Read;
-use std::path::Path;
 
 const MANIFEST: &str = "AndroidManifest.xml";
 
 /// Une archive sans `AndroidManifest.xml` (JAR, APK amputé) laisse les features
 /// du manifest vides : les règles tournent quand même, sans entrypoint validé.
-pub fn extract(apk_path: &Path, features: &mut ApkFeatures) -> Result<()> {
-    let Some(raw) = read_manifest_bytes(apk_path)? else {
+pub fn extract(src: impl Into<Source>, features: &mut ApkFeatures) -> Result<()> {
+    let src = src.into();
+    let Some(raw) = read_manifest_bytes(&src)? else {
         tracing::warn!(
-            apk = %apk_path.display(),
+            apk = %src,
             "AndroidManifest.xml absent de l'archive — manifest features vides"
         );
         return Ok(());
@@ -23,7 +24,7 @@ pub fn extract(apk_path: &Path, features: &mut ApkFeatures) -> Result<()> {
         Ok(decoded) => decoded.root,
         Err(e) => {
             tracing::warn!(
-                apk = %apk_path.display(),
+                apk = %src,
                 error = %e,
                 "AXML illisible, y compris par le décodeur tolérant — manifest features vides"
             );
@@ -49,9 +50,8 @@ pub fn extract(apk_path: &Path, features: &mut ApkFeatures) -> Result<()> {
 /// à l'ouverture de l'archive. Sur les APK trafiqués, l'ouverture passe et c'est
 /// `by_name` ou `read_to_end` qui échoue. `None` : le central directory, lu par
 /// le lecteur tolérant, ne porte aucune entrée de ce nom.
-fn read_manifest_bytes(apk_path: &Path) -> Result<Option<Vec<u8>>> {
-    let file =
-        std::fs::File::open(apk_path).with_context(|| format!("open {}", apk_path.display()))?;
+pub(crate) fn read_manifest_bytes(src: &Source) -> Result<Option<Vec<u8>>> {
+    let file = src.reader().with_context(|| format!("open {src}"))?;
 
     let nominal = (|| -> Result<Vec<u8>> {
         let mut zip = zip::ZipArchive::new(file).context("read apk as zip")?;
@@ -67,11 +67,11 @@ fn read_manifest_bytes(apk_path: &Path) -> Result<Option<Vec<u8>>> {
         Ok(buf) => Ok(Some(buf)),
         Err(e) => {
             tracing::warn!(
-                apk = %apk_path.display(),
+                apk = %src,
                 error = %e,
                 "manifest illisible par le crate zip, repli sur le lecteur tolérant"
             );
-            let zip = super::apkzip::TolerantZip::open(apk_path)?;
+            let zip = src.tolerant()?;
             if !zip.entries().iter().any(|entry| entry.name == MANIFEST) {
                 return Ok(None);
             }

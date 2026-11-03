@@ -128,7 +128,8 @@ pub fn run(input_dir: &Path, engine: &Engine, opts: &BulkOptions) -> Result<()> 
         // peuvent paniquer sur un DEX/manifest malformé — courant sur des samples
         // sideloadés. On isole le panic pour qu'un APK pourri ne tue pas le batch.
         let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<usize> {
-            let parsed = parser::parse_apk(apk)?;
+            let input = parser::xapk::resolve(apk)?;
+            let parsed = parser::parse_apk(input.source(), input.splits())?;
             let matches = engine.run(&parsed.features, &parsed.call_graph);
             let json = serde_json::to_string_pretty(&matches)?;
             std::fs::write(&out_path, json)?;
@@ -162,7 +163,9 @@ pub fn run(input_dir: &Path, engine: &Engine, opts: &BulkOptions) -> Result<()> 
 
 /// Ce qu'a donné la collecte d'un répertoire.
 pub struct Collected {
-    /// APK confirmés, triés.
+    /// APK confirmés, triés. Les XAPK y figurent sous leur propre chemin : la
+    /// résolution vers le base en mémoire se fait dans chaque worker
+    /// (`parser::xapk::resolve`).
     pub apks: Vec<PathBuf>,
     /// Fichiers à signature ZIP dont aucun lecteur n'a tiré d'AndroidManifest.xml.
     /// Ils sont comptés en échec plutôt qu'écartés en silence : sur un corpus
@@ -241,7 +244,9 @@ enum Recognition {
 ///  1. signature zip `PK\x03\x04` sur les 4 premiers octets — élimine d'emblée
 ///     les DEX, ELF, images et autres résidus qui traînent dans un corpus ;
 ///  2. présence d'une entrée `AndroidManifest.xml` — ce qui distingue un APK
-///     d'un JAR, d'un ZIP quelconque ou d'un document Office ;
+///     d'un JAR, d'un ZIP quelconque ou d'un document Office — ou XAPK : pas de
+///     manifeste à la racine, mais un `*.apk` racine qui en porte un (cf.
+///     `parser::xapk`) ;
 ///  3. si le crate `zip` refuse l'archive, même recherche via le lecteur
 ///     tolérant : les archives trafiquées sont précisément celles qu'il sait
 ///     lire, et les rejeter ici priverait `extract_apk` de son repli.
@@ -262,7 +267,9 @@ fn recognize(p: &Path) -> Recognition {
     // Lecture du central directory uniquement : le contenu n'est pas décompressé.
     let nominal = match zip::ZipArchive::new(f) {
         Ok(mut zip) => {
-            if zip.by_name("AndroidManifest.xml").is_ok() {
+            let has_manifest = zip.by_name("AndroidManifest.xml").is_ok();
+            let container = parser::xapk::looks_like_container(zip.file_names());
+            if has_manifest || (container && parser::xapk::is_xapk(p)) {
                 return Recognition::Apk;
             }
             "pas d'AndroidManifest.xml".to_string()
@@ -272,11 +279,9 @@ fn recognize(p: &Path) -> Recognition {
 
     match parser::apkzip::TolerantZip::open(p) {
         Ok(zip) => {
-            if zip
-                .entries()
-                .iter()
-                .any(|e| e.name == "AndroidManifest.xml")
-            {
+            let names = || zip.entries().iter().map(|e| e.name.as_str());
+            let xapk = parser::xapk::looks_like_container(names()) && parser::xapk::is_xapk(p);
+            if names().any(|n| n == "AndroidManifest.xml") || xapk {
                 Recognition::Apk
             } else {
                 Recognition::ZipWithoutManifest(format!(
@@ -353,9 +358,11 @@ pub fn run_inventory(input_dir: &Path, what: Inventory, opts: &BulkOptions) -> R
         // d'`axmldecoder`, mais les autres inventaires n'ont pas leur propre
         // filet.
         let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<String> {
+            // XAPK -> base APK ; `stem` reste celui du fichier collecté.
+            let input = parser::xapk::resolve(apk)?;
             match what {
                 Inventory::Manifest => {
-                    let r = parser::manifest_info::extract(apk)?;
+                    let r = input.manifest_report()?;
                     let summary = format!(
                         "{} — {} composants, {} points d'entrée",
                         r.package,
@@ -370,7 +377,7 @@ pub fn run_inventory(input_dir: &Path, what: Inventory, opts: &BulkOptions) -> R
                     Ok(summary)
                 }
                 Inventory::Cert => {
-                    let r = parser::cert::extract(apk)?;
+                    let r = input.cert_report()?;
                     let sha = r
                         .certificates
                         .first()
@@ -385,7 +392,7 @@ pub fn run_inventory(input_dir: &Path, what: Inventory, opts: &BulkOptions) -> R
                     Ok(summary)
                 }
                 Inventory::Dating => {
-                    let r = parser::dating::extract(apk)?;
+                    let r = input.dating_report()?;
                     let summary = format!(
                         "target={} compile={} écart={} archive={}",
                         opt_u32(r.sdk.target_sdk),
@@ -504,16 +511,23 @@ fn cert_csv(rows: Vec<(String, parser::cert::SigningReport)>) -> String {
     let mut out = String::from(
         "sample,schemes,cert_sha256,subject_cn,subject_o,issuer_cn,self_signed,\
 not_before,not_after,validity_years,signature_algorithm,key_algorithm,\
-key_bits,public_key_sha256,anomalies\n",
+key_bits,public_key_sha256,anomalies,splits_same_signer",
     );
+    out.push_str(CONTAINER_HEADER);
+    out.push('\n');
 
     for (stem, report) in &rows {
         let schemes = report.schemes.labels().join("+");
         let anomalies = report.anomalies.len();
+        let same = report
+            .splits_same_signer
+            .map(|b| b.to_string())
+            .unwrap_or_default();
+        let container = container_columns(report.container.as_ref());
 
         if report.certificates.is_empty() {
             out.push_str(&format!(
-                "{},{},,,,,,,,,,,,,{anomalies}\n",
+                "{},{},,,,,,,,,,,,,{anomalies},{same}{container}\n",
                 csv_field(stem),
                 csv_field(&schemes)
             ));
@@ -522,7 +536,7 @@ key_bits,public_key_sha256,anomalies\n",
 
         for c in &report.certificates {
             out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{:.2},{},{},{},{},{anomalies}\n",
+                "{},{},{},{},{},{},{},{},{},{:.2},{},{},{},{},{anomalies},{same}{container}\n",
                 csv_field(stem),
                 csv_field(&schemes),
                 csv_field(&c.fingerprints.sha256),
@@ -556,8 +570,10 @@ fn manifest_csv(rows: Vec<(String, parser::manifest_info::ManifestReport)>) -> S
     let mut out = String::from(
         "sample,package,version_name,version_code,min_sdk,target_sdk,\
 permissions,components,activities,services,receivers,providers,\
-entrypoints,triggers,application_class,anomalies\n",
+entrypoints,triggers,application_class,anomalies",
     );
+    out.push_str(CONTAINER_HEADER);
+    out.push('\n');
 
     for (stem, r) in &rows {
         // Types de déclencheurs distincts, dans l'ordre de première apparition.
@@ -570,7 +586,7 @@ entrypoints,triggers,application_class,anomalies\n",
         }
 
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}{}\n",
             csv_field(stem),
             csv_field(&r.package),
             csv_field(r.version_name.as_deref().unwrap_or_default()),
@@ -587,6 +603,7 @@ entrypoints,triggers,application_class,anomalies\n",
             csv_field(&triggers.join("|")),
             csv_field(r.application.name.as_deref().unwrap_or_default()),
             r.anomalies.len(),
+            container_columns(r.container.as_ref()),
         ));
     }
     out
@@ -619,7 +636,7 @@ dex_count,dex_versions,toolchain_floor_api,\
 archive_entries,archive_dated,archive_earliest,archive_latest,archive_distinct,\
 archive_normalized,archive_sentinel,\
 code_date_min,code_date_max,code_date_count,\
-lib_count,{lib_headers},build_metadata\n"
+lib_count,{lib_headers},build_metadata{CONTAINER_HEADER}\n"
     );
 
     for (stem, r) in &rows {
@@ -654,7 +671,7 @@ lib_count,{lib_headers},build_metadata\n"
             .join("|");
 
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}{}\n",
             csv_field(stem),
             csv_field(&r.file_sha256),
             csv_field(&r.package),
@@ -706,9 +723,27 @@ lib_count,{lib_headers},build_metadata\n"
             r.library_versions.len(),
             libs,
             csv_field(&metadata),
+            container_columns(r.container.as_ref()),
         ));
     }
     out
+}
+
+/// Colonnes de traçabilité XAPK, en fin de ligne de chaque CSV d'inventaire.
+/// `base_sha256` est celui du fichier analysé ; tout est vide pour un APK simple.
+const CONTAINER_HEADER: &str = ",container_kind,container_sha256,base_sha256";
+
+/// Valeurs de [`CONTAINER_HEADER`], virgule de tête comprise. Hashes complets.
+fn container_columns(c: Option<&parser::xapk::ContainerInfo>) -> String {
+    match c {
+        Some(c) => format!(
+            ",{},{},{}",
+            c.kind.as_str(),
+            csv_field(&c.sha256),
+            csv_field(&c.base_sha256)
+        ),
+        None => ",,,".to_string(),
+    }
 }
 
 /// Échappe un champ CSV (RFC 4180) : guillemets doublés, encadrement si le champ
@@ -761,12 +796,16 @@ pub struct OrphanRoots {
 /// Construit les racines de l'audit pour un APK **ou** un DEX brut — source de
 /// vérité unique pour le mode single et le mode bulk.
 ///
-/// `path` sert aux passes qui relisent le binaire (dyn, ui) ; elles routent
+/// `src` sert aux passes qui relisent le binaire (dyn, ui) ; elles routent
 /// elles-mêmes sur le contenu via `extract_any`. Le régime est déduit de la
 /// présence de composants dans `parsed.features` : un DEX brut n'a pas de
 /// manifeste, donc pas de composant, donc pas de racine à l'étage 1 — d'où le
 /// repli heuristique.
-pub fn build_orphan_roots(path: &Path, parsed: &parser::ParsedApk) -> Result<OrphanRoots> {
+pub fn build_orphan_roots(
+    src: impl Into<parser::source::Source>,
+    parsed: &parser::ParsedApk,
+) -> Result<OrphanRoots> {
+    let src = src.into();
     let cg = &parsed.call_graph;
 
     // Étage 1 : composants du manifeste, ou repli heuristique.
@@ -782,14 +821,14 @@ pub fn build_orphan_roots(path: &Path, parsed: &parser::ParsedApk) -> Result<Orp
     // Étage 2 : + classes atteintes dynamiquement (registerReceiver, Intent…).
     // Sous le régime heuristique l'étage est neutre par construction (les nœuds
     // qu'il désignerait sont déjà tous racines) : la colonne le montrera.
-    let dyn_classes = parser::dyn_entrypoints::extract_any(path)?.classes();
+    let dyn_classes = parser::dyn_entrypoints::extract_any(&src)?.classes();
     let mut with_dyn = base.clone();
     with_dyn.extend(cg.entrypoints(&dyn_classes));
     with_dyn.sort();
     with_dyn.dedup();
 
     // Étage 3 : + handlers UI (onClick & cie) résolus en nœuds.
-    let ui_roots = parser::ui_callbacks::extract_any(path)?.roots();
+    let ui_roots = parser::ui_callbacks::extract_any(&src)?.roots();
     let mut with_ui = with_dyn.clone();
     with_ui.extend(cg.nodes_for(&ui_roots));
     with_ui.sort();
@@ -914,9 +953,10 @@ pub fn orphan_audit_sample(apk: &Path) -> Result<OrphanSample> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".into());
 
-    let parsed = parser::parse_any(apk)?;
+    let input = parser::xapk::resolve(apk)?;
+    let parsed = parser::parse_any(input.source(), input.splits())?;
     let cg = &parsed.call_graph;
-    let roots = build_orphan_roots(apk, &parsed)?;
+    let roots = build_orphan_roots(input.source(), &parsed)?;
     let OrphanRoots {
         mode,
         base,

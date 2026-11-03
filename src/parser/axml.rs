@@ -660,7 +660,7 @@ fn u32_at(d: &[u8], off: usize) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn u16b(v: u16) -> [u8; 2] {
@@ -782,6 +782,25 @@ mod tests {
         d.extend_from_slice(&u32b((CHUNK_HEADER + body.len()) as u32));
         d.extend_from_slice(&body);
         d
+    }
+
+    /// `<manifest>` binaire minimal portant `attrs`, attributs sans espace de
+    /// noms et valeurs chaînes. Sert aussi aux tests de `xapk`.
+    pub(crate) fn manifest_doc(attrs: &[(&str, &str)]) -> Vec<u8> {
+        let mut strings = vec!["manifest"];
+        let mut refs = Vec::new();
+        for (name, value) in attrs {
+            let at = strings.len() as u32;
+            refs.push((u32::MAX, at, at + 1));
+            strings.push(*name);
+            strings.push(*value);
+        }
+        document(&[
+            string_pool(&strings, None, None),
+            resource_map(&[0]),
+            start(0, &refs),
+            end(0),
+        ])
     }
 
     const STRINGS: &[&str] = &["manifest", "package", "com.example.app"];

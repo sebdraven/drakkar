@@ -19,8 +19,19 @@ pub struct CallEdge {
 /// Parse le DEX et construit la liste des call edges inter-procéduraux.
 /// Peuple aussi `features.methods` et `features.strings`.
 pub fn extract(path: &Path, features: &mut ApkFeatures) -> Result<Vec<CallEdge>> {
-    let dex = DexBin::open(path)?;
+    edges_of(DexBin::open(path)?, features)
+}
 
+/// Même chose sur un DEX déjà en mémoire ; `label` le nomme dans les erreurs.
+pub fn extract_bytes(
+    bytes: &[u8],
+    label: &str,
+    features: &mut ApkFeatures,
+) -> Result<Vec<CallEdge>> {
+    edges_of(DexBin::from_bytes(bytes, label)?, features)
+}
+
+fn edges_of(dex: DexBin, features: &mut ApkFeatures) -> Result<Vec<CallEdge>> {
     // Strings globales du DEX -> features (utile pour les règles `string:`).
     for s in dex.strings() {
         features.strings.push(s.to_string());

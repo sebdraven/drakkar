@@ -48,6 +48,7 @@
 
 use crate::model::MethodRef;
 use crate::parser::dex_facade::DexBin;
+use crate::parser::source::Source;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
@@ -321,8 +322,10 @@ pub(crate) fn backtrack_new_instance(
 
 /// Scanne le DEX et renvoie les points d'entrée dynamiques.
 pub fn extract(path: &Path) -> Result<DynEntrypointReport> {
-    let dex = DexBin::open(path)?;
+    extract_bin(DexBin::open(path)?)
+}
 
+fn extract_bin(dex: DexBin) -> Result<DynEntrypointReport> {
     let mut report = DynEntrypointReport::default();
 
     // Passe 1 : classe concrète assignée à chaque champ.
@@ -795,18 +798,18 @@ fn to_descriptor(dotted: &str) -> String {
     format!("L{};", dotted.replace('.', "/"))
 }
 
-/// Variante prenant un APK : dézippe les `classes*.dex` dans un tempdir et
-/// agrège le rapport sur l'ensemble des DEX. Passe par
-/// `parser::extract_dex_files` pour hériter du repli `TolerantZip` sur les
-/// archives trafiquées.
-pub fn extract_from_apk(apk: &Path) -> Result<DynEntrypointReport> {
-    let tmp = tempfile::tempdir().context("create tempdir")?;
-    let dex_files = crate::parser::extract_dex_files(apk, tmp.path())?;
+/// Variante prenant un APK : lit les `classes*.dex` en mémoire et agrège le
+/// rapport sur l'ensemble des DEX. Passe par `parser::read_dex_files` pour
+/// hériter du repli `TolerantZip` sur les archives trafiquées.
+pub fn extract_from_apk(apk: impl Into<Source>) -> Result<DynEntrypointReport> {
+    let dex_files = crate::parser::read_dex_files(&apk.into())?;
 
     let mut merged = DynEntrypointReport::default();
 
     for dex in &dex_files {
-        let r = extract(dex).with_context(|| format!("scan {}", dex.display()))?;
+        let r = DexBin::from_bytes(&dex.bytes, &dex.name)
+            .and_then(extract_bin)
+            .with_context(|| format!("scan {}", dex.name))?;
         merged.entrypoints.extend(r.entrypoints);
         merged.unresolved.extend(r.unresolved);
     }
@@ -847,14 +850,14 @@ pub fn sniff(path: &Path) -> Option<InputKind> {
 /// Jiagu ou SecNeo, l'archive ne contient pas le vrai DEX, mais celui-ci existe
 /// une fois déballé (`classes_unpacked.dex`, dumps mémoire Frida). Il suffit de
 /// le passer directement.
-pub fn extract_any(path: &Path) -> Result<DynEntrypointReport> {
-    match sniff(path) {
-        Some(InputKind::Apk) => extract_from_apk(path),
-        Some(InputKind::Dex) => extract(path),
+pub fn extract_any(input: impl Into<Source>) -> Result<DynEntrypointReport> {
+    let src = input.into();
+    match src.sniff() {
+        Some(InputKind::Apk) => extract_from_apk(src),
+        Some(InputKind::Dex) => extract_bin(DexBin::read(&src)?),
         None => anyhow::bail!(
-            "{} n'est ni un APK (PK\\x03\\x04) ni un DEX (dex\\n) — reconnu au contenu, \
-             l'extension n'entre pas en compte",
-            path.display()
+            "{src} n'est ni un APK (PK\\x03\\x04) ni un DEX (dex\\n) — reconnu au contenu, \
+             l'extension n'entre pas en compte"
         ),
     }
 }

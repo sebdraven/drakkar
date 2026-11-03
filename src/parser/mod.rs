@@ -38,7 +38,9 @@ pub mod native_extract;
 pub mod native_static;
 pub mod reflection_inputs;
 pub mod resource_xref;
+pub mod source;
 pub mod ui_callbacks;
+pub mod xapk;
 
 use crate::cfg::CallGraph;
 use crate::model::ApkFeatures;
@@ -89,23 +91,38 @@ pub struct ParsedApk {
 }
 
 /// Point d'entrée : parse un APK et construit features + CFG inter-proc.
-pub fn parse_apk(path: &Path) -> Result<ParsedApk> {
-    tracing::info!(apk = %path.display(), "parsing APK");
+/// `splits` : splits d'un XAPK dont `src` est le base (cf. `xapk::Input`),
+/// scannés par `native_arch` ; vide pour un APK simple.
+///
+/// Un APK sur disque passe par un tempdir pour ses `.dex` et `.so` ; une source
+/// en mémoire est lue sans rien écrire. Ses `.so` ne sont pas lus : ils ne
+/// servent qu'à `elf::extract`, qui exige un chemin.
+pub fn parse_apk(src: impl Into<source::Source>, splits: &[xapk::Split]) -> Result<ParsedApk> {
+    let src = src.into();
+    tracing::info!(apk = %src, "parsing APK");
 
     let mut features = ApkFeatures::default();
     let mut call_graph = CallGraph::new();
 
-    // Tempdir pour matérialiser les .dex et .so extraits de l'archive.
-    let tmp = tempfile::tempdir().context("create tempdir")?;
-    let entries = extract_apk(path, tmp.path(), Want::DexAndSo)?;
+    let (tmp, want) = match &src {
+        source::Source::Path(_) => (
+            Some(tempfile::tempdir().context("create tempdir")?),
+            Want::DexAndSo,
+        ),
+        source::Source::Bytes { .. } => (None, Want::DexOnly),
+    };
+    let entries = extract_apk(&src, tmp.as_ref().map(|t| t.path()), want)?;
 
     // Manifest (axml) — opère directement sur l'APK.
-    manifest::extract(path, &mut features)?;
+    manifest::extract(&src, &mut features)?;
 
     // DEX : chaque classes*.dex -> edges inter-proc accumulés dans le même graphe.
-    for dex_path in &entries.dex_files {
-        let edges = dex::extract(dex_path, &mut features)
-            .with_context(|| format!("parse {}", dex_path.display()))?;
+    for item in &entries.dex_files {
+        let edges = match item {
+            Extracted::File(path) => dex::extract(path, &mut features),
+            Extracted::Mem(blob) => dex::extract_bytes(&blob.bytes, &blob.name, &mut features),
+        };
+        let edges = edges.with_context(|| format!("parse {}", item.label()))?;
         for e in edges {
             call_graph.add_call(e.caller, e.callee, e.site);
         }
@@ -116,15 +133,17 @@ pub fn parse_apk(path: &Path) -> Result<ParsedApk> {
     call_graph.set_supers(features.superclasses.clone());
 
     // ELF natifs : symboles des .so.
-    for so_path in &entries.so_files {
-        elf::extract(so_path, &mut features)
-            .with_context(|| format!("parse {}", so_path.display()))?;
+    for item in &entries.so_files {
+        if let Extracted::File(so_path) = item {
+            elf::extract(so_path, &mut features)
+                .with_context(|| format!("parse {}", so_path.display()))?;
+        }
     }
 
     // Architecture native (pur en-tête ELF, en mémoire — indépendant de LIEF).
     // Conditionne la convention d'appel côté SE (Kharon) : arm=AArch32/Thumb,
     // arm64=AAPCS64. Deuxième passe zip header-only, coût négligeable.
-    features.native_arch = native_arch::scan_apk_file(path).context("scan arch native")?;
+    features.native_arch = native_arch::scan_apk_file(&src, splits).context("scan arch native")?;
     tracing::info!(
         abis = ?features.native_arch.abis,
         fat = features.native_arch.is_fat,
@@ -144,14 +163,16 @@ pub fn parse_apk(path: &Path) -> Result<ParsedApk> {
 /// Conséquence pour l'appelant : `features.components` reste vide, donc
 /// `CallGraph::entrypoints` ne rendrait rien. Les racines viennent alors de
 /// `CallGraph::heuristic_entrypoints` (cf. `bulk::build_orphan_roots`).
-pub fn parse_dex(path: &Path) -> Result<ParsedApk> {
-    tracing::info!(dex = %path.display(), "parsing DEX brut");
+pub fn parse_dex(src: impl Into<source::Source>) -> Result<ParsedApk> {
+    let src = src.into();
+    tracing::info!(dex = %src, "parsing DEX brut");
 
     let mut features = ApkFeatures::default();
     let mut call_graph = CallGraph::new();
 
-    let edges =
-        dex::extract(path, &mut features).with_context(|| format!("parse {}", path.display()))?;
+    let label = src.to_string();
+    let edges = dex::extract_bytes(&src.read_all()?, &label, &mut features)
+        .with_context(|| format!("parse {label}"))?;
     for e in edges {
         call_graph.add_call(e.caller, e.callee, e.site);
     }
@@ -164,27 +185,90 @@ pub fn parse_dex(path: &Path) -> Result<ParsedApk> {
 }
 
 /// Route APK vs DEX brut au **contenu** (magic bytes, cf.
-/// `dyn_entrypoints::sniff`) — l'extension n'entre jamais en compte.
-pub fn parse_any(path: &Path) -> Result<ParsedApk> {
-    use self::dyn_entrypoints::{sniff, InputKind};
-    match sniff(path) {
-        Some(InputKind::Apk) => parse_apk(path),
-        Some(InputKind::Dex) => parse_dex(path),
+/// `dyn_entrypoints::sniff`) — l'extension n'entre jamais en compte. `splits` :
+/// voir [`parse_apk`], sans effet sur un DEX.
+pub fn parse_any(src: impl Into<source::Source>, splits: &[xapk::Split]) -> Result<ParsedApk> {
+    use self::dyn_entrypoints::InputKind;
+    let src = src.into();
+    match src.sniff() {
+        Some(InputKind::Apk) => parse_apk(src, splits),
+        Some(InputKind::Dex) => parse_dex(src),
         None => anyhow::bail!(
-            "{} n'est ni un APK (PK\\x03\\x04) ni un DEX (dex\\n) — reconnu au contenu",
-            path.display()
+            "{src} n'est ni un APK (PK\\x03\\x04) ni un DEX (dex\\n) — reconnu au contenu"
         ),
     }
 }
 
+/// Un `classes*.dex` en mémoire : nom d'entrée dans l'archive, ou chemin du DEX
+/// brut.
+pub struct DexBlob {
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Une entrée retenue : écrite dans le tempdir d'un APK sur disque, ou gardée
+/// en mémoire.
+enum Extracted {
+    File(std::path::PathBuf),
+    Mem(DexBlob),
+}
+
+impl Extracted {
+    fn label(&self) -> String {
+        match self {
+            Extracted::File(path) => path.display().to_string(),
+            Extracted::Mem(blob) => blob.name.clone(),
+        }
+    }
+
+    fn into_mem(self) -> Option<DexBlob> {
+        match self {
+            Extracted::Mem(blob) => Some(blob),
+            Extracted::File(_) => None,
+        }
+    }
+}
+
 /// Fichiers d'intérêt extraits de l'APK.
+#[derive(Default)]
 struct ApkEntries {
-    dex_files: Vec<std::path::PathBuf>,
-    so_files: Vec<std::path::PathBuf>,
+    dex_files: Vec<Extracted>,
+    so_files: Vec<Extracted>,
+}
+
+impl ApkEntries {
+    /// Range une entrée lue : écrite sous `out_dir` avec le nom `flat`, ou
+    /// gardée en mémoire sans `out_dir`.
+    fn keep(
+        &mut self,
+        out_dir: Option<&Path>,
+        flat: &str,
+        name: &str,
+        bytes: Vec<u8>,
+        is_dex: bool,
+    ) -> Result<()> {
+        let item = match out_dir {
+            Some(dir) => {
+                let dest = dir.join(flat);
+                std::fs::write(&dest, &bytes)?;
+                Extracted::File(dest)
+            }
+            None => Extracted::Mem(DexBlob {
+                name: name.to_string(),
+                bytes,
+            }),
+        };
+        if is_dex {
+            self.dex_files.push(item);
+        } else {
+            self.so_files.push(item);
+        }
+        Ok(())
+    }
 }
 
 /// Ce qu'on tire de l'archive. Les passes qui ne relisent que du bytecode
-/// (`dyn_entrypoints`, `ui_callbacks`) n'écrivent pas les `.so` sur disque.
+/// (`dyn_entrypoints`, `ui_callbacks`) ne lisent pas les `.so`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Want {
     DexAndSo,
@@ -198,8 +282,8 @@ fn wanted(name: &str, want: Want) -> (bool, bool) {
     (is_dex, is_so)
 }
 
-/// Extrait les `classes*.dex` d'un APK dans `out_dir` et rend leurs chemins,
-/// avec le MÊME repli tolérant que [`parse_apk`].
+/// Lit les `classes*.dex` d'un APK en mémoire, avec le MÊME repli tolérant que
+/// [`parse_apk`].
 ///
 /// Pour les passes qui rescannent le bytecode en dehors de `parse_apk`
 /// (`dyn_entrypoints`, `ui_callbacks`) : elles ouvraient l'archive elles-mêmes
@@ -208,44 +292,70 @@ fn wanted(name: &str, want: Want) -> (bool, bool) {
 /// répond « Password required to decrypt file » et l'échantillon entier était
 /// perdu — alors même que `parse_apk` en avait tiré manifeste et DEX par le
 /// lecteur tolérant.
-pub(crate) fn extract_dex_files(apk: &Path, out_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
-    Ok(extract_apk(apk, out_dir, Want::DexOnly)?.dex_files)
+pub(crate) fn read_dex_files(src: &source::Source) -> Result<Vec<DexBlob>> {
+    let entries = extract_apk(src, None, Want::DexOnly)?;
+    Ok(entries
+        .dex_files
+        .into_iter()
+        .filter_map(Extracted::into_mem)
+        .collect())
 }
 
-/// Dézippe l'APK : écrit les classes*.dex et lib/**/*.so dans `out_dir`.
+/// DEX d'une entrée reconnue au contenu : un DEX brut est lu tel quel, un APK
+/// donne ses `classes*.dex` par [`read_dex_files`]. Un APK sans DEX est une
+/// erreur.
+pub(crate) fn dex_inputs(src: &source::Source) -> Result<Vec<DexBlob>> {
+    use self::dyn_entrypoints::InputKind;
+    match src.sniff() {
+        Some(InputKind::Dex) => Ok(vec![DexBlob {
+            name: src.to_string(),
+            bytes: src.read_all()?,
+        }]),
+        Some(InputKind::Apk) => {
+            let blobs = read_dex_files(src)?;
+            if blobs.is_empty() {
+                anyhow::bail!("aucun classes*.dex dans l'APK {src}");
+            }
+            Ok(blobs)
+        }
+        None => anyhow::bail!("{src} n'est ni un DEX ni un APK — reconnu au contenu"),
+    }
+}
+
+/// Dézippe l'APK : écrit les classes*.dex et lib/**/*.so dans `out_dir`, ou les
+/// garde en mémoire sans `out_dir`.
 ///
 /// Chemin nominal via le crate `zip`. On retombe sur le lecteur tolérant dès
 /// qu'il refuse quoi que ce soit — l'archive à l'ouverture, mais aussi une
 /// entrée à la lecture : le drapeau de chiffrement et la méthode de compression
 /// ne sont contrôlés qu'à ce moment, et c'est là que le trafiquage frappe.
-fn extract_apk(apk: &Path, out_dir: &Path, want: Want) -> Result<ApkEntries> {
-    let file = std::fs::File::open(apk).with_context(|| format!("open {}", apk.display()))?;
+fn extract_apk(src: &source::Source, out_dir: Option<&Path>, want: Want) -> Result<ApkEntries> {
+    let file = src.reader().with_context(|| format!("open {src}"))?;
     let mut zip = match zip::ZipArchive::new(file) {
         Ok(z) => z,
         Err(e) => {
             tracing::warn!(
-                apk = %apk.display(),
+                apk = %src,
                 error = %e,
                 "crate zip en échec, repli sur le lecteur tolérant"
             );
-            return extract_apk_tolerant(apk, out_dir, want);
+            return extract_apk_tolerant(src, out_dir, want);
         }
     };
 
-    let mut dex_files = Vec::new();
-    let mut so_files = Vec::new();
+    let mut entries = ApkEntries::default();
 
     for i in 0..zip.len() {
         let mut entry = match zip.by_index(i) {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!(
-                    apk = %apk.display(),
+                    apk = %src,
                     index = i,
                     error = %e,
                     "entrée refusée par le crate zip, repli sur le lecteur tolérant"
                 );
-                return extract_apk_tolerant(apk, out_dir, want);
+                return extract_apk_tolerant(src, out_dir, want);
             }
         };
         let name = entry.name().to_string();
@@ -257,49 +367,46 @@ fn extract_apk(apk: &Path, out_dir: &Path, want: Want) -> Result<ApkEntries> {
 
         // Nom de fichier de sortie aplati (lib/arm64-v8a/foo.so -> arm64-v8a__foo.so).
         let flat = output_file_name(&name.replace('/', "__"), &name);
-        let dest = out_dir.join(&flat);
         let mut buf = Vec::with_capacity(entry.size() as usize);
         let read = entry.read_to_end(&mut buf);
         drop(entry);
         if let Err(e) = read {
             tracing::warn!(
-                apk = %apk.display(),
+                apk = %src,
                 entry = %name,
                 error = %e,
                 "lecture d'entrée en échec, repli sur le lecteur tolérant"
             );
-            return extract_apk_tolerant(apk, out_dir, want);
+            return extract_apk_tolerant(src, out_dir, want);
         }
-        std::fs::write(&dest, &buf)?;
-
-        if is_dex {
-            dex_files.push(dest);
-        } else {
-            so_files.push(dest);
-        }
+        entries.keep(out_dir, &flat, &name, buf, is_dex)?;
     }
 
-    tracing::info!(dex = dex_files.len(), so = so_files.len(), "APK extracted");
-    Ok(ApkEntries {
-        dex_files,
-        so_files,
-    })
+    tracing::info!(
+        dex = entries.dex_files.len(),
+        so = entries.so_files.len(),
+        "APK extracted"
+    );
+    Ok(entries)
 }
 
 /// Repli quand le crate `zip` refuse l'archive : lecteur calqué sur le
 /// chargeur d'APK d'Android (cf. `apkzip`). Une entrée illisible est ignorée
 /// plutôt que de faire échouer l'extraction complète.
-fn extract_apk_tolerant(apk: &Path, out_dir: &Path, want: Want) -> Result<ApkEntries> {
-    let zip = apkzip::TolerantZip::open(apk)
-        .with_context(|| format!("lecteur tolérant sur {}", apk.display()))?;
+fn extract_apk_tolerant(
+    src: &source::Source,
+    out_dir: Option<&Path>,
+    want: Want,
+) -> Result<ApkEntries> {
+    let what = format!("lecteur tolérant sur {src}");
+    let zip = src.tolerant().context(what)?;
     tracing::warn!(
         entries = zip.len(),
         tampered = zip.tampered_count(),
         "lecteur tolérant actif"
     );
 
-    let mut dex_files = Vec::new();
-    let mut so_files = Vec::new();
+    let mut entries = ApkEntries::default();
 
     for (i, entry) in zip.entries().iter().enumerate() {
         let name = &entry.name;
@@ -325,25 +432,15 @@ fn extract_apk_tolerant(apk: &Path, out_dir: &Path, want: Want) -> Result<ApkEnt
             }
         };
 
-        let dest = out_dir.join(&flat);
-        std::fs::write(&dest, &buf)?;
-
-        if is_dex {
-            dex_files.push(dest);
-        } else {
-            so_files.push(dest);
-        }
+        entries.keep(out_dir, &flat, name, buf, is_dex)?;
     }
 
     tracing::info!(
-        dex = dex_files.len(),
-        so = so_files.len(),
+        dex = entries.dex_files.len(),
+        so = entries.so_files.len(),
         "APK extracted (lecteur tolérant)"
     );
-    Ok(ApkEntries {
-        dex_files,
-        so_files,
-    })
+    Ok(entries)
 }
 
 #[cfg(test)]

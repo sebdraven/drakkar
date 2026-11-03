@@ -51,11 +51,11 @@
 //! Toutes les étiquettes produites sont définies dans [`legend`].
 
 use super::axml::StringPool;
+use super::source::Source;
 use anyhow::{bail, Context, Result};
 use serde::{Serialize, Serializer};
 use std::collections::HashMap;
 use std::io::Read;
-use std::path::Path;
 
 /// Nom de l'entrée d'archive qui porte la table.
 pub const ARSC_ENTRY: &str = "resources.arsc";
@@ -282,9 +282,10 @@ impl ResourceTable {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Lit et parse le `resources.arsc` d'un APK.
-pub fn extract(apk: &Path) -> Result<ResourceTable> {
-    let raw = read_arsc_bytes(apk)?;
-    parse(&raw).with_context(|| format!("{} : resources.arsc illisible", apk.display()))
+pub fn extract(apk: impl Into<Source>) -> Result<ResourceTable> {
+    let apk = apk.into();
+    let raw = read_arsc_bytes(&apk)?;
+    parse(&raw).with_context(|| format!("{apk} : resources.arsc illisible"))
 }
 
 /// Extrait les octets de l'entrée `resources.arsc`.
@@ -293,8 +294,8 @@ pub fn extract(apk: &Path) -> Result<ResourceTable> {
 /// chiffrement et la méthode de compression qu'à la LECTURE de l'entrée. Sur les
 /// archives trafiquées du corpus, l'ouverture passe et c'est `by_name` ou
 /// `read_to_end` qui échoue.
-fn read_arsc_bytes(apk: &Path) -> Result<Vec<u8>> {
-    let file = std::fs::File::open(apk).with_context(|| format!("open {}", apk.display()))?;
+fn read_arsc_bytes(apk: &Source) -> Result<Vec<u8>> {
+    let file = apk.reader().with_context(|| format!("open {apk}"))?;
 
     let nominal = (|| -> Result<Vec<u8>> {
         let mut zip = zip::ZipArchive::new(file).context("lecture de l'APK en zip")?;
@@ -309,17 +310,16 @@ fn read_arsc_bytes(apk: &Path) -> Result<Vec<u8>> {
         Err(e) => e,
     };
     tracing::warn!(
-        apk = %apk.display(),
+        apk = %apk,
         error = %err,
         "resources.arsc illisible par le crate zip, repli sur le lecteur tolérant"
     );
 
-    let zip = super::apkzip::TolerantZip::open(apk)?;
+    let zip = apk.tolerant()?;
     if !zip.entries().iter().any(|e| e.name == ARSC_ENTRY) {
         bail!(
-            "{} ne contient pas resources.arsc — APK sans ressources compilées, \
-             ou entrée renommée (voir --list-entries)",
-            apk.display()
+            "{apk} ne contient pas resources.arsc — APK sans ressources compilées, \
+             ou entrée renommée (voir --list-entries)"
         );
     }
     zip.read_by_name(ARSC_ENTRY)

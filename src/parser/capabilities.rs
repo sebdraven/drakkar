@@ -8,9 +8,9 @@
 //! comme l'alternance de `re`, et le motif retenu est le plus à gauche.
 
 use crate::parser::disasm::{self, DisasmOptions, DisasmReport};
+use crate::parser::source::Source;
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 /// Préfixes de descripteur exclus d'office : bibliothèques, pas l'application.
 pub const LIBRARY_PREFIXES: &[&str] = &[
@@ -224,7 +224,11 @@ pub struct CapabilityReport {
 }
 
 /// APK ou DEX brut, même sélection de classes que `--disasm`.
-pub fn run(input: &Path, patterns: &[String], exclude: &[String]) -> Result<CapabilityReport> {
+pub fn run(
+    input: impl Into<Source>,
+    patterns: &[String],
+    exclude: &[String],
+) -> Result<CapabilityReport> {
     let options = DisasmOptions {
         patterns: patterns.to_vec(),
         normalize: Vec::new(),

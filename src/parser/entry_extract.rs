@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 
 use super::apkzip::TolerantZip;
 use super::flat_output_name;
+use super::source::Source;
 
 /// Une entrée extraite de l'APK.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,9 +247,9 @@ pub fn extract_matching(path: &Path, patterns: &[String]) -> Result<EntryExtract
 
 /// Liste les chemins de toutes les entrées de l'archive, sans rien extraire.
 /// Sert à trouver quoi demander quand on ne connaît pas encore l'arborescence.
-pub fn list_entries(path: &Path) -> Result<Vec<String>> {
-    let file =
-        std::fs::File::open(path).with_context(|| format!("ouverture {}", path.display()))?;
+pub fn list_entries(src: impl Into<Source>) -> Result<Vec<String>> {
+    let src = src.into();
+    let file = src.reader().with_context(|| format!("ouverture {src}"))?;
     let nominal = (|| -> Result<Vec<String>> {
         let mut archive = zip::ZipArchive::new(file).context("lecture APK (zip)")?;
         let mut names = Vec::with_capacity(archive.len());
@@ -264,11 +265,11 @@ pub fn list_entries(path: &Path) -> Result<Vec<String>> {
         Ok(names) => names,
         Err(e) => {
             tracing::warn!(
-                apk = %path.display(),
+                apk = %src,
                 error = %e,
                 "liste en échec par le crate zip, repli sur le lecteur tolérant"
             );
-            let zip = TolerantZip::open(path)?;
+            let zip = src.tolerant()?;
             zip.entries().iter().map(|e| e.name.clone()).collect()
         }
     };

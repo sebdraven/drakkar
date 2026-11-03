@@ -219,8 +219,17 @@ impl DexBin {
     /// Ouvre un `.dex` déjà matérialisé sur disque.
     pub fn open(path: &Path) -> Result<Self> {
         let buf = std::fs::read(path).with_context(|| format!("read dex {}", path.display()))?;
-        let dex = DexFile::parse(&buf).with_context(|| format!("parse dex {}", path.display()))?;
-        drop(buf);
+        Self::from_bytes(&buf, &path.display().to_string())
+    }
+
+    /// Ouvre un DEX brut, sur disque ou en mémoire.
+    pub fn read(src: &crate::parser::source::Source) -> Result<Self> {
+        Self::from_bytes(&src.read_all()?, &src.to_string())
+    }
+
+    /// Ouvre un DEX déjà en mémoire ; `label` nomme la source dans les erreurs.
+    pub fn from_bytes(bytes: &[u8], label: &str) -> Result<Self> {
+        let dex = DexFile::parse(bytes).with_context(|| format!("parse dex {label}"))?;
 
         let strings = (0..dex.header.string_ids_size)
             .map(|i| dex.get_string(i).ok())

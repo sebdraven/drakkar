@@ -13,10 +13,10 @@
 //! (légende autonome).
 
 use crate::parser::axml::{self, Element};
+use crate::parser::source::Source;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
-use std::path::Path;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Modèle
@@ -47,6 +47,9 @@ pub struct ManifestReport {
     pub entrypoints: Vec<Entrypoint>,
     /// Observations notables (surface d'attaque, indices de packer, etc.).
     pub anomalies: Vec<String>,
+    /// Conteneur XAPK d'où vient l'APK analysé ; absent pour un APK simple.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<crate::parser::xapk::ContainerInfo>,
 }
 
 /// Niveaux d'API déclarés, plus les marqueurs de chaîne de build injectés dans
@@ -433,8 +436,8 @@ const ANOMALY_TOLERANT_AXML: &str =
     "manifest décodé par le repli AXML tolérant — inventaire potentiellement partiel";
 
 /// Parse le `AndroidManifest.xml` d'un APK et produit le rapport complet.
-pub fn extract(apk_path: &Path) -> Result<ManifestReport> {
-    let raw = read_manifest_bytes(apk_path)?;
+pub fn extract(src: impl Into<Source>) -> Result<ManifestReport> {
+    let raw = read_manifest_bytes(&src.into())?;
     let decoded = axml::decode(&raw).map_err(|e| anyhow!("décodage AXML: {e}"))?;
     if decoded.root.get_tag() != "manifest" {
         return Err(anyhow!(
@@ -453,9 +456,8 @@ pub fn extract(apk_path: &Path) -> Result<ManifestReport> {
 ///
 /// Même repli que `parser::manifest` : le crate `zip` ne contrôle le drapeau de
 /// chiffrement et la méthode de compression qu'à la lecture de l'entrée.
-fn read_manifest_bytes(apk_path: &Path) -> Result<Vec<u8>> {
-    let file = std::fs::File::open(apk_path)
-        .with_context(|| format!("ouverture {}", apk_path.display()))?;
+fn read_manifest_bytes(src: &Source) -> Result<Vec<u8>> {
+    let file = src.reader().with_context(|| format!("ouverture {src}"))?;
 
     let nominal = (|| -> Result<Vec<u8>> {
         let mut zip = zip::ZipArchive::new(file).context("lecture de l'APK comme zip")?;
@@ -471,11 +473,11 @@ fn read_manifest_bytes(apk_path: &Path) -> Result<Vec<u8>> {
         Ok(buf) => Ok(buf),
         Err(e) => {
             tracing::warn!(
-                apk = %apk_path.display(),
+                apk = %src,
                 error = %e,
                 "manifest illisible par le crate zip, repli sur le lecteur tolérant"
             );
-            super::apkzip::TolerantZip::open(apk_path)?
+            src.tolerant()?
                 .read_by_name("AndroidManifest.xml")
                 .context("AndroidManifest.xml illisible, y compris par le lecteur tolérant")
         }
@@ -986,6 +988,8 @@ pub fn legend() -> String {
     s.push_str("                        illisibles sont absents plutôt que faux, mais\n");
     s.push_str("                        l'inventaire peut être incomplet — un composant\n");
     s.push_str("                        manquant n'est pas un composant absent.\n");
+    s.push('\n');
+    s.push_str(crate::parser::xapk::container_legend());
     s
 }
 

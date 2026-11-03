@@ -31,11 +31,12 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::Ipv4Addr;
 use std::panic::AssertUnwindSafe;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::apkzip::TolerantZip;
 use super::dex_facade::DexBin;
 use super::native_arch::{expected_arch, parse_elf_header, Abi, Bits, ElfArch, Endian, Machine};
+use super::source::Source;
 
 mod decode;
 mod disasm;
@@ -137,6 +138,9 @@ pub struct NativeReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct ElfReport {
     pub path: String,
+    /// Split XAPK porteur (`xapk::Split::id`) ; absent pour le base ou un APK.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split: Option<String>,
     pub origin: &'static str,
     pub sha256: String,
     pub size: u64,
@@ -423,36 +427,57 @@ impl NativeMethod {
     }
 }
 
-/// Analyse un APK sur disque. Seule une archive illisible fait échouer le mode :
-/// un ELF illisible devient une anomalie, une entrée illisible une erreur.
-/// `extra_dex` : APK ou DEX bruts dont les méthodes natives s'ajoutent à celles
-/// de l'APK. `disasm` active `--native-disasm`.
+/// Analyse un APK, puis les splits ABI d'un XAPK dont il est le base (`splits`,
+/// vide pour un APK simple). Seule une archive illisible fait échouer le mode :
+/// un ELF illisible devient une anomalie, une entrée illisible ou un split
+/// illisible une erreur. `extra_dex` : APK ou DEX bruts dont les méthodes
+/// natives s'ajoutent à celles de l'APK. `disasm` active `--native-disasm`.
 pub fn analyze_apk(
-    path: &Path,
-    extra_dex: &[PathBuf],
+    src: impl Into<Source>,
+    splits: &[super::xapk::Split],
+    extra_dex: &[Source],
     disasm: Option<&DisasmOptions>,
 ) -> Result<NativeReport> {
-    let sha256 = file_sha256(path)?;
-    let zip = TolerantZip::open(path)?;
+    let src = src.into();
+    let sha256 = src.sha256()?;
     let mut errors = Vec::new();
     let mut elfs = Vec::new();
     let mut kept = Vec::new();
-    for (index, entry) in zip.entries().iter().enumerate() {
-        let bytes = match zip.read(index) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                errors.push(format!("{}: entrée illisible ({e:#})", entry.name));
+    let native = splits.iter().filter(|s| s.native);
+    let archives =
+        std::iter::once((&src, None)).chain(native.map(|s| (&s.source, Some(s.id.as_str()))));
+    for (archive, split) in archives {
+        let zip = match (archive.tolerant(), split) {
+            (Ok(zip), _) => zip,
+            (Err(e), None) => return Err(e),
+            (Err(e), Some(id)) => {
+                errors.push(format!("split {id} : illisible ({e:#})"));
                 continue;
             }
         };
-        if bytes.starts_with(ELF_MAGIC) {
-            elfs.push(analyze_elf(&entry.name, &bytes));
-            if disasm.is_some() {
-                kept.push(bytes);
+        let at = |name: &str| match split {
+            Some(split) => format!("{split}!{name}"),
+            None => name.to_string(),
+        };
+        for (index, entry) in zip.entries().iter().enumerate() {
+            let bytes = match zip.read(index) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    errors.push(format!("{}: entrée illisible ({e:#})", at(&entry.name)));
+                    continue;
+                }
+            };
+            if bytes.starts_with(ELF_MAGIC) {
+                let mut elf = analyze_elf(&entry.name, &bytes);
+                elf.split = split.map(str::to_string);
+                elfs.push(elf);
+                if disasm.is_some() {
+                    kept.push(bytes);
+                }
             }
         }
     }
-    let mut sources = vec![path.to_path_buf()];
+    let mut sources = vec![src];
     sources.extend_from_slice(extra_dex);
     Ok(finish(sha256, elfs, &kept, &sources, disasm, errors))
 }
@@ -461,7 +486,7 @@ pub fn analyze_apk(
 /// natives sont liées à cet ELF ; vide, binding est vide.
 pub fn analyze_elf_file(
     path: &Path,
-    dex: &[PathBuf],
+    dex: &[Source],
     disasm: Option<&DisasmOptions>,
 ) -> Result<NativeReport> {
     let bytes = std::fs::read(path).with_context(|| format!("lecture {}", path.display()))?;
@@ -496,7 +521,7 @@ fn finish(
     sha256: String,
     mut elfs: Vec<ElfReport>,
     kept: &[Vec<u8>],
-    dex: &[PathBuf],
+    dex: &[Source],
     disasm: Option<&DisasmOptions>,
     mut errors: Vec<String>,
 ) -> NativeReport {
@@ -528,7 +553,7 @@ fn finish(
     NativeReport {
         sha256,
         dex_available: natives.is_some(),
-        dex_sources: dex.iter().map(|p| p.display().to_string()).collect(),
+        dex_sources: dex.iter().map(|s| s.to_string()).collect(),
         elfs,
         binding,
         summary,
@@ -538,18 +563,26 @@ fn finish(
 }
 
 /// `--native-listing` sur un rapport déjà désassemblé. `input` : l'APK ou l'ELF
-/// brut analysé, d'où les octets de chaque ELF retenu sont relus.
+/// brut analysé, d'où les octets de chaque ELF retenu sont relus ; `splits` :
+/// ceux passés à [`analyze_apk`], d'où sont relus les ELF de split.
 pub fn add_listings(
     report: &mut NativeReport,
-    input: &Path,
+    input: impl Into<Source>,
+    splits: &[super::xapk::Split],
     specs: &[ListingSpec],
     max_insns: usize,
 ) {
     if specs.is_empty() {
         return;
     }
+    let input = input.into();
     let in_archive = report.elfs.iter().any(|e| e.origin != ORIGIN_RAW);
-    let zip = in_archive.then(|| TolerantZip::open(input));
+    let base_zip = in_archive.then(|| input.tolerant());
+    let split_zips: Vec<(&str, Option<Result<TolerantZip>>)> = splits
+        .iter()
+        .filter(|s| s.native)
+        .map(|s| (s.id.as_str(), in_archive.then(|| s.source.tolerant())))
+        .collect();
     self::disasm::silence_panics(|| {
         for spec in specs {
             let mut matched = false;
@@ -558,8 +591,15 @@ pub fn add_listings(
                     continue;
                 }
                 matched = true;
-                let bytes = match (&zip, elf.origin) {
-                    (_, ORIGIN_RAW) => std::fs::read(input).map_err(|e| e.to_string()),
+                let zip = match elf.split.as_deref() {
+                    None => base_zip.as_ref(),
+                    Some(split) => split_zips
+                        .iter()
+                        .find(|(label, _)| *label == split)
+                        .and_then(|(_, zip)| zip.as_ref()),
+                };
+                let bytes = match (zip, elf.origin) {
+                    (_, ORIGIN_RAW) => input.read_all().map_err(|e| format!("{e:#}")),
                     (Some(Ok(zip)), _) => zip.read_by_name(&elf.path).map_err(|e| format!("{e:#}")),
                     (Some(Err(e)), _) => Err(format!("archive illisible ({e:#})")),
                     (None, _) => Err("archive non ouverte".to_string()),
@@ -640,6 +680,7 @@ impl ElfReport {
         }
         ElfReport {
             path: path.to_string(),
+            split: None,
             origin,
             sha256: format!("{:x}", Sha256::digest(bytes)),
             size: bytes.len() as u64,
@@ -1711,7 +1752,7 @@ pub fn demangle_jni(symbol: &str) -> Option<StaticExport> {
     })
 }
 
-fn declared_natives(apk: &Path, errors: &mut Vec<String>) -> Option<Vec<NativeMethod>> {
+fn declared_natives(apk: &Source, errors: &mut Vec<String>) -> Option<Vec<NativeMethod>> {
     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| read_natives(apk)));
     match outcome {
         Ok(Ok((natives, mut problems))) => {
@@ -1719,13 +1760,12 @@ fn declared_natives(apk: &Path, errors: &mut Vec<String>) -> Option<Vec<NativeMe
             Some(natives)
         }
         Ok(Err(e)) => {
-            errors.push(format!("dex {}: {e:#} ; source ignorée", apk.display()));
+            errors.push(format!("dex {apk}: {e:#} ; source ignorée"));
             None
         }
         Err(_) => {
-            let source = apk.display();
             errors.push(format!(
-                "dex {source}: panique pendant le parsing ; source ignorée"
+                "dex {apk}: panique pendant le parsing ; source ignorée"
             ));
             None
         }
@@ -1746,21 +1786,23 @@ pub fn merge_natives(lists: Vec<Vec<NativeMethod>>) -> Vec<NativeMethod> {
 }
 
 /// `apk` : APK, ou DEX brut reconnu à son magic.
-fn read_natives(apk: &Path) -> Result<(Vec<NativeMethod>, Vec<String>)> {
-    let tmp = tempfile::tempdir().context("création du répertoire temporaire")?;
-    let files = match super::dyn_entrypoints::sniff(apk) {
-        Some(super::dyn_entrypoints::InputKind::Dex) => vec![apk.to_path_buf()],
-        _ => super::extract_dex_files(apk, tmp.path())?,
+fn read_natives(apk: &Source) -> Result<(Vec<NativeMethod>, Vec<String>)> {
+    let files = match apk.sniff() {
+        Some(super::dyn_entrypoints::InputKind::Dex) => {
+            let name = apk.as_path().and_then(Path::file_name);
+            vec![super::DexBlob {
+                name: name.map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+                bytes: apk.read_all()?,
+            }]
+        }
+        _ => super::read_dex_files(apk)?,
     };
     let mut problems = Vec::new();
     let mut seen = HashSet::new();
     let mut natives = Vec::new();
     for file in &files {
-        let label = match file.file_name() {
-            Some(name) => name.to_string_lossy().into_owned(),
-            None => String::new(),
-        };
-        let dex = match DexBin::open(file) {
+        let label = &file.name;
+        let dex = match DexBin::from_bytes(&file.bytes, label) {
             Ok(dex) => dex,
             Err(e) => {
                 problems.push(format!("{label}: DEX illisible ({e:#})"));
@@ -1969,22 +2011,6 @@ fn section_flags(section: &Section) -> String {
     out
 }
 
-/// SHA-256 du fichier entier, lu par blocs pour ne pas charger l'APK en mémoire.
-fn file_sha256(path: &Path) -> Result<String> {
-    let mut f =
-        std::fs::File::open(path).with_context(|| format!("ouverture {}", path.display()))?;
-    let mut h = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", h.finalize()))
-}
-
 const LEGEND: &str = "\
 --native : analyse statique de TOUS les ELF de l'APK et liaison avec les méthodes
 `native` du DEX. Ni exécution, ni émulation ; désassemblage seulement avec
@@ -1998,13 +2024,14 @@ de toutes les sources sont fusionnées avant la liaison : même classe, même no
 même signature = une seule méthode.
 
 RAPPORT
-  sha256          SHA-256 complet du fichier APK, ou de l'ELF en mode brut.
+  sha256          SHA-256 complet du fichier APK (du base pour un XAPK), ou de l'ELF en
+                  mode brut.
   dex_available   Au moins une source de dex_sources a été lue. false en mode brut sans
                   --native-dex, ou si aucune source n'a pu être lue : binding est alors
                   vide et native_methods_declared vaut 0, sans rien dire du DEX.
   dex_sources     Sources de méthodes natives, dans l'ordre de lecture : l'APK lui-même
                   en mode APK, puis chaque --native-dex dans l'ordre de la ligne de
-                  commande. Vide en mode brut sans --native-dex. Une source illisible
+                  commande. Un XAPK s'y écrit <chemin du .xapk>!<entrée du base>. Vide en mode brut sans --native-dex. Une source illisible
                   reste listée, avec sa raison dans errors.
   listings[]      --native-listing seulement, absent sinon (section LISTING).
   errors          Une entrée de longueur nulle (empty : stored vide ou flux deflate vide)
@@ -2020,6 +2047,10 @@ ELF (elfs[])
   Est un ELF toute entrée dont les 4 premiers octets décompressés valent 7F 45 4C 46,
   quel que soit son chemin ou son extension. Archive lue par le lecteur ZIP tolérant.
   path            Chemin de l'entrée dans l'APK ; nom du fichier en mode brut.
+  split           ELF lu dans un split ABI d'un XAPK : id du split (attribut split de
+                  son manifeste). Absent pour le base APK ou un APK simple. Une entrée de
+                  split illisible figure dans errors sous la forme <split>!<entry>, un
+                  split illisible sous la forme « split <id> : illisible (<raison>) ».
   origin          lib = sous lib/ ; assets = sous assets/ ; res_raw = sous res/raw/ ;
                   other = ailleurs (racine, res/ renommé, META-INF/…) ; raw = fichier ELF
                   passé directement, hors de toute archive, lié comme lib.

@@ -49,15 +49,15 @@
 //! instruction, sa valeur vit dans `encoded_static_values`. D'où la catégorie
 //! `valeur-statique`, lue dans le `class_def_item` et non dans le code.
 
-use crate::parser::dex_facade::DexValue;
+use crate::parser::dex_facade::{DexBin, DexValue};
 use crate::parser::disasm::{escape, normalize, resolve, Operand};
+use crate::parser::source::Source;
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::io::{IsTerminal, Read};
-use std::path::{Path, PathBuf};
+use std::io::IsTerminal;
 
 // ── Couleur ──────────────────────────────────────────────────────────────────
 
@@ -342,13 +342,18 @@ impl Default for ExplainOptions {
 
 // ── Traitement ───────────────────────────────────────────────────────────────
 
-pub fn run(input_a: &Path, input_b: &Path, opts: &ExplainOptions) -> Result<ExplainReport> {
-    let (a, _ta) = load(input_a, opts)?;
-    let (b, _tb) = load(input_b, opts)?;
+pub fn run(
+    input_a: impl Into<Source>,
+    input_b: impl Into<Source>,
+    opts: &ExplainOptions,
+) -> Result<ExplainReport> {
+    let (input_a, input_b) = (input_a.into(), input_b.into());
+    let a = load(&input_a, opts)?;
+    let b = load(&input_b, opts)?;
 
     let mut report = ExplainReport {
-        input_a: input_a.display().to_string(),
-        input_b: input_b.display().to_string(),
+        input_a: input_a.to_string(),
+        input_b: input_b.to_string(),
         classes_paired: 0,
         paired_by_name: 0,
         paired_by_hash: 0,
@@ -849,28 +854,25 @@ fn visible(lines: &[AlignedLine], ctx: usize) -> Vec<usize> {
 
 // ── Chargement ───────────────────────────────────────────────────────────────
 
-fn load(
-    input: &Path,
-    opts: &ExplainOptions,
-) -> Result<(Vec<ClassRich>, Option<tempfile::TempDir>)> {
-    let (paths, tmp) = collect_dex_paths(input)?;
+fn load(input: &Source, opts: &ExplainOptions) -> Result<Vec<ClassRich>> {
+    let dexes = crate::parser::dex_inputs(input)?;
     let mut out = Vec::new();
-    for p in &paths {
-        collect_from_dex(p, opts, &mut out).with_context(|| format!("parse {}", p.display()))?;
+    for dex in &dexes {
+        DexBin::from_bytes(&dex.bytes, &dex.name)
+            .and_then(|bin| collect_from_dex(bin, opts, &mut out))
+            .with_context(|| format!("parse {}", dex.name))?;
     }
     if out.is_empty() {
         bail!(
             "aucune classe applicative retenue dans {} — vérifie --explain-include \
              (préfixes au format descripteur Dalvik, ex. Lcom/dy/)",
-            input.display()
+            input
         );
     }
-    Ok((out, tmp))
+    Ok(out)
 }
 
-fn collect_from_dex(path: &Path, opts: &ExplainOptions, out: &mut Vec<ClassRich>) -> Result<()> {
-    let dex = crate::parser::dex_facade::DexBin::open(path)?;
-
+fn collect_from_dex(dex: DexBin, opts: &ExplainOptions, out: &mut Vec<ClassRich>) -> Result<()> {
     for class in dex.classes() {
         let class = match class {
             Ok(c) => c,
@@ -994,47 +996,6 @@ fn included(descriptor: &str, prefixes: &[String]) -> bool {
         "Lgov/nist/",
     ];
     !LIB_PREFIXES.iter().any(|p| descriptor.starts_with(p))
-}
-
-fn collect_dex_paths(input: &Path) -> Result<(Vec<PathBuf>, Option<tempfile::TempDir>)> {
-    let mut magic = [0u8; 8];
-    {
-        let mut f =
-            std::fs::File::open(input).with_context(|| format!("open {}", input.display()))?;
-        if f.read(&mut magic)? < 4 {
-            bail!("{} trop court pour être un DEX ou un APK", input.display());
-        }
-    }
-    if &magic[0..4] == b"dex\n" {
-        return Ok((vec![input.to_path_buf()], None));
-    }
-    if magic[0..4] == [0x50, 0x4b, 0x03, 0x04] {
-        let tmp = tempfile::tempdir().context("create tempdir")?;
-        let file = std::fs::File::open(input)?;
-        let mut zip = zip::ZipArchive::new(file).context("read apk as zip")?;
-        let mut paths = Vec::new();
-        for i in 0..zip.len() {
-            let mut entry = zip.by_index(i)?;
-            let name = entry.name().to_string();
-            if !(name.starts_with("classes") && name.ends_with(".dex")) {
-                continue;
-            }
-            let dest = tmp.path().join(name.replace('/', "__"));
-            let mut buf = Vec::with_capacity(entry.size() as usize);
-            entry.read_to_end(&mut buf)?;
-            std::fs::write(&dest, &buf)?;
-            paths.push(dest);
-        }
-        if paths.is_empty() {
-            bail!("aucun classes*.dex dans l'APK {}", input.display());
-        }
-        return Ok((paths, Some(tmp)));
-    }
-    bail!(
-        "{} n'est ni un DEX (dex\\n) ni un APK (PK) — magic {:02x?}",
-        input.display(),
-        &magic[0..4]
-    )
 }
 
 // ── Rendu ────────────────────────────────────────────────────────────────────

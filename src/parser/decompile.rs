@@ -9,7 +9,8 @@ use crate::parser::dex_facade::{DexBin, DexClass, DexValue};
 use crate::parser::diff_dex::opcode_fingerprint;
 use crate::parser::diff_matrix::is_application_class;
 use crate::parser::disasm::{self, ClassDisasm, DisasmReport, Insn, MethodDisasm};
-use crate::parser::dyn_entrypoints::{sniff, InputKind};
+use crate::parser::dyn_entrypoints::InputKind;
+use crate::parser::source::Source;
 use anyhow::{bail, Context, Result};
 use dex_decompiler::java::descriptor_to_java;
 use dex_decompiler::{Decompiler, DexFile, EncodedMethod};
@@ -17,7 +18,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const CARGO_LOCK: &str = include_str!("../../Cargo.lock");
 
@@ -32,17 +33,16 @@ pub struct DexEntry {
     /// pour un DEX brut.
     pub name: String,
     pub sha256: String,
-    path: PathBuf,
+    bytes: Vec<u8>,
 }
 
-/// L'entrée, reconnue au contenu, et ses DEX matérialisés sur disque.
+/// L'entrée, reconnue au contenu, et ses DEX lus en mémoire.
 pub struct Input {
     pub kind: InputKind,
     pub sha256: String,
     /// Taille du fichier d'entrée, en octets.
     pub size: u64,
     pub dexes: Vec<DexEntry>,
-    _tmp: Option<tempfile::TempDir>,
 }
 
 /// Statut de décompilation d'une méthode, rangé par gravité croissante.
@@ -278,42 +278,39 @@ pub struct DecompileReport {
     pub scanned: usize,
 }
 
-/// Reconnaît l'entrée aux octets de tête et matérialise ses DEX. Un APK passe
-/// par `parser::extract_dex_files`, donc par le repli `TolerantZip`.
-pub fn open(path: &Path) -> Result<Input> {
-    let Some(kind) = sniff(path) else {
-        bail!(
-            "{} n'est ni un APK (PK\\x03\\x04) ni un DEX (dex\\n) — reconnu au contenu",
-            path.display()
-        );
+/// Reconnaît l'entrée aux octets de tête et lit ses DEX en mémoire. Un APK
+/// passe par `parser::read_dex_files`, donc par le repli `TolerantZip`.
+pub fn open(input: impl Into<Source>) -> Result<Input> {
+    let src = input.into();
+    let Some(kind) = src.sniff() else {
+        bail!("{src} n'est ni un APK (PK\\x03\\x04) ni un DEX (dex\\n) — reconnu au contenu");
     };
-    let (paths, tmp) = match kind {
-        InputKind::Dex => (vec![path.to_path_buf()], None),
-        InputKind::Apk => {
-            let tmp = tempfile::tempdir().context("create tempdir")?;
-            let paths = crate::parser::extract_dex_files(path, tmp.path())?;
-            (paths, Some(tmp))
-        }
+    let blobs = match kind {
+        InputKind::Dex => vec![crate::parser::DexBlob {
+            name: src.as_path().map_or_else(|| src.to_string(), file_name),
+            bytes: src.read_all()?,
+        }],
+        InputKind::Apk => crate::parser::read_dex_files(&src)?,
     };
-    if paths.is_empty() {
-        bail!("aucun classes*.dex dans {}", path.display());
+    if blobs.is_empty() {
+        bail!("aucun classes*.dex dans {src}");
     }
-    let mut dexes = Vec::with_capacity(paths.len());
-    for p in paths {
-        dexes.push(DexEntry {
-            name: file_name(&p),
-            sha256: sha256_file(&p)?,
-            path: p,
-        });
-    }
+    let dexes = blobs
+        .into_iter()
+        .map(|d| DexEntry {
+            name: match kind {
+                InputKind::Dex => d.name,
+                InputKind::Apk => crate::parser::flat_output_name(&d.name),
+            },
+            sha256: format!("{:x}", Sha256::digest(&d.bytes)),
+            bytes: d.bytes,
+        })
+        .collect();
     Ok(Input {
         kind,
-        sha256: sha256_file(path)?,
-        size: std::fs::metadata(path)
-            .with_context(|| format!("stat {}", path.display()))?
-            .len(),
+        sha256: src.sha256()?,
+        size: src.size()?,
         dexes,
-        _tmp: tmp,
     })
 }
 
@@ -364,7 +361,7 @@ pub fn string_pools(input: &Input) -> (Vec<Pool>, Vec<BundleError>) {
     let mut pools = Vec::new();
     let mut errors = Vec::new();
     for entry in &input.dexes {
-        match crate::parser::dex_strings::extract(&entry.path) {
+        match crate::parser::dex_strings::from_bytes(&entry.bytes) {
             Ok(p) => pools.push(Pool {
                 dex: entry.name.clone(),
                 declared: p.declared,
@@ -383,8 +380,13 @@ pub fn string_pools(input: &Input) -> (Vec<Pool>, Vec<BundleError>) {
 /// `--decompile` : Java des classes dont le descripteur contient un motif,
 /// même sélection que `--disasm`. `decompile_class` d'abord, repli méthode par
 /// méthode quand il échoue.
-pub fn decompile_matching(path: &Path, patterns: &[String]) -> Result<DecompileReport> {
-    let input = open(path)?;
+pub fn decompile_matching(
+    input: impl Into<Source>,
+    patterns: &[String],
+) -> Result<DecompileReport> {
+    let src: Source = input.into();
+    let label = src.to_string();
+    let input = open(src)?;
     let mut errors = Vec::new();
     let loaded = load(&input, &mut errors);
     for e in &errors {
@@ -442,7 +444,7 @@ pub fn decompile_matching(path: &Path, patterns: &[String]) -> Result<DecompileR
             "aucune classe ne correspond à {:?} dans {} ({} classes lues) — le motif est \
              comparé au descripteur Dalvik, essaie `services/g` ou `Lcom/dy/`",
             patterns,
-            path.display(),
+            label,
             report.scanned
         );
     }
@@ -536,7 +538,8 @@ type Job<'a> = (usize, u32, Result<DexClass<'a>>);
 fn load(input: &Input, errors: &mut Vec<BundleError>) -> Vec<LoadedDex> {
     let mut out = Vec::new();
     for entry in &input.dexes {
-        let bin = match catch_unwind(AssertUnwindSafe(|| DexBin::open(&entry.path))) {
+        let open = || DexBin::from_bytes(&entry.bytes, &entry.name);
+        let bin = match catch_unwind(AssertUnwindSafe(open)) {
             Ok(Ok(b)) => b,
             Ok(Err(e)) => {
                 let error = format!("{e:#}");
@@ -548,16 +551,10 @@ fn load(input: &Input, errors: &mut Vec<BundleError>) -> Vec<LoadedDex> {
                 continue;
             }
         };
-        let file = match std::fs::read(&entry.path) {
-            Ok(bytes) => match guarded(|| dex_decompiler::parse_dex(&bytes)) {
-                Ok(f) => Some(f),
-                Err(f) => {
-                    errors.push(BundleError::in_dex("decompile", &entry.name, f.message));
-                    None
-                }
-            },
-            Err(e) => {
-                errors.push(BundleError::in_dex("decompile", &entry.name, e.to_string()));
+        let file = match guarded(|| dex_decompiler::parse_dex(&entry.bytes)) {
+            Ok(f) => Some(f),
+            Err(f) => {
+                errors.push(BundleError::in_dex("decompile", &entry.name, f.message));
                 None
             }
         };
@@ -1113,11 +1110,6 @@ fn file_name(p: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
-}
-
 fn locked_git_rev<'a>(lock: &'a str, package: &str) -> Option<&'a str> {
     let mut current = false;
     for line in lock.lines() {
@@ -1448,6 +1440,7 @@ Rapport de --bundle, sur stdout
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn method(name: &str, insns: usize) -> MethodDisasm {
         MethodDisasm {

@@ -18,8 +18,9 @@ use anyhow::{Context, Result};
 use der::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
 use x509_cert::Certificate;
+
+use super::source::Source;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes du format
@@ -58,6 +59,26 @@ pub struct SigningReport {
     /// Certificats dédoublonnés par empreinte SHA-256.
     pub certificates: Vec<CertInfo>,
     pub anomalies: Vec<String>,
+    /// Signataires des splits d'un XAPK ; absent pour un APK simple.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub split_signers: Vec<SplitSigner>,
+    /// Tous les splits sont signés par le même ensemble de certificats que le
+    /// base ; absent sans split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub splits_same_signer: Option<bool>,
+    /// Conteneur XAPK d'où vient l'APK analysé ; absent pour un APK simple.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<super::xapk::ContainerInfo>,
+}
+
+/// Certificats d'un split, réduits à leur SHA-256.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitSigner {
+    pub entry: String,
+    /// Attribut `split` du manifeste du split.
+    pub id: String,
+    /// SHA-256 complets des certificats du split, dédoublonnés.
+    pub cert_sha256: Vec<String>,
 }
 
 /// Schémas de signature détectés.
@@ -178,16 +199,17 @@ pub struct Fingerprints {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Analyse la signature d'un APK et produit le rapport complet.
-pub fn extract(apk_path: &Path) -> Result<SigningReport> {
+pub fn extract(src: impl Into<Source>) -> Result<SigningReport> {
+    let src = src.into();
     let mut report = SigningReport::default();
     // (der, source) accumulés puis dédoublonnés par SHA-256.
     let mut raw_certs: Vec<(Vec<u8>, CertSource)> = Vec::new();
 
     // ── v1 : META-INF/*.{RSA,DSA,EC} ──
-    collect_v1(apk_path, &mut report, &mut raw_certs)?;
+    collect_v1(&src, &mut report, &mut raw_certs)?;
 
     // ── v2 / v3 / v3.1 : APK Signing Block ──
-    if let Err(e) = collect_signing_block(apk_path, &mut report, &mut raw_certs) {
+    if let Err(e) = collect_signing_block(&src, &mut report, &mut raw_certs) {
         tracing::warn!(error = %e, "APK Signing Block illisible");
         report
             .anomalies
@@ -229,17 +251,61 @@ pub fn extract(apk_path: &Path) -> Result<SigningReport> {
     Ok(report)
 }
 
+/// Complète le rapport du base d'un XAPK avec les signataires de ses splits.
+/// Un split dont la signature est illisible compte comme signataire différent,
+/// avec sa raison dans `anomalies`.
+pub fn add_split_signers(report: &mut SigningReport, splits: &[super::xapk::Split]) {
+    if splits.is_empty() {
+        return;
+    }
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v.dedup();
+        v
+    };
+    let base = sorted(
+        report
+            .certificates
+            .iter()
+            .map(|c| c.fingerprints.sha256.clone())
+            .collect(),
+    );
+    let mut same = !base.is_empty();
+    for split in splits {
+        let cert_sha256 = match extract(&split.source) {
+            Ok(r) => sorted(
+                r.certificates
+                    .into_iter()
+                    .map(|c| c.fingerprints.sha256)
+                    .collect(),
+            ),
+            Err(e) => {
+                let id = &split.id;
+                let why = format!("split {id} : signature illisible ({e:#})");
+                report.anomalies.push(why);
+                Vec::new()
+            }
+        };
+        same &= cert_sha256 == base;
+        report.split_signers.push(SplitSigner {
+            entry: split.entry.clone(),
+            id: split.id.clone(),
+            cert_sha256,
+        });
+    }
+    report.splits_same_signer = Some(same);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // v1 — PKCS#7 dans META-INF/
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn collect_v1(
-    apk_path: &Path,
+    src: &Source,
     report: &mut SigningReport,
     out: &mut Vec<(Vec<u8>, CertSource)>,
 ) -> Result<()> {
-    let file = std::fs::File::open(apk_path)
-        .with_context(|| format!("ouverture {}", apk_path.display()))?;
+    let file = src.reader().with_context(|| format!("ouverture {src}"))?;
     let mut zip = zip::ZipArchive::new(file).context("lecture de l'APK comme zip")?;
 
     let names: Vec<String> = (0..zip.len())
@@ -347,13 +413,12 @@ fn scan_der_certificates(blob: &[u8]) -> Vec<Vec<u8>> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn collect_signing_block(
-    apk_path: &Path,
+    src: &Source,
     report: &mut SigningReport,
     out: &mut Vec<(Vec<u8>, CertSource)>,
 ) -> Result<()> {
-    let mut f = std::fs::File::open(apk_path)
-        .with_context(|| format!("ouverture {}", apk_path.display()))?;
-    let file_len = f.metadata()?.len();
+    let mut f = src.reader().with_context(|| format!("ouverture {src}"))?;
+    let file_len = src.size()?;
 
     let Some(cd_offset) = central_directory_offset(&mut f, file_len)? else {
         anyhow::bail!("EOCD introuvable (archive tronquée ou ZIP64 non géré)");
@@ -431,7 +496,7 @@ fn collect_signing_block(
 }
 
 /// Localise l'offset du *central directory* via l'EOCD.
-fn central_directory_offset(f: &mut std::fs::File, file_len: u64) -> Result<Option<u64>> {
+fn central_directory_offset<R: Read + Seek>(f: &mut R, file_len: u64) -> Result<Option<u64>> {
     let search = EOCD_MAX_SEARCH.min(file_len);
     let start = file_len - search;
     let mut tail = vec![0u8; search as usize];
@@ -867,6 +932,18 @@ pub fn legend() -> String {
     s.push_str("    validity_years     (notAfter - notBefore) / 365,25 j\n");
     s.push_str("  Note : aucune vérification cryptographique n'est faite ; la présence\n");
     s.push_str("  d'un certificat ne signifie pas que la signature est valide.\n");
+    s.push_str("  Splits d'un XAPK (absents pour un APK simple) :\n");
+    s.push_str("    split_signers[]     un par split : entry (nom dans le conteneur),\n");
+    s.push_str("                       id (attribut split de son manifeste), cert_sha256\n");
+    s.push_str("                       (SHA-256 complets de ses certificats, dédoublonnés\n");
+    s.push_str("                       et triés ; vide si sa signature est illisible,\n");
+    s.push_str("                       raison dans anomalies)\n");
+    s.push_str("    splits_same_signer vrai si chaque split a exactement le même ensemble\n");
+    s.push_str("                       de SHA-256 de certificat que le base, ce dernier\n");
+    s.push_str("                       non vide ; faux sinon, y compris pour un split à\n");
+    s.push_str("                       signature illisible. Absent sans split\n");
+    s.push('\n');
+    s.push_str(super::xapk::container_legend());
     s
 }
 

@@ -37,7 +37,7 @@ use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Métrique qui pilote la matrice et le regroupement.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize)]
@@ -161,14 +161,18 @@ fn load(path: &Path, opts: &MatrixOptions) -> Result<Sample> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "?".into());
 
+    // Un XAPK est lu par son base, en mémoire ; `name` reste celui du .xapk.
+    let input = crate::parser::xapk::resolve(path)?;
+    let src = input.source();
+
     // ── Empreintes de méthodes ──
-    let (dex_paths, _tmp) = collect_dex_paths(path)?;
+    let dexes = crate::parser::dex_inputs(src)?;
     let mut opcodes = HashSet::new();
     let mut classes = 0usize;
     let mut methods = 0usize;
 
-    for dp in &dex_paths {
-        let dex = match crate::parser::dex_facade::DexBin::open(dp) {
+    for dp in &dexes {
+        let dex = match crate::parser::dex_facade::DexBin::from_bytes(&dp.bytes, &dp.name) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(sample = %name, error = %e, "dex illisible, ignoré");
@@ -198,8 +202,8 @@ fn load(path: &Path, opts: &MatrixOptions) -> Result<Sample> {
     }
 
     // ── Pool de chaînes, bruit structurel retiré ──
-    let pool = super::dex_strings::extract_any(path)
-        .with_context(|| format!("pool de chaînes de {}", path.display()))?;
+    let pool = super::dex_strings::extract_any(src)
+        .with_context(|| format!("pool de chaînes de {src}"))?;
     let strings: HashSet<String> = pool
         .strings
         .iter()
@@ -369,47 +373,6 @@ fn single_linkage(sim: &[Vec<f64>], samples: &[Sample], threshold: f64) -> Vec<V
     // Les groupes les plus gros d'abord — c'est là qu'est l'information.
     groups.sort_by(|a, b| b.len().cmp(&a.len()).then(a[0].cmp(&b[0])));
     groups
-}
-
-// ── Entrées ──────────────────────────────────────────────────────────────────
-
-fn collect_dex_paths(input: &Path) -> Result<(Vec<PathBuf>, Option<tempfile::TempDir>)> {
-    use std::io::Read;
-
-    let mut magic = [0u8; 4];
-    {
-        let mut f =
-            std::fs::File::open(input).with_context(|| format!("open {}", input.display()))?;
-        if f.read(&mut magic)? < 4 {
-            bail!("{} trop court", input.display());
-        }
-    }
-    if &magic == b"dex\n" {
-        return Ok((vec![input.to_path_buf()], None));
-    }
-    if magic == [0x50, 0x4b, 0x03, 0x04] {
-        let tmp = tempfile::tempdir().context("create tempdir")?;
-        let file = std::fs::File::open(input)?;
-        let mut zip = zip::ZipArchive::new(file).context("read apk as zip")?;
-        let mut paths = Vec::new();
-        for i in 0..zip.len() {
-            let mut entry = zip.by_index(i)?;
-            let name = entry.name().to_string();
-            if !(name.starts_with("classes") && name.ends_with(".dex")) {
-                continue;
-            }
-            let dest = tmp.path().join(name.replace('/', "__"));
-            let mut buf = Vec::with_capacity(entry.size() as usize);
-            entry.read_to_end(&mut buf)?;
-            std::fs::write(&dest, &buf)?;
-            paths.push(dest);
-        }
-        if paths.is_empty() {
-            bail!("aucun classes*.dex dans {}", input.display());
-        }
-        return Ok((paths, Some(tmp)));
-    }
-    bail!("{} n'est ni un DEX ni un APK", input.display())
 }
 
 // ── Rendu ────────────────────────────────────────────────────────────────────
