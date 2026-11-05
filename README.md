@@ -53,7 +53,8 @@ pulls LIEF, a C++ build. Release binaries are built without it.
 - **Tampered archives.** When the `zip` crate refuses an APK (patched
   general-purpose flags, non-standard compression methods, false sizes), a
   tolerant reader takes over (`src/parser/apkzip.rs`). It never activates on a
-  well-formed archive.
+  well-formed archive. Each module that opens the APK on its own wires that
+  fallback at open, entry lookup and read — `parser::dart_snapshot` included.
 
 ## Modes
 
@@ -126,6 +127,54 @@ index: `--native-string-index`.
 It does not execute, emulate or run symbolically; it does not follow `JNIEnv`
 past the first argument of a callee; strings built or decrypted at run time,
 and native code absent from the APK, are invisible.
+
+### Flutter (Dart AOT snapshot)
+
+| Flag | What it answers |
+|---|---|
+| `--dart-snapshot` | for each `lib/<abi>/libapp.so` (or a raw ELF): the four snapshot blobs (`_kDartVmSnapshotData`, `_kDartVmSnapshotInstructions`, `_kDartIsolateSnapshotData`, `_kDartIsolateSnapshotInstructions`) located through `.dynsym`, or by scanning for the snapshot magic when the symbols are gone; the header of each data blob (`version_hash`, `kind`, `features`, `compressed_pointers`), which splits it into a serialized part and a data image; and a **heuristic** enumeration of the `OneByteString` / `TwoByteString` objects of each data image, with a count of rejected candidates per reason. |
+
+Every blob that carries the magic with a coherent header is a data blob
+candidate, examined on its own; it is named after its symbol only when a
+symbol exists (`heuristic` otherwise). Its header bounds it: the serialized
+part is `[magic, magic + length + 4)`, and the data image starts at
+`magic + RoundUp(length + 4, 64)` (`kObjectStartAlignment`, Dart SDK 3.5.0).
+Only the data image is scanned.
+
+The string enumeration needs the object layout of the snapshot's Dart version,
+which changes between SDK releases. It runs only with a layout that has been
+**calibrated** on the sample, or found in the known-versions table
+(`KNOWN_VERSIONS`, empty for now); otherwise `strings` is null with the reason
+(`unsupported_snapshot_version`). It also refuses a symbol-located blob whose
+end is not known (`data_blob_size_unknown`), an empty data image
+(`data_image_empty`) and any layout that fails validation
+(`invalid_heap_layout`).
+
+Calibration infers the layout from strings whose text you already know:
+
+```sh
+drakkar app.apk --dart-snapshot --format json \
+  --dart-calibrate "<known string 1>" --dart-calibrate "<known string 2>" \
+  --dart-calibrate "<known string 3>"
+drakkar app.apk --dart-snapshot --dart-calibrate-file witnesses.txt
+```
+
+Each witness is first counted over the whole ELF section that carries the
+blob, split by zone (`serialized`, `data_image`, `outside`), even when
+calibration cannot run: `data_image_verdict` says whether the witnesses are
+objects of the data image at all (`witnesses_outside_data_image` when none
+is). Inside the data image, Drakkar then looks up to
+64 bytes upstream for an object header whose length field matches the
+witness, and keeps only the layouts that explain **every** witness. When
+`features` says `compressed-pointers` (or `no-compressed-pointers`), the
+width of the length field is taken from it instead of being guessed. It needs
+three witnesses at least (`insufficient_witnesses`), and refuses to choose
+between several surviving layouts (`ambiguous_layout`). A calibrated layout
+wins over the table, and a disagreement between them is reported. On success
+the report carries a ready-to-paste `KnownVersion { … }` literal; Drakkar
+never writes to the table itself. The JSON report carries every accepted
+string by default; `--dart-max-rows N` keeps only the first N, as a deliberate
+preview (`truncated` then says so, `accepted` stays the real count).
 
 ### Enrichment
 
