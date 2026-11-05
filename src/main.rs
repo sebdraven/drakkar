@@ -156,6 +156,35 @@ struct Cli {
     #[arg(long)]
     disasm_full: bool,
 
+    /// Instantané Dart AOT des applications Flutter : localise les quatre blobs
+    /// `_kDart*Snapshot*` de chaque lib/*/libapp.so (par .dynsym, à défaut par
+    /// balayage du magic), lit l'en-tête des blobs de données (version_hash,
+    /// kind, features) qui les découpe en partie sérialisée et image de données,
+    /// puis énumère HEURISTIQUEMENT les chaînes de chaque image de données pour
+    /// les versions connues ou calibrées seulement. Un ELF passé directement
+    /// (reconnu à son magic) est lu seul. Rien n'est extrait. Texte par défaut,
+    /// --format json|both disponible ; --dart-snapshot --legend définit chaque
+    /// champ. Mode single.
+    #[arg(long, conflicts_with_all = ["native", "native_arch"])]
+    dart_snapshot: bool,
+
+    /// (--dart-snapshot) Aperçu : ne rend que les N premières chaînes dans
+    /// strings.entries ; truncated vaut alors true, accepted reste le compte
+    /// réel. 0 = toutes. Défaut 0 : toutes les chaînes sont rendues.
+    #[arg(long, value_name = "N")]
+    dart_max_rows: Option<usize>,
+
+    /// (--dart-snapshot) Témoin de calibration : texte d'une chaîne attendue en
+    /// clair dans l'image de données. Répétable ; trois témoins au moins
+    /// (--dart-snapshot --legend).
+    #[arg(long, value_name = "TEXTE")]
+    dart_calibrate: Vec<String>,
+
+    /// (--dart-snapshot) Témoins depuis un fichier : une chaîne par ligne, lignes
+    /// vides et lignes commençant par `#` ignorées.
+    #[arg(long, value_name = "FICHIER")]
+    dart_calibrate_file: Option<PathBuf>,
+
     /// Extrait toutes les bibliothèques natives (.so ELF) de l'APK — y compris
     /// hors lib/ (assets/libjiagu*.so des packers) — vers --out, puis sort
     /// (mode single). N'exécute pas le pipeline complet.
@@ -548,7 +577,7 @@ struct Cli {
 
     /// Affiche la légende des étiquettes et règles de dérivation, puis sort.
     /// Se combine avec --manifest, --cert, --dating, --enrich, --decompile,
-    /// --bundle, --native ou --capabilities.
+    /// --bundle, --native, --dart-snapshot ou --capabilities.
     #[arg(long)]
     legend: bool,
 
@@ -634,6 +663,18 @@ fn main() -> Result<()> {
             "--native-root, --native-roots et --native-string-index n'ont d'effet qu'avec \
              --native --native-disasm"
         );
+    }
+    let dart_tuning = cli.dart_max_rows.is_some()
+        || !cli.dart_calibrate.is_empty()
+        || cli.dart_calibrate_file.is_some();
+    if dart_tuning && !cli.dart_snapshot {
+        bail!(
+            "--dart-max-rows, --dart-calibrate et --dart-calibrate-file n'ont d'effet qu'avec \
+             --dart-snapshot"
+        );
+    }
+    if cli.dart_calibrate.iter().any(String::is_empty) {
+        bail!("--dart-calibrate : témoin vide");
     }
     if !cli.capabilities_exclude.is_empty() && cli.capabilities.is_none() {
         bail!("--capabilities-exclude n'a d'effet qu'avec --capabilities");
@@ -735,6 +776,54 @@ fn main() -> Result<()> {
         );
         if cli.format.wants_text() {
             print_native(&report, cli.disasm_full);
+        }
+        if cli.format.wants_json() {
+            emit_json(&report, cli.json_out.as_deref())?;
+        }
+        return Ok(());
+    }
+
+    // Sortie rapide : instantané Dart AOT. Ni catalogue MITRE ni moteur de règles.
+    if cli.dart_snapshot {
+        if cli.legend {
+            println!("{}", parser::dart_snapshot::legend());
+            return Ok(());
+        }
+        if cli.format == Format::Csv {
+            bail!("--format csv n'existe pas pour --dart-snapshot : passer --format json ou both");
+        }
+        check_json_dest(cli.format, cli.json_out.as_deref())?;
+        let Some(input) = src else {
+            bail!("--dart-snapshot requiert un APK ou un ELF (mode single)");
+        };
+        let mut witnesses = None;
+        if !cli.dart_calibrate.is_empty() || cli.dart_calibrate_file.is_some() {
+            let mut list = cli.dart_calibrate.clone();
+            if let Some(path) = &cli.dart_calibrate_file {
+                let text = std::fs::read_to_string(path)
+                    .with_context(|| format!("lecture {}", path.display()))?;
+                let lines = text
+                    .lines()
+                    .filter(|l| !l.trim().is_empty() && !l.starts_with('#'));
+                list.extend(lines.map(str::to_string));
+            }
+            witnesses = Some(list);
+        }
+        let options = parser::dart_snapshot::DartOptions {
+            max_rows: cli
+                .dart_max_rows
+                .unwrap_or(parser::dart_snapshot::DEFAULT_MAX_ROWS),
+            witnesses,
+        };
+        let elf = input
+            .as_path()
+            .filter(|p| parser::native_static::is_elf_file(p));
+        let report = match elf {
+            Some(elf) => parser::dart_snapshot::analyze_elf_file(elf, &options)?,
+            None => parser::dart_snapshot::analyze_apk(input, splits, &options)?,
+        };
+        if cli.format.wants_text() {
+            print_dart_snapshot(&report);
         }
         if cli.format.wants_json() {
             emit_json(&report, cli.json_out.as_deref())?;
@@ -1824,6 +1913,158 @@ fn print_native_arch(s: &drakkar::parser::native_arch::NativeArchSummary) {
         for a in &s.anomalies {
             println!("  - {a}");
         }
+    }
+}
+
+/// Affiche l'instantané Dart AOT (mode `--dart-snapshot`), valeurs des chaînes
+/// exclues.
+fn print_dart_snapshot(r: &drakkar::parser::dart_snapshot::DartSnapshotReport) {
+    println!("== Instantané Dart AOT ==\n");
+    println!("SHA-256   {}", r.sha256);
+    println!("Légende   drakkar --dart-snapshot --legend\n");
+    if r.libraries.is_empty() {
+        println!("Aucun lib/*/libapp.so.");
+    }
+    let opt = |v: Option<u64>| v.map_or("null".to_string(), |v| format!("{v:#x}"));
+    let zone = |z: &drakkar::parser::dart_snapshot::ZoneCount| match z.first_offset {
+        Some(at) => format!("{} @{at:#x}", z.count),
+        None => z.count.to_string(),
+    };
+    for lib in &r.libraries {
+        match &lib.split {
+            Some(split) => println!("{split}!{}  {}", lib.path, lib.sha256),
+            None => println!("{}  {}", lib.path, lib.sha256),
+        }
+        if !lib.missing_symbols.is_empty() {
+            println!("  symboles absents : {}", lib.missing_symbols.join(", "));
+        }
+        for s in &lib.sections {
+            println!(
+                "  [{}] {:<34} offset {}  vaddr {:#x}  size {}  section {}",
+                s.blob_index.map_or("null".to_string(), |i| i.to_string()),
+                s.symbol,
+                opt(s.file_offset),
+                s.vaddr,
+                opt(s.size),
+                s.elf_section.as_deref().unwrap_or("null")
+            );
+            if let Some(h) = &s.header {
+                println!(
+                    "    magic {} ({})  kind {}  length {}",
+                    h.magic.as_deref().unwrap_or("null"),
+                    if h.magic_ok { "ok" } else { "inattendu" },
+                    h.kind.as_deref().unwrap_or("null"),
+                    h.length.map_or("null".to_string(), |v| v.to_string())
+                );
+                println!(
+                    "    version_hash {}  ({})",
+                    h.version_hash.as_deref().unwrap_or("null"),
+                    h.known_version.unwrap_or("version inconnue")
+                );
+                println!("    features {}", h.features.as_deref().unwrap_or("null"));
+                let compressed = h
+                    .compressed_pointers
+                    .map_or("null".to_string(), |c| c.to_string());
+                println!("    compressed_pointers {compressed}");
+                if !h.errors.is_empty() {
+                    println!("    erreurs {}", h.errors.join(", "));
+                }
+            }
+            if let Some(span) = &s.serialized {
+                println!(
+                    "    serialized  {:#x}..{:#x}  ({} octets)",
+                    span.start, span.end, span.size
+                );
+            }
+            if let Some(image) = &s.data_image {
+                println!(
+                    "    data_image  {:#x}..{:#x}  ({} octets, fin {}, début aligné sur {} [{}])",
+                    image.start,
+                    image.end,
+                    image.size,
+                    image.end_bound,
+                    image.start_alignment,
+                    image.start_alignment_source
+                );
+            }
+            let Some(scan) = &s.scan else {
+                continue;
+            };
+            if let Some(cal) = &scan.calibration {
+                println!(
+                    "    calibration : {}{}",
+                    cal.outcome,
+                    cal.not_run_reason
+                        .map_or(String::new(), |why| format!(" ({why})"))
+                );
+                println!(
+                    "      zones : {}",
+                    cal.data_image_verdict.unwrap_or("null")
+                );
+                for w in &cal.witnesses {
+                    let seen = w.occurrences.map_or("null".to_string(), |n| n.to_string());
+                    let explained = if w.explained {
+                        "expliqué"
+                    } else {
+                        "non expliqué"
+                    };
+                    println!(
+                        "      {:?}  {}  occurrences {seen}  {explained}",
+                        w.value, w.encoding
+                    );
+                    if let Some(z) = &w.zones {
+                        println!(
+                            "        serialized {}  data_image {}  outside {}",
+                            zone(&z.serialized),
+                            zone(&z.data_image),
+                            zone(&z.outside)
+                        );
+                    }
+                }
+                for inferred in &cal.inferred {
+                    println!("      disposition {:?}", inferred.layout);
+                }
+                if let Some(literal) = &cal.known_version_literal {
+                    println!("{literal}");
+                }
+            }
+            match (&scan.strings, scan.strings_unavailable) {
+                (Some(strings), _) => {
+                    let rejected: u64 = strings.rejected.values().sum();
+                    println!(
+                        "    chaînes (HEURISTIQUE) : {} retenues, {rejected} rejetées sur {} \
+                         candidats",
+                        strings.accepted, strings.candidates
+                    );
+                    println!(
+                        "      disposition {}  borne {}  rendues {} / {}{}",
+                        strings.layout_source,
+                        strings.blob_bound,
+                        strings.entries_returned,
+                        strings.entries_total,
+                        if strings.truncated {
+                            " (coupé : --dart-max-rows)"
+                        } else {
+                            ""
+                        }
+                    );
+                    for (reason, n) in &strings.rejected {
+                        println!("      {reason:<20} {n}");
+                    }
+                }
+                (None, why) => println!("    chaînes : null ({})", why.unwrap_or("null")),
+            }
+        }
+        if let Some(why) = lib.strings_unavailable {
+            println!("  chaînes : null ({why})");
+        }
+        for a in &lib.anomalies {
+            println!("  ! {a}");
+        }
+        println!();
+    }
+    for e in &r.errors {
+        println!("erreur  {e}");
     }
 }
 
