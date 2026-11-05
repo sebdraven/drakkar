@@ -766,31 +766,31 @@ impl Segment {
     }
 }
 
-struct Section {
-    name: String,
-    sh_type: u32,
-    flags: u64,
-    addr: u64,
-    offset: u64,
-    size: u64,
+pub(super) struct Section {
+    pub(super) name: String,
+    pub(super) sh_type: u32,
+    pub(super) flags: u64,
+    pub(super) addr: u64,
+    pub(super) offset: u64,
+    pub(super) size: u64,
 }
 
 impl Section {
-    fn has(&self, flag: u32) -> bool {
+    pub(super) fn has(&self, flag: u32) -> bool {
         self.flags & u64::from(flag) != 0
     }
 
-    fn has_file_data(&self) -> bool {
+    pub(super) fn has_file_data(&self) -> bool {
         self.sh_type != elf::SHT_NOBITS
     }
 }
 
-struct DynSymbol {
-    name: String,
-    defined: bool,
+pub(super) struct DynSymbol {
+    pub(super) name: String,
+    pub(super) defined: bool,
     bind: u8,
-    value: u64,
-    size: u64,
+    pub(super) value: u64,
+    pub(super) size: u64,
     func: bool,
 }
 
@@ -802,13 +802,13 @@ struct Region<'a> {
 
 /// L'ELF tel que le voit le chargeur : octets du fichier, segments, et sections
 /// quand elles sont lisibles.
-struct Image<'a> {
-    data: &'a [u8],
-    ptr_size: u64,
+pub(super) struct Image<'a> {
+    pub(super) data: &'a [u8],
+    pub(super) ptr_size: u64,
     big_endian: bool,
     machine: u16,
     segments: Vec<Segment>,
-    sections: Vec<Section>,
+    pub(super) sections: Vec<Section>,
 }
 
 impl Image<'_> {
@@ -818,7 +818,7 @@ impl Image<'_> {
         self.data.get(start..end)
     }
 
-    fn offset_of(&self, vaddr: u64) -> Option<u64> {
+    pub(super) fn offset_of(&self, vaddr: u64) -> Option<u64> {
         for s in &self.segments {
             if s.p_type == elf::PT_LOAD && s.in_file(vaddr) {
                 return s.offset.checked_add(vaddr - s.vaddr);
@@ -883,18 +883,18 @@ impl Image<'_> {
     }
 }
 
-struct Parsed<'a> {
-    image: Image<'a>,
+pub(super) struct Parsed<'a> {
+    pub(super) image: Image<'a>,
     e_type: u16,
     entry: u64,
     dynamic: Option<Vec<(u64, u64)>>,
-    symbols: Vec<DynSymbol>,
+    pub(super) symbols: Vec<DynSymbol>,
     /// `.symtab`, quand l'ELF n'est pas strippé.
-    local_symbols: Vec<DynSymbol>,
-    anomalies: Vec<String>,
+    pub(super) local_symbols: Vec<DynSymbol>,
+    pub(super) anomalies: Vec<String>,
 }
 
-fn parse_elf(data: &[u8]) -> object::read::Result<Parsed<'_>> {
+pub(super) fn parse_elf(data: &[u8]) -> object::read::Result<Parsed<'_>> {
     if data.get(4) == Some(&elf::ELFCLASS64) {
         parse_with(elf::FileHeader64::<Endianness>::parse(data)?, data)
     } else {

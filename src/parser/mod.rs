@@ -18,6 +18,7 @@ pub mod axml;
 pub mod bundle_archive;
 pub mod capabilities;
 pub mod cert;
+pub mod dart_snapshot;
 pub mod dating;
 pub mod decompile;
 pub mod dex;
