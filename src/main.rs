@@ -1997,10 +1997,7 @@ fn print_dart_snapshot(r: &drakkar::parser::dart_snapshot::DartSnapshotReport) {
                     cal.not_run_reason
                         .map_or(String::new(), |why| format!(" ({why})"))
                 );
-                println!(
-                    "      zones : {}",
-                    cal.data_image_verdict.unwrap_or("null")
-                );
+                println!("      zones : {}", cal.data_image_verdict.unwrap_or("null"));
                 for w in &cal.witnesses {
                     let seen = w.occurrences.map_or("null".to_string(), |n| n.to_string());
                     let explained = if w.explained {

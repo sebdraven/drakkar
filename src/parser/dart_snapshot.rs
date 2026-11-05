@@ -766,7 +766,14 @@ fn inspect(
             continue;
         }
         frame(blob, &mut lib.anomalies);
-        let scan = scan_blob(image.data, blob, known, options, word_size, &mut lib.anomalies);
+        let scan = scan_blob(
+            image.data,
+            blob,
+            known,
+            options,
+            word_size,
+            &mut lib.anomalies,
+        );
         blob.section.scan = Some(scan);
     }
     if !blobs.iter().any(|b| b.section.scan.is_some()) {
@@ -795,8 +802,7 @@ fn index_blobs(blobs: &mut [Blob]) {
 /// `Snapshot::DataImage()` = magic + RoundUp(length(), kObjectStartAlignment),
 /// jusqu'à la fin du blob.
 fn frame(blob: &mut Blob, anomalies: &mut Vec<String>) {
-    let (Some(range), Some(header), Some(bound)) =
-        (&blob.range, &blob.section.header, blob.bound)
+    let (Some(range), Some(header), Some(bound)) = (&blob.range, &blob.section.header, blob.bound)
     else {
         return;
     };
@@ -2976,7 +2982,11 @@ mod tests {
     /// [0x40, 0xb0), image de données [0xc0, 0x200).
     fn zoned_section(writes: &[(usize, &str)]) -> Vec<u8> {
         let mut data = vec![0u8; 0x200];
-        place(&mut data, 0x40, &blob_with_length(0x6c, 2, HASH.as_bytes(), b"\0"));
+        place(
+            &mut data,
+            0x40,
+            &blob_with_length(0x6c, 2, HASH.as_bytes(), b"\0"),
+        );
         for &(at, text) in writes {
             place(&mut data, at, text.as_bytes());
         }
@@ -2986,7 +2996,11 @@ mod tests {
     #[test]
     fn header_bounds_serialized_part_and_data_image() {
         let mut data = vec![0u8; 0x200];
-        place(&mut data, 0x48, &blob_with_length(0x6c, 2, HASH.as_bytes(), b"\0"));
+        place(
+            &mut data,
+            0x48,
+            &blob_with_length(0x6c, 2, HASH.as_bytes(), b"\0"),
+        );
         let blobs = heuristics(&data, &section_at(0, 0x200));
         assert_eq!(blobs.len(), 1);
         let s = &blobs[0].section;
@@ -3108,19 +3122,31 @@ mod tests {
         let cal = scan.calibration.unwrap();
 
         let alpha = zones_of(&cal, "alpha");
-        let counts = (alpha.serialized.count, alpha.data_image.count, alpha.outside.count);
+        let counts = (
+            alpha.serialized.count,
+            alpha.data_image.count,
+            alpha.outside.count,
+        );
         assert_eq!(counts, (1, 0, 0));
         assert_eq!(alpha.serialized.first_offset, Some(0x90));
         assert_eq!(alpha.data_image.first_offset, None);
         assert_eq!(alpha.outside.first_offset, None);
 
         let beta = zones_of(&cal, "beta");
-        let counts = (beta.serialized.count, beta.data_image.count, beta.outside.count);
+        let counts = (
+            beta.serialized.count,
+            beta.data_image.count,
+            beta.outside.count,
+        );
         assert_eq!(counts, (0, 1, 0));
         assert_eq!(beta.data_image.first_offset, Some(0x100));
 
         let gamma = zones_of(&cal, "gamma");
-        let counts = (gamma.serialized.count, gamma.data_image.count, gamma.outside.count);
+        let counts = (
+            gamma.serialized.count,
+            gamma.data_image.count,
+            gamma.outside.count,
+        );
         assert_eq!(counts, (0, 0, 2));
         assert_eq!(gamma.outside.first_offset, Some(0x10));
 
@@ -3129,7 +3155,10 @@ mod tests {
             .iter()
             .map(|w| (w.occurrences, w.occurrences_examined))
             .collect();
-        assert_eq!(seen, vec![(Some(1), Some(0)), (Some(1), Some(1)), (Some(2), Some(0))]);
+        assert_eq!(
+            seen,
+            vec![(Some(1), Some(0)), (Some(1), Some(1)), (Some(2), Some(0))]
+        );
         assert_eq!(cal.witnesses_found, Some(3));
         assert_eq!(cal.witnesses_in_data_image, Some(1));
         assert_eq!(cal.data_image_verdict, Some(VERDICT_PARTLY_IN_DATA_IMAGE));
@@ -3211,14 +3240,24 @@ mod tests {
         let data = snapshot_with_strings();
         let options = calibrating(&["hello", "world!", "flutter"]);
         let known = table(KindLayout::WithFullCore);
-        let (scan, _) = run(&symbol_blob(&data, BOUND_SECTION_END), &data, &known, &options);
+        let (scan, _) = run(
+            &symbol_blob(&data, BOUND_SECTION_END),
+            &data,
+            &known,
+            &options,
+        );
         assert_eq!(scan.strings, None);
         assert_eq!(scan.strings_unavailable, Some(DATA_BLOB_SIZE_UNKNOWN));
         let cal = scan.calibration.unwrap();
         assert_eq!(cal.outcome, NOT_RUN);
         assert_eq!(cal.not_run_reason, Some(DATA_BLOB_SIZE_UNKNOWN));
         assert_eq!(cal.data_image_verdict, Some(VERDICT_ALL_IN_DATA_IMAGE));
-        let (scan, _) = run(&symbol_blob(&data, BOUND_NEXT_SYMBOL), &data, &known, &options);
+        let (scan, _) = run(
+            &symbol_blob(&data, BOUND_NEXT_SYMBOL),
+            &data,
+            &known,
+            &options,
+        );
         assert_eq!(scan.strings.unwrap().blob_bound, BOUND_NEXT_SYMBOL);
     }
 
