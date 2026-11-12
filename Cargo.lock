@@ -766,7 +766,7 @@ dependencies = [
 [[package]]
 name = "dex-decompiler"
 version = "0.1.0"
-source = "git+https://github.com/sebdraven/dex-decompiler?rev=b1e8ac3510dc2964cb8b607079bb6c610f21a3f2#b1e8ac3510dc2964cb8b607079bb6c610f21a3f2"
+source = "git+https://github.com/sebdraven/dex-decompiler?rev=29fdb75b196c5c1b1dc1fcd40b4be6fcead15864#29fdb75b196c5c1b1dc1fcd40b4be6fcead15864"
 dependencies = [
  "anyhow",
  "apkparser",
