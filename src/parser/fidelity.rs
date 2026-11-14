@@ -1369,7 +1369,7 @@ fn method_defects(dir: &Path, ids: &BTreeSet<usize>) -> Result<BTreeMap<MethodKe
                 defects
                     .entry("syntax_errors".to_string())
                     .or_default()
-                    .extend(std::iter::repeat((None, None)).take(row.syntax_errors));
+                    .extend(std::iter::repeat_n((None, None), row.syntax_errors));
             }
         }
     }
