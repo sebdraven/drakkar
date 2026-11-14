@@ -204,25 +204,25 @@ impl MethodFacts {
 /// StringBuilder repliée en `+`, null-checks et boxing de littéraux retirés,
 /// switch sur chaîne (hashCode, equals) et sur énumération (ordinal) restaurés.
 fn rewritten_call(owner: &str, name: &str) -> bool {
-    match (owner, name) {
+    matches!(
+        (owner, name),
         ("Ljava/lang/StringBuilder;", "append" | "toString")
-        | ("Ljava/util/Objects;", "requireNonNull")
-        | (
-            "Lkotlin/jvm/internal/Intrinsics;",
-            "checkNotNull" | "checkNotNullParameter" | "checkNotNullExpressionValue",
-        )
-        | ("Ljava/lang/String;", "hashCode" | "equals")
-        | (_, "ordinal") => true,
-        (
-            "Ljava/lang/Integer;"
-            | "Ljava/lang/Long;"
-            | "Ljava/lang/Boolean;"
-            | "Ljava/lang/Double;"
-            | "Ljava/lang/Float;",
-            "valueOf",
-        ) => true,
-        _ => false,
-    }
+            | ("Ljava/util/Objects;", "requireNonNull")
+            | (
+                "Lkotlin/jvm/internal/Intrinsics;",
+                "checkNotNull" | "checkNotNullParameter" | "checkNotNullExpressionValue",
+            )
+            | ("Ljava/lang/String;", "hashCode" | "equals")
+            | (_, "ordinal")
+            | (
+                "Ljava/lang/Integer;"
+                    | "Ljava/lang/Long;"
+                    | "Ljava/lang/Boolean;"
+                    | "Ljava/lang/Double;"
+                    | "Ljava/lang/Float;",
+                "valueOf",
+            )
+    )
 }
 
 /// `(clé, cible relative en unités de 16 bits)` du payload d'un switch 31t.
