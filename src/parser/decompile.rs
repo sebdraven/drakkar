@@ -10,6 +10,7 @@ use crate::parser::diff_dex::opcode_fingerprint;
 use crate::parser::diff_matrix::is_application_class;
 use crate::parser::disasm::{self, ClassDisasm, DisasmReport, Insn, MethodDisasm};
 use crate::parser::dyn_entrypoints::InputKind;
+use crate::parser::fidelity::{self, MethodFacts, MethodSpan, Suspect};
 use crate::parser::source::Source;
 use anyhow::{bail, Context, Result};
 use dex_decompiler::java::descriptor_to_java;
@@ -84,6 +85,9 @@ pub struct ClassEntry {
     pub rules_path: Vec<String>,
     pub decompile_status: Status,
     pub class_java: ClassJavaStatus,
+    /// Méthodes ayant au moins un `suspect` ou une erreur de syntaxe.
+    pub suspect_methods: usize,
+    pub syntax_errors_outside_methods: usize,
 }
 
 /// Une entrée de `classes/<id>.json`.
@@ -99,6 +103,9 @@ pub struct MethodRecord {
     pub error: Option<String>,
     pub java_lines: Option<[usize; 2]>,
     pub dasm_lines: Option<[usize; 2]>,
+    /// Nœuds ERROR et MISSING de tree-sitter-java dans `java_lines`.
+    pub syntax_errors: usize,
+    pub suspect: Vec<Suspect>,
 }
 
 #[derive(Debug, Serialize)]
@@ -176,6 +183,8 @@ pub struct Decompiled {
     pub static_values: Vec<StaticValue>,
     pub stats: Stats,
     pub errors: Vec<BundleError>,
+    /// Compteurs de `fidelity.json`.
+    pub fidelity: fidelity::Totals,
 }
 
 /// Version de la structure du bundle, incrémentée à toute modification
@@ -350,6 +359,7 @@ pub fn decompile_all(input: &Input, dir: &Path) -> Decompiled {
             }
             out.static_values.extend(o.statics);
             out.errors.extend(o.errors);
+            out.fidelity.merge(&o.fidelity);
             out.classes.push(o.entry);
         }
     }
@@ -524,6 +534,7 @@ struct Rendered {
     methods: Vec<MethodRecord>,
     statics: Vec<StaticValue>,
     errors: Vec<BundleError>,
+    syntax_errors_outside_methods: usize,
 }
 
 struct ClassOutcome {
@@ -531,6 +542,7 @@ struct ClassOutcome {
     statuses: Vec<Status>,
     statics: Vec<StaticValue>,
     errors: Vec<BundleError>,
+    fidelity: fidelity::Totals,
 }
 
 type Job<'a> = (usize, u32, Result<DexClass<'a>>);
@@ -659,6 +671,7 @@ fn process_class<'a>(
         methods,
         statics,
         errors: render_errors,
+        syntax_errors_outside_methods,
     } = rendered.unwrap_or_default();
     errors.extend(render_errors);
     let class_java = whole_class(ctx, dec, idx);
@@ -682,6 +695,15 @@ fn process_class<'a>(
         ));
     }
     let statuses: Vec<Status> = methods.iter().map(|m| m.decompile_status).collect();
+    let mut totals = fidelity::Totals::default();
+    for m in &methods {
+        totals.add_method(m.java_lines.is_some(), m.syntax_errors, &m.suspect);
+    }
+    totals.add_outside(syntax_errors_outside_methods);
+    let suspect_methods = methods
+        .iter()
+        .filter(|m| m.syntax_errors > 0 || !m.suspect.is_empty())
+        .count();
     let decompile_status = if failed {
         Status::Failed
     } else {
@@ -703,10 +725,13 @@ fn process_class<'a>(
             } else {
                 ClassJavaStatus::Failed
             },
+            suspect_methods,
+            syntax_errors_outside_methods,
         },
         statuses,
         statics,
         errors,
+        fidelity: totals,
     }
 }
 
@@ -744,6 +769,7 @@ fn render_class<'a>(
     let mut java_line = 0usize;
     let mut dasm_methods = Vec::new();
     let mut dasm_slots = Vec::with_capacity(class.methods.len());
+    let mut facts: Vec<MethodFacts> = Vec::with_capacity(class.methods.len());
     let mut codeless = 0usize;
 
     for (k, m) in class.methods.iter().enumerate() {
@@ -759,10 +785,12 @@ fn render_class<'a>(
         let mut insns_count = None;
         let mut fingerprint = None;
         let mut slot = None;
+        let mut method_facts = MethodFacts::default();
         match &m.code {
             None => codeless += 1,
             Some(code) => match dex_bytecode::decode_all(code.insns, 0) {
                 Ok(instructions) => {
+                    method_facts = MethodFacts::from_code(&dex.bin, code, &instructions);
                     let fp = opcode_fingerprint(&instructions);
                     insns_count = Some(instructions.len());
                     fingerprint = Some(format!("{fp:016x}"));
@@ -794,6 +822,7 @@ fn render_class<'a>(
             },
         }
         dasm_slots.push(slot);
+        facts.push(method_facts);
 
         let outcome = match (enc, dec.as_ref()) {
             (Some(enc), Some(d)) => guarded(|| d.decompile_method(enc, simple_arg, class_arg)),
@@ -859,7 +888,12 @@ fn render_class<'a>(
             error,
             java_lines,
             dasm_lines: None,
+            syntax_errors: 0,
+            suspect: Vec::new(),
         });
+    }
+    if id.is_some() {
+        fidelity_pass(&mut out, &dex.bin, &dex.name, class, id, &facts);
     }
 
     let sizes: Vec<usize> = dasm_methods.iter().map(|m| m.insns.len()).collect();
@@ -920,6 +954,59 @@ fn render_class<'a>(
         )),
     }
     out
+}
+
+/// Banc de fidélité sur le Java de la classe (bundle seulement) : remplit
+/// `syntax_errors` et `suspect` de chaque méthode. Un échec part dans
+/// errors.json, stage fidelity, et laisse les compteurs à zéro.
+fn fidelity_pass(
+    out: &mut Rendered,
+    bin: &DexBin,
+    dex_name: &str,
+    class: &DexClass<'_>,
+    id: Option<usize>,
+    facts: &[MethodFacts],
+) {
+    let fields: std::collections::HashSet<String> = match bin.field_names(class) {
+        Ok(names) => names.into_iter().collect(),
+        Err(e) => {
+            out.errors.push(BundleError::in_class(
+                "fidelity",
+                dex_name,
+                id,
+                Some(class.descriptor),
+                format!("champs illisibles, undefined_var sans eux : {e:#}"),
+            ));
+            Default::default()
+        }
+    };
+    let spans: Vec<MethodSpan<'_>> = out
+        .methods
+        .iter()
+        .zip(&class.methods)
+        .zip(facts)
+        .map(|((record, m), facts)| MethodSpan {
+            name: m.name,
+            java_lines: record.java_lines,
+            facts,
+        })
+        .collect();
+    match fidelity::analyze_class(&out.java, &spans, &fields) {
+        Ok(found) => {
+            out.syntax_errors_outside_methods = found.syntax_errors_outside_methods;
+            for (record, m) in out.methods.iter_mut().zip(found.methods) {
+                record.syntax_errors = m.syntax_errors;
+                record.suspect = m.suspect;
+            }
+        }
+        Err(e) => out.errors.push(BundleError::in_class(
+            "fidelity",
+            dex_name,
+            id,
+            Some(class.descriptor),
+            format!("{e:#}"),
+        )),
+    }
 }
 
 fn encoded_members(file: &DexFile, idx: u32) -> Result<(Vec<EncodedMethod>, Vec<u32>)> {
@@ -1156,6 +1243,8 @@ Arborescence : OUT/<sha256 complet de l'entrée>/
   dyn_entrypoints.tsv  Sortie de --dyn-entrypoints, colonnes ci-dessous. En-tête
                        seul si l'extraction échoue.
   index.json           Une entrée par classe.
+  fidelity.json        Banc de fidélité : défauts détectés dans le Java,
+                       totalisés (Fidélité du Java, plus bas).
   errors.json          Tout échec, une entrée chacun. Rien n'est omis en silence.
   classes/<id>.java    Java, méthode par méthode.
   classes/<id>.class.java
@@ -1258,6 +1347,14 @@ index.json — une entrée par classe, dans l'ordre des DEX puis des class_defs
   class_java       ok | failed : issue de decompile_class, donc présence ou
                    absence de classes/<id>.class.java. Indépendant de
                    decompile_status.
+  suspect_methods  Nombre de méthodes de la classe dont syntax_errors > 0 ou
+                   suspect non vide (Fidélité du Java).
+  syntax_errors_outside_methods
+                   Nœuds ERROR et MISSING de classes/<id>.java hors des
+                   java_lines de toute méthode : une méthode qui déborde de
+                   ses bornes, ou une classe dont aucune méthode n'est lisible.
+  has_suspect      N'est PAS un champ : c'est le filtre suspect_methods > 0,
+                   comme has_rules_direct est le filtre rules_direct non vide.
 
 classes/<id>.json — une entrée par méthode : direct puis virtual, ordre du DEX
   signature        Lowner;->nom(params)retour, types exacts.
@@ -1284,6 +1381,15 @@ classes/<id>.json — une entrée par méthode : direct puis virtual, ordre du D
                    méthode, puis ses instructions. null sans code, si le
                    décodage échoue, ou si le .dasm ne suit pas le gabarit de
                    --disasm (errors.json, stage disasm).
+  syntax_errors    Nœuds ERROR et MISSING que tree-sitter-java pose dans
+                   java_lines. 0 quand java_lines est null.
+  suspect          [{kind, line, detail?}] : défauts détectés dans le Java de
+                   la méthode, line = ligne dans classes/<id>.java. kind : voir
+                   Fidélité du Java. Vide quand java_lines est null.
+    detail         Présent pour lost_call (nom de la méthode appelée) et
+                   lost_string (la chaîne, en clair) ; absent sinon. Une
+                   chaîne de plus de 120 caractères est coupée et suivie de
+                   `… [tronquée, N caractères]`.
 
 decompile_status
   ok       decompile_method de dex-decompiler a rendu du Java sans erreur et
@@ -1329,6 +1435,146 @@ classes/<id>.class.java
 classes/<id>.dasm
   Rendu de --disasm pour la classe seule, valeurs statiques comprises sous
   l'en-tête. Une méthode dont le code ne se décode pas n'y figure pas.
+
+Fidélité du Java — banc de mesure du décompilateur
+  classes/<id>.java est relu par tree-sitter-java (grammaire tolérante),
+  enveloppé dans une classe factice ouverte sur sa première ligne, donc sans
+  décaler la numérotation. Une méthode de classes/<id>.json y est retrouvée
+  par ses java_lines (écrites par Drakkar), contrôlée par son nom : <init> ↔
+  constructeur, <clinit> ↔ bloc static, sinon le nom de la déclaration. Une
+  déclaration introuvable ou d'un autre nom : syntax_errors est compté, suspect
+  reste vide. Les détecteurs sont SYNTAXIQUES : ils signalent un Java
+  suspect, ils ne prouvent rien sur le bytecode. Aucun ne suit la portée des
+  blocs : un nom est « déclaré » s'il l'est n'importe où dans la méthode.
+  kind
+    literal_receiver   L'objet d'un appel ou d'un accès de champ est un
+                       littéral numérique, null, true, false ou un caractère,
+                       entre parenthèses ou non (`0.x`, `null.f()`). Un
+                       littéral chaîne n'est pas suspect (`\"RESP:\".concat(s)`).
+                       Repère aussi `2131230978.edit()`, que la grammaire lit
+                       comme le flottant `2131230978.` collé à `edit`. Limite :
+                       un littéral casté (`((T) 0).f()`) n'est pas vu.
+    undefined_var      Identifiant lu ou écrit comme variable (argument,
+                       opérande, valeur, condition, indice, return…), jamais
+                       suivi de `.`, qui n'est ni un paramètre, ni une locale
+                       (déclaration, for, catch, try-with-resources, lambda,
+                       motif instanceof), ni un champ déclaré par la classe
+                       (lu dans le class_data du DEX). Faux positifs attendus :
+                       champ hérité d'une superclasse écrit sans this., champ
+                       d'une classe englobante, constante importée en static.
+    dead_after_return  Instruction qui suit return, throw, break ou continue
+                       dans le même bloc (ou le même groupe de case). Une seule
+                       par bloc : la première. Faux positif : aucun connu en
+                       Java valide, où ce code ne compile pas.
+    type_mismatch      Locale de type primitif initialisée ou réaffectée par
+                       une chaîne, une concaténation contenant une chaîne, ou
+                       null ; ou String initialisée par un nombre ou un
+                       booléen. Une variable vaut chaîne si elle est déclarée
+                       String ou reçoit un littéral chaîne quelque part dans la
+                       méthode (`int s3_r0 = s3 + s5` avec `s3 = \"x\"`). Limite :
+                       un appel qui rend String n'est pas typé.
+    null_on_primitive  `== null` / `!= null` dont l'autre opérande est une
+                       locale ou un paramètre déclaré de type primitif dans la
+                       méthode (`if (length == null)` avec `int length`).
+    invalid_ident      Identifiant commençant par un chiffre : la grammaire le
+                       lit comme un nombre collé à un identifiant (`2abc`).
+    empty_handler      catch vide (sans instruction, commentaires ignorés)
+                       alors que le handler du bytecode porte une instruction
+                       autre que move-exception, nop, goto ou return-void avant
+                       le premier saut. Handler désigné par le commentaire
+                       `// handler at code unit N` que dex-decompiler écrit
+                       dans son repli ; sans lui, tous les handlers de même
+                       type (nom simple ; Throwable ↔ catch-all) doivent porter
+                       du code. Limites : sans commentaire, rapprochement par
+                       type, pas par try ; un catch vide sur un type que le
+                       bytecode n'attrape pas n'est pas signalé.
+    switch_case_lost   case dont le groupe n'a pas de corps (vide ou break
+                       seul) alors que, dans les packed-switch / sparse-switch
+                       de la méthode, chaque cible de cette valeur porte du code
+                       (autre que nop puis goto ou return-void) et n'est pas la
+                       sortie par défaut. Rapprochement par la valeur du case :
+                       entiers et caractères seulement — un switch sur chaîne
+                       (hashCode) ou sur énumération (ordinal) n'est pas
+                       comparé. Limite : deux switch de la même méthode qui
+                       partagent une valeur sont confondus.
+  Les deux kinds suivants mesurent ce que le Java a PERDU du bytecode, pas ce
+  qu'il a de faux. Un suspect par élément perdu, à la première ligne de la
+  méthode (java_lines[0]), l'élément dans detail. Les méthodes et chaînes
+  apportées par une lambda ou une classe anonyme inlinée ne masquent rien :
+  seul ce qui MANQUE compte.
+    lost_call          Nom simple d'une méthode appelée par un invoke-* du
+                       bytecode (cible résolue comme dans --disasm) qui
+                       n'apparaît comme nom d'appel (method_invocation) ou de
+                       référence de méthode (A::m) nulle part dans le Java de
+                       la méthode. Exclus : <init> et <clinit> (un
+                       constructeur s'écrit new T(…), super(…), this(…)), et
+                       les appels que dex-decompiler fait disparaître en
+                       réécrivant : StringBuilder.append / toString (repliés
+                       en +), Objects.requireNonNull et Intrinsics.checkNotNull*
+                       (retirés), valueOf de Integer, Long, Boolean, Double,
+                       Float (boxing de littéral retiré), String.hashCode et
+                       String.equals (switch sur chaîne restauré), ordinal
+                       (switch sur énumération restauré). Un invoke-custom
+                       (lambda) n'a pas de cible nommée : non compté. BORNE
+                       BASSE : comparaison par nom seul, donc une surcharge, ou
+                       deux appels distincts du même nom, ne comptent qu'une
+                       fois, et un appel perdu dont le nom survit ailleurs dans
+                       la méthode n'est pas vu ; les exclusions masquent aussi
+                       les vraies pertes de ces appels.
+    lost_string        Littéral const-string (ou /jumbo) non vide du bytecode
+                       qu'aucun littéral chaîne du Java de la méthode ne
+                       contient, échappements Java décodés (\\n, \\t, \\\", \\\\,
+                       octal, \\uXXXX). Une chaîne qui ne subsiste que par son
+                       hashCode (switch sur chaîne non restauré) compte comme
+                       perdue : c'est un vrai défaut de lisibilité. Limites :
+                       recherche par inclusion, donc une chaîne perdue contenue
+                       dans une autre chaîne de la méthode n'est pas vue ; un
+                       bloc de texte (\"\"\") n'est pas désindenté ; la même
+                       chaîne chargée deux fois ne compte qu'une fois — borne
+                       basse.
+  syntax_errors et suspect sont dans classes/<id>.json par méthode ;
+  suspect_methods et syntax_errors_outside_methods dans index.json par classe.
+
+fidelity.json
+  sha256           SHA-256 complet de l'entrée, comme bundle.json.
+  decompiler       {crate, rev}, repris de bundle.json.
+  methods_total    Méthodes de tous les classes/<id>.json.
+  methods_analyzed Méthodes dont le Java a été relu (java_lines non null).
+  methods_clean    Méthodes relues sans suspect ni erreur de syntaxe. Une
+                   méthode failed n'est jamais propre.
+  syntax_errors_total
+                   Somme des syntax_errors des méthodes et des
+                   syntax_errors_outside_methods des classes.
+  syntax_errors_outside_methods
+                   Somme des syntax_errors_outside_methods.
+  methods_with_loss
+                   Méthodes ayant au moins un lost_call ou un lost_string.
+                   Absent d'un fidelity.json antérieur à ces kinds :
+                   --bench-diff le lit alors comme 0.
+  suspect          {kind: total}, chaque kind présent, même à 0.
+  Une classe que le banc n'a pas pu relire (errors.json, stage fidelity)
+  compte ses méthodes sans défaut : vérifier errors.json avant de conclure.
+
+--bench-diff A B
+  A et B : deux répertoires OUT/<sha256> de la MÊME entrée, produits par deux
+  révisions de dex-decompiler. Refus si leurs fidelity.json ne portent pas le
+  même sha256 ; avertissement [AVERT], sans refus, si decompiler.rev est le
+  même. Ne lit que fidelity.json, index.json et les classes/<id>.json des
+  classes dont suspect_methods > 0 d'un côté ou de l'autre ; ni APK, ni
+  catalogue MITRE, ni moteur de règles.
+  Sortie texte : tableau kind | A | B | écart, plus syntax_errors (total),
+  methods_clean et methods_with_loss ; puis Régressions (méthodes qui gagnent
+  des défauts d'un kind, lignes et detail dans B) et Corrections (qui en
+  perdent, lignes et detail dans A). syntax_errors y figure comme un kind sans
+  ligne. Méthodes rapprochées par id de classe + nom + descripteur : deux
+  bundles d'une même entrée ont les mêmes id. Un kind est comparé en NOMBRE :
+  une méthode qui perd g au lieu de f ne change pas. --format json : {sha256,
+  rev_a, rev_b, same_rev, counters: [{counter, a, b, delta}], regressions et
+  corrections: [{class_id, method, descriptor, kind, a, b, lines, details?}],
+  worse}.
+  Code de sortie : 0 si aucun compteur de défauts ne monte, ni
+  methods_with_loss, et que methods_clean ne baisse pas ; 1 sinon ; 2 en cas
+  d'erreur d'usage (fidelity.json absent, entrées différentes, JSON illisible).
 
 strings.json
   pool             Une entrée par DEX : {dex, declared, unreadable, strings}.
@@ -1376,6 +1622,7 @@ errors.json — {stage, dex, class_id, target, error}
            decompile_class : decompile_class a échoué, pas de .class.java ;
            disasm : décodage d'une méthode, ou .dasm hors gabarit ;
            static_values : valeur statique non attribuable à un champ ;
+           fidelity : banc de fidélité, Java non relu ou champs illisibles ;
            write : écriture d'un fichier de classes/ ;
            manifest, cert, dating, rules, strings, dyn_entrypoints : la partie
            du même nom.
