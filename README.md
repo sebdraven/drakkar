@@ -101,6 +101,7 @@ pulls LIEF, a C++ build. Release binaries are built without it.
 | `--diff-explain A B` | what actually differs in the resolved operands of matched methods (string, method target, type, real or renamed field). |
 | `--diff-strings A B` | what differs in the string pools — where `static final` values, C2 endpoints included, live. |
 | `--diff-matrix DIR` | all-against-all similarity over a directory, each sample parsed once, plus single-linkage groups (`--matrix-metric opcodes\|strings`). |
+| `--bench-diff A B` | did a new dex-decompiler revision make the Java better or worse? Compares the defect counters of two bundles of the same input; exit code 1 when one gets worse. See Bundle. |
 
 The `--*-normalize FROM=TO` options rewrite descriptors before matching, so two
 lots built under different namespaces (`com/duiyun=com/dy`) are compared on
@@ -227,7 +228,26 @@ hand to an import service. Two bundles of the same input still differ, through
 is replaced with `--archive` and deleted without, so it never outlives the
 bundle it was made from.
 
-`drakkar --bundle --legend` defines every file and field.
+Every method's Java is read back by tree-sitter-java: `classes/<id>.json`
+records its syntax errors and its suspect constructs (`suspect`: literal
+receiver, undefined variable, dead code after return, type mismatch, null
+compared to a primitive, identifier starting with a digit, empty catch over a
+non-empty handler, switch case lost), `index.json` counts the suspect methods
+per class, and `fidelity.json` totals them. The detectors are syntactic: they
+flag, they do not prove.
+
+```sh
+drakkar --bench-diff bundles-rev1/<sha256> bundles-rev2/<sha256> [--format json]
+```
+
+compares two bundles of the same input built with two dex-decompiler
+revisions: a kind | A | B | delta table, then the methods that gain a defect
+(regressions) and those that lose one (corrections). It exits 0 when no
+counter gets worse, 1 when a defect counter rises or `methods_clean` drops, 2
+on a usage error (different inputs, missing `fidelity.json`).
+
+`drakkar --bundle --legend` defines every file and field, each defect kind
+with its known false positives, and `--bench-diff`.
 
 ## Rules
 
