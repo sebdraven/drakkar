@@ -214,8 +214,11 @@ fn rewritten_call(owner: &str, name: &str) -> bool {
         | ("Ljava/lang/String;", "hashCode" | "equals")
         | (_, "ordinal") => true,
         (
-            "Ljava/lang/Integer;" | "Ljava/lang/Long;" | "Ljava/lang/Boolean;"
-            | "Ljava/lang/Double;" | "Ljava/lang/Float;",
+            "Ljava/lang/Integer;"
+            | "Ljava/lang/Long;"
+            | "Ljava/lang/Boolean;"
+            | "Ljava/lang/Double;"
+            | "Ljava/lang/Float;",
             "valueOf",
         ) => true,
         _ => false,
@@ -356,7 +359,11 @@ fn losses(decl: Node<'_>, src: &[u8], facts: &MethodFacts, line: usize) -> Vec<S
                 }
             }
             "method_reference" => {
-                if let Some(name) = named_children(n).into_iter().rev().find(|c| c.kind() == "identifier") {
+                if let Some(name) = named_children(n)
+                    .into_iter()
+                    .rev()
+                    .find(|c| c.kind() == "identifier")
+                {
                     called.insert(text(name, src));
                 }
             }
@@ -393,7 +400,10 @@ fn losses(decl: Node<'_>, src: &[u8], facts: &MethodFacts, line: usize) -> Vec<S
 /// (ou `"""` d'un bloc de texte) retirés, échappements décodés. Un bloc de
 /// texte n'est pas désindenté.
 fn java_string_value(literal: &str) -> Option<String> {
-    let body = match literal.strip_prefix("\"\"\"").and_then(|s| s.strip_suffix("\"\"\"")) {
+    let body = match literal
+        .strip_prefix("\"\"\"")
+        .and_then(|s| s.strip_suffix("\"\"\""))
+    {
         Some(block) => block.strip_prefix('\n').unwrap_or(block),
         None => literal.strip_prefix('"')?.strip_suffix('"')?,
     };
@@ -518,11 +528,16 @@ fn analyze_method(
                 if let Some(ty) = ty {
                     types.insert(name, text(ty, src));
                 }
-                if n.child_by_field_name("value").is_some_and(is_string_literal) {
+                if n.child_by_field_name("value")
+                    .is_some_and(is_string_literal)
+                {
                     strings.insert(name);
                 }
             }
-            "formal_parameter" | "catch_formal_parameter" | "resource" | "enhanced_for_statement"
+            "formal_parameter"
+            | "catch_formal_parameter"
+            | "resource"
+            | "enhanced_for_statement"
             | "instanceof_expression" => {
                 let Some(name) = n.child_by_field_name("name") else {
                     continue;
@@ -652,8 +667,10 @@ fn analyze_method(
                 if operator(n, src) != Some("=") {
                     continue;
                 }
-                let (Some(l), Some(r)) = (n.child_by_field_name("left"), n.child_by_field_name("right"))
-                else {
+                let (Some(l), Some(r)) = (
+                    n.child_by_field_name("left"),
+                    n.child_by_field_name("right"),
+                ) else {
                     continue;
                 };
                 if l.kind() != "identifier" {
@@ -669,8 +686,10 @@ fn analyze_method(
                 if !matches!(operator(n, src), Some("==" | "!=")) {
                     continue;
                 }
-                let (Some(l), Some(r)) = (n.child_by_field_name("left"), n.child_by_field_name("right"))
-                else {
+                let (Some(l), Some(r)) = (
+                    n.child_by_field_name("left"),
+                    n.child_by_field_name("right"),
+                ) else {
                     continue;
                 };
                 let (l, r) = (unparen(l), unparen(r));
@@ -724,7 +743,11 @@ fn analyze_method(
 
     // `2131230978.edit()` se lit comme le flottant `2131230978.` suivi de
     // `edit` ; `2abc`, comme l'entier `2` suivi de `abc`.
-    let leaves: Vec<Node<'_>> = nodes.iter().copied().filter(|n| n.child_count() == 0).collect();
+    let leaves: Vec<Node<'_>> = nodes
+        .iter()
+        .copied()
+        .filter(|n| n.child_count() == 0)
+        .collect();
     for w in leaves.windows(2) {
         let (num, next) = (w[0], w[1]);
         if !NUMERIC_LITERALS.contains(&num.kind())
@@ -836,7 +859,9 @@ fn case_value(n: Node<'_>, src: &[u8]) -> Option<i64> {
                 "\\'" => '\'',
                 "\\\"" => '"',
                 "\\\\" => '\\',
-                s if s.starts_with("\\u") => char::from_u32(u32::from_str_radix(&s[2..], 16).ok()?)?,
+                s if s.starts_with("\\u") => {
+                    char::from_u32(u32::from_str_radix(&s[2..], 16).ok()?)?
+                }
                 s => {
                     let mut it = s.chars();
                     let c = it.next()?;
@@ -995,7 +1020,10 @@ impl Default for Totals {
             syntax_errors_total: 0,
             syntax_errors_outside_methods: 0,
             methods_with_loss: 0,
-            suspect: Kind::ALL.iter().map(|k| (k.as_str().to_string(), 0)).collect(),
+            suspect: Kind::ALL
+                .iter()
+                .map(|k| (k.as_str().to_string(), 0))
+                .collect(),
         }
     }
 }
@@ -1141,11 +1169,23 @@ impl BenchDiff {
     pub fn render(&self) -> String {
         let mut s = String::from("== Bench-diff fidélité ==\n\n");
         s.push_str(&format!("sha256  {}\n", self.sha256));
-        s.push_str(&format!("A       {}\n", self.rev_a.as_deref().unwrap_or("rev inconnu")));
-        s.push_str(&format!("B       {}\n\n", self.rev_b.as_deref().unwrap_or("rev inconnu")));
-        s.push_str(&format!("{:<22} {:>8} {:>8} {:>8}\n", "kind", "A", "B", "écart"));
+        s.push_str(&format!(
+            "A       {}\n",
+            self.rev_a.as_deref().unwrap_or("rev inconnu")
+        ));
+        s.push_str(&format!(
+            "B       {}\n\n",
+            self.rev_b.as_deref().unwrap_or("rev inconnu")
+        ));
+        s.push_str(&format!(
+            "{:<22} {:>8} {:>8} {:>8}\n",
+            "kind", "A", "B", "écart"
+        ));
         for c in &self.counters {
-            s.push_str(&format!("{:<22} {:>8} {:>8} {:>+8}\n", c.counter, c.a, c.b, c.delta));
+            s.push_str(&format!(
+                "{:<22} {:>8} {:>8} {:>+8}\n",
+                c.counter, c.a, c.b, c.delta
+            ));
         }
         for (title, list) in [
             ("Régressions", &self.regressions),
@@ -1162,7 +1202,11 @@ impl BenchDiff {
                     m.kind,
                     m.a,
                     m.b,
-                    if lines.is_empty() { "-".to_string() } else { lines.join(", ") }
+                    if lines.is_empty() {
+                        "-".to_string()
+                    } else {
+                        lines.join(", ")
+                    }
                 ));
                 for d in &m.details {
                     s.push_str(&format!("          {}\n", disasm::escape(d)));
@@ -1189,7 +1233,12 @@ pub fn bench_diff(a: &Path, b: &Path) -> Result<BenchDiff> {
     let mut counters = Vec::new();
     let mut worse = false;
     let mut kinds: Vec<String> = Kind::ALL.iter().map(|k| k.as_str().to_string()).collect();
-    for k in report_a.totals.suspect.keys().chain(report_b.totals.suspect.keys()) {
+    for k in report_a
+        .totals
+        .suspect
+        .keys()
+        .chain(report_b.totals.suspect.keys())
+    {
         if !kinds.contains(k) {
             kinds.push(k.clone());
         }
@@ -1206,7 +1255,10 @@ pub fn bench_diff(a: &Path, b: &Path) -> Result<BenchDiff> {
         worse |= kb > ka;
         counters.push(row(k, ka, kb));
     }
-    let (sa, sb) = (report_a.totals.syntax_errors_total, report_b.totals.syntax_errors_total);
+    let (sa, sb) = (
+        report_a.totals.syntax_errors_total,
+        report_b.totals.syntax_errors_total,
+    );
     worse |= sb > sa;
     counters.push(row("syntax_errors", sa, sb));
     let (ca, cb) = (report_a.totals.methods_clean, report_b.totals.methods_clean);
@@ -1353,11 +1405,18 @@ mod tests {
 
     #[test]
     fn litteral_numerique_en_recepteur() {
-        let java = "    public void f() {\n        2131230978.edit();\n        null.toString();\n    }\n";
+        let java =
+            "    public void f() {\n        2131230978.edit();\n        null.toString();\n    }\n";
         let class = class_of(java, "f", &MethodFacts::default(), &[]);
         let found = &class.methods[0].suspect;
-        assert!(found.contains(&Suspect::at(Kind::LiteralReceiver, 2)), "{found:?}");
-        assert!(found.contains(&Suspect::at(Kind::LiteralReceiver, 3)), "{found:?}");
+        assert!(
+            found.contains(&Suspect::at(Kind::LiteralReceiver, 2)),
+            "{found:?}"
+        );
+        assert!(
+            found.contains(&Suspect::at(Kind::LiteralReceiver, 3)),
+            "{found:?}"
+        );
     }
 
     #[test]
@@ -1407,7 +1466,11 @@ mod tests {
     #[test]
     fn identifiant_commencant_par_un_chiffre() {
         let java = "    public void f() {\n        this.g(2abc);\n    }\n";
-        assert!(kinds_in(java).contains(&Kind::InvalidIdent), "{:?}", kinds_in(java));
+        assert!(
+            kinds_in(java).contains(&Kind::InvalidIdent),
+            "{:?}",
+            kinds_in(java)
+        );
     }
 
     #[test]
@@ -1510,7 +1573,11 @@ mod tests {
         facts.calls.insert("f".to_string());
         facts.strings.insert("a\"b\\c\néA".to_string());
         let class = class_of(java, "m", &facts, &[]);
-        assert!(class.methods[0].suspect.is_empty(), "{:?}", class.methods[0].suspect);
+        assert!(
+            class.methods[0].suspect.is_empty(),
+            "{:?}",
+            class.methods[0].suspect
+        );
     }
 
     #[test]
@@ -1528,7 +1595,10 @@ mod tests {
         assert_eq!(found.len(), 2, "{found:?}");
         assert_eq!(
             found[0],
-            lost(Kind::LostString, "android.settings.action.MANAGE_OVERLAY_PERMISSION")
+            lost(
+                Kind::LostString,
+                "android.settings.action.MANAGE_OVERLAY_PERMISSION"
+            )
         );
         let detail = found[1].detail.as_deref().unwrap();
         assert!(detail.starts_with(&"x".repeat(120)), "{detail}");
@@ -1538,8 +1608,14 @@ mod tests {
     #[test]
     fn appels_reecrits_par_le_decompilateur_ne_comptent_pas() {
         assert!(rewritten_call("Ljava/lang/StringBuilder;", "append"));
-        assert!(rewritten_call("Lkotlin/jvm/internal/Intrinsics;", "checkNotNullParameter"));
-        assert!(!rewritten_call("Landroid/provider/Settings;", "canDrawOverlays"));
+        assert!(rewritten_call(
+            "Lkotlin/jvm/internal/Intrinsics;",
+            "checkNotNullParameter"
+        ));
+        assert!(!rewritten_call(
+            "Landroid/provider/Settings;",
+            "canDrawOverlays"
+        ));
     }
 
     #[test]
@@ -1590,7 +1666,11 @@ mod tests {
             totals,
         );
         std::fs::create_dir_all(dir.join("classes")).unwrap();
-        std::fs::write(dir.join("fidelity.json"), serde_json::to_vec(&report).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("fidelity.json"),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
         let index = serde_json::json!([{ "id": 0, "suspect_methods": 1 }]);
         std::fs::write(dir.join("index.json"), index.to_string()).unwrap();
         let methods = serde_json::json!([
@@ -1604,8 +1684,18 @@ mod tests {
     fn bench_diff_liste_regression_et_correction() {
         let tmp = tempfile::tempdir().unwrap();
         let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
-        write_bundle(&a, "1111111111111111111111111111111111111111", "undefined_var", 3);
-        write_bundle(&b, "2222222222222222222222222222222222222222", "literal_receiver", 4);
+        write_bundle(
+            &a,
+            "1111111111111111111111111111111111111111",
+            "undefined_var",
+            3,
+        );
+        write_bundle(
+            &b,
+            "2222222222222222222222222222222222222222",
+            "literal_receiver",
+            4,
+        );
         let diff = bench_diff(&a, &b).unwrap();
         assert!(!diff.same_rev);
         assert_eq!(diff.regressions.len(), 1);
@@ -1623,8 +1713,18 @@ mod tests {
     fn bench_diff_refuse_deux_entrees_differentes() {
         let tmp = tempfile::tempdir().unwrap();
         let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
-        write_bundle(&a, "1111111111111111111111111111111111111111", "undefined_var", 3);
-        write_bundle(&b, "2222222222222222222222222222222222222222", "undefined_var", 3);
+        write_bundle(
+            &a,
+            "1111111111111111111111111111111111111111",
+            "undefined_var",
+            3,
+        );
+        write_bundle(
+            &b,
+            "2222222222222222222222222222222222222222",
+            "undefined_var",
+            3,
+        );
         let mut other: Report = read_json(&b.join("fidelity.json")).unwrap();
         other.sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into();
         std::fs::write(b.join("fidelity.json"), serde_json::to_vec(&other).unwrap()).unwrap();

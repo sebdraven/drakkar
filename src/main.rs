@@ -2652,8 +2652,11 @@ fn run_bundle(input: &parser::xapk::Input, out: &std::path::Path, cli: &Cli) -> 
     }
     write_bundle_json(&root, "index.json", &index)?;
 
-    let fidelity =
-        parser::fidelity::Report::new(&src.sha256, decompile::decompiler_rev(), decompiled.fidelity);
+    let fidelity = parser::fidelity::Report::new(
+        &src.sha256,
+        decompile::decompiler_rev(),
+        decompiled.fidelity,
+    );
     write_bundle_json(&root, "fidelity.json", &fidelity)?;
 
     let info = BundleInfo::new(&src, &decompiled.stats, generated_at, rules_hash);
