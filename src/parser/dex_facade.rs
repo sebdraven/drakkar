@@ -82,6 +82,26 @@ pub struct Code<'a> {
     pub insns: &'a [u8],
     pub registers_size: u16,
     pub ins_size: u16,
+    /// `try_item`s et leurs handlers ; `None` si la table est illisible.
+    pub tries: Option<Vec<TryBlock<'a>>>,
+}
+
+/// Un `try_item` du `code_item`.
+pub struct TryBlock<'a> {
+    /// Début, en unités de code de 16 bits.
+    pub start_unit: u32,
+    pub insn_count: u16,
+    pub handlers: Vec<Handler<'a>>,
+}
+
+/// Un handler d'un `try_item`.
+pub struct Handler<'a> {
+    /// Descripteur du type attrapé ; `None` pour le catch-all, ou si l'index
+    /// de type est illisible (`catch_all` les distingue).
+    pub catch_type: Option<&'a str>,
+    pub catch_all: bool,
+    /// Adresse du handler, en unités de code de 16 bits.
+    pub addr: u32,
 }
 
 /// Entrée de `method_ids` résolue.
@@ -357,10 +377,29 @@ impl DexBin {
             None
         } else {
             let item = self.dex.get_code_item(code_off)?;
+            let tries = item.tries(&self.dex.data).ok().map(|tries| {
+                tries
+                    .into_iter()
+                    .map(|t| TryBlock {
+                        start_unit: t.start_unit,
+                        insn_count: t.insn_count,
+                        handlers: t
+                            .handlers
+                            .into_iter()
+                            .map(|(ty, addr)| Handler {
+                                catch_type: ty.and_then(|i| self.typ(i)),
+                                catch_all: ty.is_none(),
+                                addr,
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            });
             Some(Code {
                 insns: item.insns_slice(&self.dex.data),
                 registers_size: item.registers_size,
                 ins_size: item.ins_size,
+                tries,
             })
         };
 
@@ -423,6 +462,21 @@ impl DexBin {
         }
 
         Ok(pair_statics(names, values))
+    }
+
+    /// Noms des champs déclarés par la classe, statiques puis d'instance. Un
+    /// nom illisible est omis.
+    pub fn field_names(&self, class: &DexClass<'_>) -> Result<Vec<String>> {
+        let Some(data) = self.dex.get_class_data(&class.class_def)? else {
+            return Ok(Vec::new());
+        };
+        Ok(data
+            .static_fields
+            .iter()
+            .chain(&data.instance_fields)
+            .filter_map(|enc| self.dex.fields.get(enc.field_idx).ok())
+            .filter_map(|f| self.string(f.name_idx).map(str::to_string))
+            .collect())
     }
 
     /// Annotations d'une classe : niveaux classe, champ, méthode et paramètre.
