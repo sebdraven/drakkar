@@ -1452,8 +1452,15 @@ Fidélité du Java — banc de mesure du décompilateur
                        entre parenthèses ou non (`0.x`, `null.f()`). Un
                        littéral chaîne n'est pas suspect (`\"RESP:\".concat(s)`).
                        Repère aussi `2131230978.edit()`, que la grammaire lit
-                       comme le flottant `2131230978.` collé à `edit`. Limite :
-                       un littéral casté (`((T) 0).f()`) n'est pas vu.
+                       comme le flottant `2131230978.` collé à `edit`. Repli
+                       lexical, quelle que soit la forme de l'arbre : un entier
+                       (décimal, octal, 0x…, 0b…, suffixe l/L facultatif) non
+                       précédé d'un caractère d'identifiant ni d'un point,
+                       suivi de `.` (espaces permis autour) puis d'un début
+                       d'identifiant. Les chaînes, caractères et commentaires
+                       sont ignorés ; les flottants valides sont exclus (`1.5`,
+                       `1.e3`, `1.f`, `0x1.p3`). Limite : un littéral casté
+                       (`((T) 0).f()`) n'est pas vu.
     undefined_var      Identifiant lu ou écrit comme variable (argument,
                        opérande, valeur, condition, indice, return…), jamais
                        suivi de `.`, qui n'est ni un paramètre, ni une locale

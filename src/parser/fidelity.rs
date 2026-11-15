@@ -762,10 +762,116 @@ fn analyze_method(
             push(Kind::InvalidIdent, num);
         }
     }
+    for line in numeric_receiver_lines(decl, &nodes, src) {
+        out.push(Suspect::at(Kind::LiteralReceiver, line));
+    }
 
     out.sort();
     out.dedup();
     out
+}
+
+/// Nœuds dont le texte n'est pas du code : masqués par le repli lexical.
+const OPAQUE: [&str; 4] = [
+    "string_literal",
+    "character_literal",
+    "line_comment",
+    "block_comment",
+];
+
+/// Repli lexical de literal_receiver, indépendant de la forme de l'arbre (la
+/// grammaire range `2131230978.edit()` dans un nœud ERROR) : entier suivi de
+/// `.` puis d'un début d'identifiant. Rend la ligne du premier chiffre.
+fn numeric_receiver_lines(decl: Node<'_>, nodes: &[Node<'_>], src: &[u8]) -> Vec<usize> {
+    let base = decl.start_byte();
+    let mut s = src[base..decl.end_byte()].to_vec();
+    for n in nodes.iter().filter(|n| OPAQUE.contains(&n.kind())) {
+        for b in &mut s[n.start_byte() - base..n.end_byte() - base] {
+            if *b != b'\n' {
+                *b = b' ';
+            }
+        }
+    }
+    let at = |k: usize| s.get(k).copied().unwrap_or(0);
+
+    let mut lines = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        if !s[i].is_ascii_digit() || (i > 0 && (ident_byte(s[i - 1]) || s[i - 1] == b'.')) {
+            i += 1;
+            continue;
+        }
+        let first = i;
+        let radix = match (s[i], at(i + 1)) {
+            (b'0', b'x' | b'X') => 16,
+            (b'0', b'b' | b'B') => 2,
+            _ => 10,
+        };
+        let hex = radix == 16;
+        let digit = |b: u8| b == b'_' || b.is_ascii_digit() || (hex && b.is_ascii_hexdigit());
+        let mut j = if radix == 10 { i } else { i + 2 };
+        let digits = j;
+        while digit(at(j)) {
+            j += 1;
+        }
+        let empty = j == digits;
+        let long = matches!(at(j), b'l' | b'L');
+        if long {
+            j += 1;
+        }
+        i = j;
+        while ident_byte(at(i)) {
+            i += 1;
+        }
+        if empty || i != j {
+            continue;
+        }
+
+        let mut dot = j;
+        while at(dot).is_ascii_whitespace() {
+            dot += 1;
+        }
+        if at(dot) != b'.' {
+            continue;
+        }
+        let mut k = dot + 1;
+        while at(k).is_ascii_whitespace() {
+            k += 1;
+        }
+        if !ident_start(at(k)) {
+            continue;
+        }
+        if !long && dot == j && k == dot + 1 && float_tail(radix, &s[k..]) {
+            continue;
+        }
+        let row = s[..first].iter().filter(|&&b| b == b'\n').count();
+        lines.push(decl.start_position().row + 1 + row);
+    }
+    lines
+}
+
+/// `rest` suit immédiatement le point d'un entier : `1.e3`, `1.f`, `0x1.p3`
+/// sont des flottants.
+fn float_tail(radix: u32, rest: &[u8]) -> bool {
+    let at = |k: usize| rest.get(k).copied().unwrap_or(0);
+    let exponent: &[u8] = match radix {
+        10 => b"eE",
+        16 => b"pP",
+        _ => return false,
+    };
+    if exponent.contains(&at(0)) {
+        let k = if matches!(at(1), b'+' | b'-') { 2 } else { 1 };
+        return at(k).is_ascii_digit();
+    }
+    radix == 10 && matches!(at(0), b'f' | b'F' | b'd' | b'D') && !ident_byte(at(1))
+}
+
+fn ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+fn ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b == b'$'
 }
 
 /// Position où un identifiant est lu ou écrit comme variable : jamais nom de
@@ -1417,6 +1523,34 @@ mod tests {
             found.contains(&Suspect::at(Kind::LiteralReceiver, 3)),
             "{found:?}"
         );
+    }
+
+    #[test]
+    fn litteral_entier_en_recepteur_repli_lexical() {
+        for receiver in ["2131230978 .edit()", "0x7f0a0012.edit()"] {
+            let java = format!("    public void f() {{\n        {receiver};\n    }}\n");
+            let class = class_of(&java, "f", &MethodFacts::default(), &[]);
+            let found = &class.methods[0].suspect;
+            assert!(
+                found.contains(&Suspect::at(Kind::LiteralReceiver, 2)),
+                "{receiver} : {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn flottants_chaines_commentaires_et_identifiants_ne_sont_pas_des_recepteurs() {
+        for body in [
+            "float f = 1.5f; double d = 2.0e3; this.g(\"2131230978.edit()\"); // 12.edit()",
+            "int x = a1.b;",
+        ] {
+            let java = format!("    public void f() {{\n        {body}\n    }}\n");
+            let kinds = kinds_in(&java);
+            assert!(
+                !kinds.contains(&Kind::LiteralReceiver),
+                "{body} : {kinds:?}"
+            );
+        }
     }
 
     #[test]
