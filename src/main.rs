@@ -401,6 +401,16 @@ struct Cli {
     #[arg(long, value_names = ["A", "B"], num_args = 2)]
     diff_dex: Option<Vec<PathBuf>>,
 
+    /// Banc de fidélité : compare deux bundles OUT/<sha256> de la MÊME entrée,
+    /// produits par deux révisions de dex-decompiler. Compteurs de
+    /// fidelity.json, puis méthodes qui gagnent (régressions) ou perdent
+    /// (corrections) un défaut. Code de sortie : 0 sans dégradation, 1 si un
+    /// compteur de défauts monte ou si methods_clean baisse, 2 en cas d'erreur
+    /// d'usage. --format json disponible ; --bundle --legend définit les
+    /// défauts. Puis sort.
+    #[arg(long, value_names = ["A", "B"], num_args = 2)]
+    bench_diff: Option<Vec<PathBuf>>,
+
     /// (--diff-dex) Ne comparer que les classes dont le descripteur Dalvik
     /// commence par ce préfixe (ex. Lcom/dy/). Répétable — passer les préfixes
     /// applicatifs des DEUX côtés. Sans lui : exclusion best-effort des libs.
@@ -1359,6 +1369,40 @@ est racine — ne pas comparer à une mesure `manifest`)",
             cli.json_out.as_deref(),
         )?;
         return Ok(());
+    }
+
+    // Sortie rapide : banc de fidélité de deux bundles. Ne lit que leurs JSON,
+    // ni APK, ni catalogue MITRE, ni moteur de règles. Codes de sortie propres
+    // au mode : 1 = dégradation, 2 = erreur d'usage.
+    if let Some(pair) = &cli.bench_diff {
+        if cli.legend {
+            println!("{}", parser::decompile::legend());
+            return Ok(());
+        }
+        if !matches!(cli.format, Format::Text | Format::Json) {
+            eprintln!("[FAIL]  --bench-diff : --format text (défaut) ou json");
+            std::process::exit(2);
+        }
+        let diff = match parser::fidelity::bench_diff(&pair[0], &pair[1]) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[FAIL]  --bench-diff : {e:#}");
+                std::process::exit(2);
+            }
+        };
+        if diff.same_rev {
+            eprintln!(
+                "[AVERT] decompiler.rev identique des deux côtés ({}) : l'écart ne mesure pas \
+                 un changement de décompilateur",
+                diff.rev_a.as_deref().unwrap_or("inconnu")
+            );
+        }
+        if cli.format == Format::Json {
+            emit_json(&diff, cli.json_out.as_deref())?;
+        } else {
+            print!("{}", diff.render());
+        }
+        std::process::exit(diff.exit_code());
     }
 
     // Sortie rapide : diff sémantique de deux DEX/APK par empreinte d'opcodes.
@@ -2607,6 +2651,13 @@ fn run_bundle(input: &parser::xapk::Input, out: &std::path::Path, cli: &Cli) -> 
         }
     }
     write_bundle_json(&root, "index.json", &index)?;
+
+    let fidelity = parser::fidelity::Report::new(
+        &src.sha256,
+        decompile::decompiler_rev(),
+        decompiled.fidelity,
+    );
+    write_bundle_json(&root, "fidelity.json", &fidelity)?;
 
     let info = BundleInfo::new(&src, &decompiled.stats, generated_at, rules_hash);
     write_bundle_json(&root, "bundle.json", &info)?;

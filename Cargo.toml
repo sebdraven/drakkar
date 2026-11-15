@@ -72,7 +72,11 @@ md-5 = "0.10"
 dex-bytecode = { git = "https://github.com/androguard/dex-bytecode" }
 
 # Fork sebdraven: utf8 byte push (androguard/dex-decompiler#1) + noms hors litteraux + variables par définition (def-use webs).
-dex-decompiler = { git = "https://github.com/sebdraven/dex-decompiler", rev = "f3581de63b9ec8b62b9835c7e150533b4d3d7599" }
+dex-decompiler = { git = "https://github.com/sebdraven/dex-decompiler", rev = "41b4e40c52872bac3af83d18da5c23f36911befc" }
+
+# Parseur Java pour le banc de fidélité du bundle (parser::fidelity) ; compile du C via cc.
+tree-sitter = "0.24"
+tree-sitter-java = "0.23.5"
 
 # Lecture des ELF (--native, parser::native_static) : en-têtes, sections,
 # segments, table dynamique, symboles. Pur Rust, lecture seule. `unaligned` :
