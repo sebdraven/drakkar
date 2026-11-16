@@ -3415,7 +3415,10 @@ mod tests {
         arrays.map(|a| (a.vaddr, a.pairs.len())).collect()
     }
 
-    fn refs_of(found: &Found) -> Vec<(u64, &'static str, Option<(u64, usize)>)> {
+    /// (insn, kind, (array_vaddr, index_du_couple)) de chaque reference.
+    type RefTriple = (u64, &'static str, Option<(u64, usize)>);
+
+    fn refs_of(found: &Found) -> Vec<RefTriple> {
         let refs = found.refs.iter();
         refs.map(|r| (r.insn, r.kind, r.array)).collect()
     }
