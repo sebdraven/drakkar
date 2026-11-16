@@ -2342,8 +2342,9 @@ par ce magic est un ELF, quel que soit son chemin. --elf <chemin> restreint l'an
 à un ELF : chemin d'entrée (lib/arm64-v8a/libfoo.so), <split>!<entrée> pour un ELF de
 split, nom du fichier pour un ELF brut.
 Motifs : sous-chaîne, casse ignorée, même sémantique que --strings ; sans motif,
-toutes les chaînes. Les motifs ne filtrent que strings[] : comptes, crates,
-bibliothèques C et constantes portent sur toutes les chaînes extraites.
+toutes les chaînes. Les motifs ne filtrent que strings[] et format_arrays[] :
+comptes, crates, bibliothèques C et constantes portent sur toutes les chaînes
+extraites.
 Sortie : JSON écrit en flux dans --json-out (obligatoire), ELF après ELF et chaîne
 après chaîne ; rien sur stdout. Aucune chaîne, aucun tableau n'est tronqué.
 
@@ -2359,6 +2360,9 @@ RAPPORT
                   rust_fatptr ou rust_code ; un couple plus long est ignoré ;
                   code_window = instructions pendant lesquelles une page ADRP, une
                   adresse formée ou une longueur immédiate restent appariables ;
+                  max_propagated_array = nombre maximal de couples d'un tableau
+                  dont les références sont recopiées sur chaque morceau (section
+                  TABLEAUX) ;
                   sections_not_scanned = sections allouées jamais découpées en
                   chaînes.
   elfs[]          Un objet par ELF retenu, dans l'ordre de l'archive : base, puis
@@ -2377,6 +2381,8 @@ ELF (elfs[])
   strings[]       Chaînes retenues, triées par vaddr (section CHAÎNE).
   crates[], c_libraries[]  Avec --crates seulement (section CRATES).
   crypto_constants[]  Section CONSTANTES.
+  format_arrays[] Tableaux de couples rust_fatptr, triés par adresse (section
+                  TABLEAUX).
 
 RÉSUMÉ (elfs[].summary)
   areas           sections = zones lues d'après les section headers ; segments = sans
@@ -2389,6 +2395,18 @@ RÉSUMÉ (elfs[].summary)
                   heuristic.
   by_encoding     strings_found par encoding : ascii, utf8, utf16le.
   fatptr_pairs    Couples {ptr, len} retenus dans les données.
+  format_arrays   Tableaux de couples (section TABLEAUX), tableaux d'un seul couple
+                  compris, avant filtre des motifs.
+  pairs_in_arrays Couples qui appartiennent à un tableau d'au moins deux couples ;
+                  fatptr_pairs - pairs_in_arrays = couples isolés.
+  arrays_with_xrefs  Tableaux dont au moins un couple a son adresse formée par une
+                  instruction (kind fatptr_array). Calculé avec ou sans --xrefs ;
+                  toujours 0 quand code_scan est null.
+  arrays_without_xrefs  format_arrays - arrays_with_xrefs. Même limite que xrefs vide
+                  (section RÉFÉRENCES) : ce n'est pas une preuve de non-usage.
+  arrays_not_propagated  Tableaux de plus de max_propagated_array couples qui ont au
+                  moins une référence : leurs références restent dans
+                  format_arrays[].xrefs, aucune n'est posée sur leurs morceaux.
   rust_code_dropped_prefixes  Candidats rust_code écartés parce qu'un intervalle
                   prouvé plus long (rust_fatptr ou rust_code) commence à la même
                   adresse (section BORNES).
@@ -2407,7 +2425,7 @@ RÉSUMÉ (elfs[].summary)
                   eh_frame_unread = FDE non lus : CIE introuvable, codage d'adresse
                   non modélisé, début hors du code.
   xrefs           Avec --xrefs, null sinon. total = références rattachées à une
-                  chaîne ou à une constante ;
+                  chaîne ou à une constante, fatptr_array exclues ;
                   unresolved_text = adresses formées qui tombent dans une zone de
                   chaînes en lecture seule, sur un octet de texte (section BORNES)
                   qu'aucune chaîne extraite ne couvre et où ne commence aucune
@@ -2416,7 +2434,11 @@ RÉSUMÉ (elfs[].summary)
                   non_text_targets = mêmes adresses, mais sur un octet qui n'est pas
                   du texte : tables numériques, données binaires de .rodata ;
                   without_function = références dont l'instruction n'est dans
-                  aucune fonction bornée.
+                  aucune fonction bornée, fatptr_array exclues ;
+                  fatptr_array = références de kind fatptr_array effectivement posées
+                  sur les chaînes de strings_found, une par instruction et par
+                  chaîne, donc venues des seuls tableaux propagés ; comptées à part,
+                  ni dans total ni dans without_function.
   crypto_constants  Nombre de constantes reconnues.
   anomalies       Relocations illisibles ou non modélisées, même vocabulaire que
                   --native ; elf_unreadable: <raison> quand l'ELF n'a pas pu être lu
@@ -2449,6 +2471,15 @@ CHAÎNE (elfs[].strings[])
   split_from      vaddr du bloc nul ou heuristic dont la chaîne est un morceau
                   (section DÉCOUPE) ; absent pour une chaîne non découpée.
   patterns        Motifs contenus, tels que passés ; absent sans motif.
+  pairs[]         rust_fatptr seulement, absent pour les autres bornes. Un objet par
+                  couple {ptr, len} qui désigne exactement cette chaîne (même ptr,
+                  même len), triés par adresse du couple : une chaîne désignée par
+                  plusieurs couples sort une fois, avec un objet par couple.
+                  pair_vaddr = adresse du couple ;
+                  array_vaddr = adresse du premier couple de son tableau (section
+                  TABLEAUX) ;
+                  array_index = rang du couple dans le tableau, à partir de 0 ;
+                  array_len = nombre de couples du tableau, 1 pour un couple isolé.
   xrefs[]         Avec --xrefs seulement (section RÉFÉRENCES).
 
 BORNES (boundary)
@@ -2506,7 +2537,8 @@ DÉCOUPE AUX ADRESSES FORMÉES (AArch64, avec ou sans --xrefs)
   lus sur les blocs entiers, avant découpe. Un bloc que rien ne référence en son
   milieu reste heuristic, entier.
 
-RÉFÉRENCES (strings[].xrefs[], crypto_constants[].xrefs[] ; --xrefs, AArch64 seulement)
+RÉFÉRENCES (strings[].xrefs[], crypto_constants[].xrefs[], format_arrays[].xrefs[] ;
+--xrefs, AArch64 seulement)
   Balayage linéaire de toutes les zones exécutables, pas seulement des fonctions
   atteintes depuis JNI. L'état des registres est remis à zéro au début de chaque
   fonction bornée et après B, BR, RET ; x0 à x18 et x30 sont oubliés après BL et BLR.
@@ -2521,11 +2553,24 @@ RÉFÉRENCES (strings[].xrefs[], crypto_constants[].xrefs[] ; --xrefs, AArch64 s
                   l'est, est l'adresse ;
                   fatptr = l'adresse formée (ADRP+ADD, ADR, LDR littéral, ou ADRP puis
                   LDR [xN, #imm]) est l'emplacement d'un couple rust_fatptr : la
-                  référence va à la chaîne du couple.
+                  référence va à la chaîne du couple ;
+                  fatptr_array = la même instruction que fatptr, vue depuis le
+                  tableau du couple visé (section TABLEAUX) : la référence va à
+                  chaque morceau du tableau, sauf à une chaîne qui porte déjà cette
+                  instruction, en fatptr ou sous un autre kind. Une instruction ne
+                  compte qu'une fois par chaîne : le morceau visé garde fatptr, les
+                  autres reçoivent fatptr_array. Seulement depuis un tableau d'au
+                  plus max_propagated_array couples : au-delà, la référence reste
+                  dans format_arrays[].xrefs, et une entrée de ce tableau peut avoir
+                  xrefs vide alors que sa table est référencée (section TABLEAUX).
   offset          Écart en octets entre l'adresse formée et vaddr : 0 quand elle
                   désigne le début, donc pour tout morceau de découpe ; non nul pour
                   une adresse au milieu d'une chaîne qui n'a pas été coupée (chaîne
-                  prouvée, ou milieu d'un caractère).
+                  prouvée, ou milieu d'un caractère). Toujours 0 pour fatptr_array.
+  array_vaddr     fatptr_array seulement : adresse du premier couple du tableau.
+  target_index    fatptr_array seulement : rang, à partir de 0, du couple dont
+                  l'instruction forme l'adresse ; 0 quand elle vise le tableau par
+                  son début.
   nearest_export  Export de .dynsym (STT_FUNC défini, STB_GLOBAL ou STB_WEAK) de plus
                   haute adresse inférieure ou égale à insn_addr : name, et distance =
                   insn_addr - adresse de l'export, en octets. null si aucun ne précède.
@@ -2536,6 +2581,50 @@ RÉFÉRENCES (strings[].xrefs[], crypto_constants[].xrefs[] ; --xrefs, AArch64 s
                   plus de code_window instructions ou par un branchement, le code
                   d'une autre machine qu'AArch64, le code chiffré ou produit à
                   l'exécution, les données lues par une autre bibliothèque.
+
+TABLEAUX (elfs[].format_arrays[])
+  Les morceaux littéraux d'une chaîne de format Rust (fmt::Arguments) forment un
+  tableau de couples {ptr, len} contigus, et le code ne forme que l'adresse du
+  tableau : sans regroupement, les morceaux autres que le premier n'ont aucune
+  référence. Les couples rust_fatptr sont regroupés en tableaux : même zone,
+  emplacements consécutifs au pas de deux mots (16 octets en 64 bits, 8 en 32 bits),
+  chacun validé comme rust_fatptr. Un couple isolé est un tableau de longueur 1. Tous
+  les tableaux sont rendus.
+  array_vaddr     Adresse du premier couple.
+  section         Section qui porte les couples ; null sans section headers.
+  len             Nombre de couples.
+  propagated      true quand len <= max_propagated_array : les références du tableau
+                  sont aussi posées sur ses morceaux, en fatptr_array ; false sinon,
+                  elles ne sont que dans xrefs[] ci-dessous.
+  pieces[]        Valeur de chaque morceau, dans l'ordre des couples, quelle que soit
+                  sa longueur : un morceau plus court que min_length figure ici et
+                  dans aucun strings[]. Les arguments interpolés entre les morceaux ne
+                  sont pas reconstitués.
+  patterns        Motifs contenus dans au moins un morceau ; absent sans motif. Avec
+                  des motifs, seuls les tableaux qui en contiennent un sont rendus ;
+                  un motif à cheval sur deux morceaux n'est pas trouvé.
+  xrefs[]         Avec --xrefs : instructions qui forment l'adresse d'un couple du
+                  tableau, kind fatptr_array, array_vaddr, target_index. Rendues que
+                  le tableau soit propagé ou non.
+  Propagation. Une instruction qui forme l'adresse d'une table de &str la charge ;
+  elle ne lit pas pour autant chacune de ses entrées (table de versions Unicode,
+  d'alias de propriétés, de jetons d'un lexer : le code qui la reçoit peut n'en lire
+  qu'une partie). Recopier sa référence sur chaque entrée ferait passer pour lue
+  chacune d'elles. Elle n'est donc recopiée sur les morceaux que pour un tableau
+  d'au plus max_propagated_array couples ; ce seuil est un paramètre de l'outil, pas
+  une taille mesurée des chaînes de format. Au-delà, propagated = false, la
+  référence reste dans format_arrays[].xrefs, et une entrée peut avoir xrefs vide
+  dans strings[] alors que sa table est référencée : lire format_arrays[], que
+  pairs[] de la chaîne désigne par array_vaddr. pairs[] est renseigné pour tous les
+  tableaux, propagés ou non : il dit où est la chaîne, pas qui la lit. Une chaîne de
+  format de plus de max_propagated_array morceaux est traitée comme une table.
+  Limites. Deux tableaux rangés bout à bout, sans mot intercalé, sont fusionnés en un
+  seul : rien dans les octets ne marque leur frontière, et les références de l'un vont
+  aussi aux morceaux de l'autre. Un couple non validé (longueur 0 ou supérieure à
+  max_string_len, pointeur hors d'une zone de chaînes en lecture seule, texte
+  invalide) coupe le tableau en deux à cet endroit. Le regroupement ne prouve pas
+  qu'un tableau est une chaîne de format : toute table de &str contiguë (liste de
+  noms, de champs) est regroupée de la même façon.
 
 CRATES (--crates)
   crates[]        Chemins de source trouvés dans les chaînes extraites, \\ normalisé en
