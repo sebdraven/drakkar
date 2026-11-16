@@ -1455,7 +1455,9 @@ fn eh_frame_fdes(image: &Image, areas: &[Area]) -> EhFrame {
         .iter()
         .find(|a| a.name.as_deref() == Some(".eh_frame"));
     let located = match section {
-        Some(a) => image.bytes_at(a.offset, a.size).map(|bytes| (a.vaddr, bytes)),
+        Some(a) => image
+            .bytes_at(a.offset, a.size)
+            .map(|bytes| (a.vaddr, bytes)),
         None => eh_frame_from_header(image),
     };
     let Some((vaddr, bytes)) = located else {
@@ -2833,11 +2835,7 @@ mod tests {
             mov_w(2, 4),
             RET,
         ];
-        let sections = [
-            text(&code),
-            rodata(b"alphabetagamma\0"),
-            eh_frame(TEXT, 16),
-        ];
+        let sections = [text(&code), rodata(b"alphabetagamma\0"), eh_frame(TEXT, 16)];
         let bytes = elf_with(&sections);
         let report = analyze("libt.so", None, &bytes, &options());
         let expected = vec![
