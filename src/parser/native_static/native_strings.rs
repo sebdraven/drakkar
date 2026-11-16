@@ -3497,11 +3497,8 @@ mod tests {
             add_imm(1, 1, 40),
             RET,
         ];
-        let [relro, rela] = fat_pointers_at(&[
-            (0, RODATA, 5),
-            (16, RODATA + 5, 5),
-            (40, RODATA, 5),
-        ]);
+        let [relro, rela] =
+            fat_pointers_at(&[(0, RODATA, 5), (16, RODATA + 5, 5), (40, RODATA, 5)]);
         let bytes = elf_with(&[text(&code), rodata(PIECES), relro, rela]);
         let report = analyze("libt.so", None, &bytes, &options);
         assert_eq!(arrays_of(&report), vec![(RELRO, 2), (RELRO + 40, 1)]);
