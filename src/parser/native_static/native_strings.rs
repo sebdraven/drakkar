@@ -2713,15 +2713,25 @@ mod tests {
         spec(".rodata", SHT_PROGBITS, 2, RODATA, data.to_vec())
     }
 
-    /// Couples {ptr, len} dans .data.rel.ro, `ptr` relogé par R_AARCH64_RELATIVE.
+    /// Couples {ptr, len} contigus dans .data.rel.ro, `ptr` relogé par
+    /// R_AARCH64_RELATIVE.
     fn fat_pointers(pairs: &[(u64, u64)]) -> [Spec; 2] {
-        let mut relro = Vec::new();
+        let mut placed = Vec::new();
+        for (i, &(ptr, len)) in pairs.iter().enumerate() {
+            placed.push((16 * i as u64, ptr, len));
+        }
+        fat_pointers_at(&placed)
+    }
+
+    /// (décalage dans .data.rel.ro, ptr, len) ; les mots non écrits restent nuls.
+    fn fat_pointers_at(pairs: &[(u64, u64, u64)]) -> [Spec; 2] {
+        let size = pairs.iter().map(|p| p.0 + 16).max().unwrap_or(0);
+        let mut relro = vec![0u8; size as usize];
         let mut rela = Vec::new();
         let info = u64::from(elf::R_AARCH64_RELATIVE);
-        for (i, &(ptr, len)) in pairs.iter().enumerate() {
-            relro.extend_from_slice(&0u64.to_le_bytes());
-            relro.extend_from_slice(&len.to_le_bytes());
-            rela.extend_from_slice(&(RELRO + 16 * i as u64).to_le_bytes());
+        for &(at, ptr, len) in pairs {
+            put(&mut relro, at + 8, &len.to_le_bytes());
+            rela.extend_from_slice(&(RELRO + at).to_le_bytes());
             rela.extend_from_slice(&info.to_le_bytes());
             rela.extend_from_slice(&ptr.to_le_bytes());
         }
@@ -3065,5 +3075,228 @@ mod tests {
         let xrefs = report.summary.xrefs.as_ref().unwrap();
         assert_eq!(xrefs.non_text_targets, 1);
         assert_eq!(xrefs.unresolved_text, 0);
+    }
+
+    const PIECES: &[u8] = b"alphabravocharliedelta\0";
+
+    fn arrays_of(report: &ElfStrings) -> Vec<(u64, usize)> {
+        let arrays = report.arrays.iter();
+        arrays.map(|a| (a.vaddr, a.pairs.len())).collect()
+    }
+
+    fn refs_of(found: &Found) -> Vec<(u64, &'static str, Option<(u64, usize)>)> {
+        let refs = found.refs.iter();
+        refs.map(|r| (r.insn, r.kind, r.array)).collect()
+    }
+
+    /// (pair_vaddr, array_index, array_len) de chaque couple de la ligne.
+    fn pairs_of<'r>(row: &'r Row<'_>) -> Vec<(&'r str, usize, usize)> {
+        let pairs = row.pairs.iter();
+        pairs
+            .map(|p| (p.pair_vaddr.as_str(), p.array_index, p.array_len))
+            .collect()
+    }
+
+    #[test]
+    fn an_array_referenced_on_its_first_pair_gives_the_reference_to_every_piece() {
+        let options = options();
+        let code = [adrp(0, TEXT, RELRO), add_imm(0, 0, 0), RET];
+        let [relro, rela] = fat_pointers(&[
+            (RODATA, 5),
+            (RODATA + 5, 5),
+            (RODATA + 10, 7),
+            (RODATA + 17, 5),
+        ]);
+        let bytes = elf_with(&[text(&code), rodata(PIECES), relro, rela]);
+        let report = analyze("libt.so", None, &bytes, &options);
+        assert_eq!(arrays_of(&report), vec![(RELRO, 4)]);
+        let pieces = &report.arrays[0].pieces;
+        assert_eq!(pieces, &["alpha", "bravo", "charlie", "delta"]);
+
+        let add = TEXT + 4;
+        let array = Some((RELRO, 0));
+        let refs: Vec<_> = report.strings.iter().map(refs_of).collect();
+        let expected = vec![
+            vec![(add, KIND_FATPTR, None)],
+            vec![(add, KIND_FATPTR_ARRAY, array)],
+            vec![(add, KIND_FATPTR_ARRAY, array)],
+            vec![(add, KIND_FATPTR_ARRAY, array)],
+        ];
+        assert_eq!(refs, expected);
+
+        let row = report.row(&report.strings[2], &options);
+        assert_eq!(pairs_of(&row), vec![("0x3020", 2, 4)]);
+        assert_eq!(row.pairs[0].array_vaddr, "0x3000");
+        let xref = &row.xrefs.as_ref().unwrap()[0];
+        assert_eq!(xref.array_vaddr.as_deref(), Some("0x3000"));
+        assert_eq!(xref.target_index, Some(0));
+
+        let s = &report.summary;
+        assert_eq!(s.format_arrays, 1);
+        assert_eq!(s.pairs_in_arrays, 4);
+        assert_eq!((s.arrays_with_xrefs, s.arrays_without_xrefs), (1, 0));
+        let xrefs = s.xrefs.as_ref().unwrap();
+        assert_eq!((xrefs.total, xrefs.fatptr_array), (1, 3));
+    }
+
+    #[test]
+    fn a_word_between_two_arrays_keeps_them_apart() {
+        let [relro, rela] = fat_pointers_at(&[
+            (0, RODATA, 5),
+            (16, RODATA + 5, 5),
+            (40, RODATA + 10, 7),
+            (56, RODATA + 17, 5),
+        ]);
+        let bytes = elf_with(&[rodata(PIECES), relro, rela]);
+        let report = analyze("libt.so", None, &bytes, &options());
+        assert_eq!(arrays_of(&report), vec![(RELRO, 2), (RELRO + 40, 2)]);
+        assert_eq!(report.arrays[1].pieces, ["charlie", "delta"]);
+        let s = &report.summary;
+        assert_eq!((s.format_arrays, s.pairs_in_arrays), (2, 4));
+        assert_eq!((s.arrays_with_xrefs, s.arrays_without_xrefs), (0, 2));
+    }
+
+    #[test]
+    fn a_string_named_by_two_pairs_is_emitted_once_with_both_pairs() {
+        let options = options();
+        let code = [
+            adrp(0, TEXT, RELRO + 16),
+            add_imm(0, 0, 16),
+            adrp(1, TEXT + 8, RELRO + 40),
+            add_imm(1, 1, 40),
+            RET,
+        ];
+        let [relro, rela] = fat_pointers_at(&[
+            (0, RODATA, 5),
+            (16, RODATA + 5, 5),
+            (40, RODATA, 5),
+        ]);
+        let bytes = elf_with(&[text(&code), rodata(PIECES), relro, rela]);
+        let report = analyze("libt.so", None, &bytes, &options);
+        assert_eq!(arrays_of(&report), vec![(RELRO, 2), (RELRO + 40, 1)]);
+        let alphas = report.strings.iter().filter(|f| f.value == "alpha");
+        let alphas: Vec<&Found> = alphas.collect();
+        assert_eq!(alphas.len(), 1);
+        assert_eq!(alphas[0].places, vec![(0, 0), (1, 0)]);
+
+        let row = report.row(alphas[0], &options);
+        assert_eq!(pairs_of(&row), vec![("0x3000", 0, 2), ("0x3028", 0, 1)]);
+
+        let expected = vec![
+            (TEXT + 12, KIND_FATPTR, None),
+            (TEXT + 4, KIND_FATPTR_ARRAY, Some((RELRO, 1))),
+        ];
+        assert_eq!(refs_of(alphas[0]), expected);
+    }
+
+    #[test]
+    fn a_one_character_piece_is_in_format_arrays_not_in_strings() {
+        let piece = "] should_create_e2ee_channel for ";
+        let data = format!("[{piece}\0");
+        let len = piece.len() as u64;
+        let [relro, rela] = fat_pointers(&[(RODATA, 1), (RODATA + 1, len)]);
+        let bytes = elf_with(&[rodata(data.as_bytes()), relro, rela]);
+        let mut out = Vec::new();
+        let container = Container::Elf("libt.so".into(), bytes);
+        write_report(&mut out, "00", "libt.so", container, &[], &options()).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let elf = &json["elfs"][0];
+        let values: Vec<&str> = elf["strings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["value"].as_str())
+            .collect();
+        assert_eq!(values, vec![piece]);
+        assert_eq!(elf["strings"][0]["pairs"][0]["array_index"], 1);
+        assert_eq!(elf["format_arrays"][0]["array_vaddr"], "0x3000");
+        assert_eq!(elf["format_arrays"][0]["section"], ".data.rel.ro");
+        assert_eq!(elf["format_arrays"][0]["len"], 2);
+        let pieces = &elf["format_arrays"][0]["pieces"];
+        assert_eq!(*pieces, serde_json::json!(["[", piece]));
+    }
+
+    #[test]
+    fn patterns_keep_an_array_when_one_piece_matches() {
+        let [relro, rela] = fat_pointers(&[(RODATA, 5), (RODATA + 5, 5)]);
+        let bytes = elf_with(&[rodata(PIECES), relro, rela]);
+        for (pattern, kept) in [("BRAVO", 1), ("alphabravo", 0)] {
+            let options = Options {
+                patterns: vec![pattern.to_string()],
+                ..options()
+            };
+            let mut out = Vec::new();
+            let container = Container::Elf("libt.so".into(), bytes.clone());
+            write_report(&mut out, "00", "libt.so", container, &[], &options).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            let arrays = json["elfs"][0]["format_arrays"].as_array().unwrap();
+            assert_eq!(arrays.len(), kept, "{pattern}");
+        }
+    }
+
+    /// Tableau de `n` couples sur des morceaux de 4 caractères, `p000`, `p001`…,
+    /// référencé par ADRP+ADD sur son premier couple.
+    fn referenced_array(n: usize) -> ElfStrings {
+        let mut data = Vec::new();
+        let mut pairs = Vec::new();
+        for i in 0..n {
+            pairs.push((RODATA + data.len() as u64, 4));
+            data.extend_from_slice(format!("p{i:03}").as_bytes());
+        }
+        data.push(0);
+        let code = [adrp(0, TEXT, RELRO), add_imm(0, 0, 0), RET];
+        let [relro, rela] = fat_pointers(&pairs);
+        let bytes = elf_with(&[text(&code), rodata(&data), relro, rela]);
+        analyze("libt.so", None, &bytes, &options())
+    }
+
+    #[test]
+    fn a_short_array_gives_its_reference_to_every_piece() {
+        let options = options();
+        let report = referenced_array(3);
+        let add = TEXT + 4;
+        let array = Some((RELRO, 0));
+        let refs: Vec<_> = report.strings.iter().map(refs_of).collect();
+        let expected = vec![
+            vec![(add, KIND_FATPTR, None)],
+            vec![(add, KIND_FATPTR_ARRAY, array)],
+            vec![(add, KIND_FATPTR_ARRAY, array)],
+        ];
+        assert_eq!(refs, expected);
+        for f in &report.strings {
+            let row = report.row(f, &options);
+            assert_eq!(row.pairs.len(), 1);
+            assert_eq!(row.pairs[0].array_len, 3);
+        }
+        assert!(report.array_row(&report.arrays[0], &options).propagated);
+        let s = &report.summary;
+        assert_eq!(s.arrays_not_propagated, 0);
+        assert_eq!(s.xrefs.as_ref().unwrap().fatptr_array, 2);
+    }
+
+    #[test]
+    fn a_long_array_keeps_its_reference_in_format_arrays() {
+        let options = options();
+        let report = referenced_array(MAX_PROPAGATED_ARRAY + 1);
+        assert_eq!(report.strings.len(), 17);
+        let first = refs_of(&report.strings[0]);
+        assert_eq!(first, vec![(TEXT + 4, KIND_FATPTR, None)]);
+        for f in &report.strings[1..] {
+            assert!(f.refs.is_empty(), "{}", f.value);
+        }
+        for f in &report.strings {
+            let row = report.row(f, &options);
+            assert_eq!(row.pairs.len(), 1);
+            assert_eq!(row.pairs[0].array_len, 17);
+        }
+        let row = report.array_row(&report.arrays[0], &options);
+        assert!(!row.propagated);
+        let xrefs = row.xrefs.as_ref().unwrap();
+        assert_eq!(xrefs.len(), 1);
+        assert_eq!(xrefs[0].kind, KIND_FATPTR_ARRAY);
+        assert_eq!(xrefs[0].target_index, Some(0));
+        let s = &report.summary;
+        assert_eq!(s.arrays_not_propagated, 1);
+        assert_eq!(s.xrefs.as_ref().unwrap().fatptr_array, 0);
     }
 }
