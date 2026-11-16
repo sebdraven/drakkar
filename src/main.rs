@@ -156,6 +156,43 @@ struct Cli {
     #[arg(long)]
     disasm_full: bool,
 
+    /// Chaînes de chaque ELF de l'APK, du XAPK (base et splits ABI) ou d'un ELF
+    /// brut reconnu à son magic, avec la manière dont leur borne a été trouvée :
+    /// octet nul, couple {ptr, len} Rust relogé, longueur immédiate du code
+    /// AArch64, ou bloc heuristique. Sans motif : toutes les chaînes ; avec un ou
+    /// plusieurs motifs (répéter l'option) : celles qui en contiennent un,
+    /// comparaison INSENSIBLE À LA CASSE. Constantes cryptographiques reconnues
+    /// au contenu. JSON écrit en flux dans --json-out, requis. Mode single ;
+    /// --native-strings --legend définit chaque champ.
+    #[arg(
+        long,
+        value_name = "MOTIF",
+        num_args = 0..,
+        conflicts_with_all = ["native", "native_arch", "dart_snapshot", "strings"]
+    )]
+    native_strings: Option<Vec<String>>,
+
+    /// (--native-strings) Longueur minimale d'une chaîne, en caractères. Défaut 4.
+    #[arg(long, value_name = "N")]
+    min_length: Option<usize>,
+
+    /// (--native-strings) Restreint l'analyse à un ELF : chemin d'entrée
+    /// (`lib/arm64-v8a/libfoo.so`), `<split>!<entrée>` pour un split, nom du
+    /// fichier pour un ELF brut.
+    #[arg(long, value_name = "CHEMIN")]
+    elf: Option<String>,
+
+    /// (--native-strings) Pour chaque chaîne et constante, les instructions
+    /// AArch64 qui forment son adresse et la fonction qui les porte, sur tout
+    /// le code.
+    #[arg(long)]
+    xrefs: bool,
+
+    /// (--native-strings) Crates Rust nommées par les chemins de source des
+    /// chaînes, et bannières des bibliothèques C liées statiquement.
+    #[arg(long)]
+    crates: bool,
+
     /// Instantané Dart AOT des applications Flutter : localise les quatre blobs
     /// `_kDart*Snapshot*` de chaque lib/*/libapp.so (par .dynsym, à défaut par
     /// balayage du magic), lit l'en-tête des blobs de données (version_hash,
@@ -587,7 +624,7 @@ struct Cli {
 
     /// Affiche la légende des étiquettes et règles de dérivation, puis sort.
     /// Se combine avec --manifest, --cert, --dating, --enrich, --decompile,
-    /// --bundle, --native, --dart-snapshot ou --capabilities.
+    /// --bundle, --native, --native-strings, --dart-snapshot ou --capabilities.
     #[arg(long)]
     legend: bool,
 
@@ -673,6 +710,14 @@ fn main() -> Result<()> {
             "--native-root, --native-roots et --native-string-index n'ont d'effet qu'avec \
              --native --native-disasm"
         );
+    }
+    let native_strings_tuning =
+        cli.min_length.is_some() || cli.elf.is_some() || cli.xrefs || cli.crates;
+    if native_strings_tuning && cli.native_strings.is_none() {
+        bail!("--min-length, --elf, --xrefs et --crates n'ont d'effet qu'avec --native-strings");
+    }
+    if cli.min_length == Some(0) {
+        bail!("--min-length doit valoir au moins 1");
     }
     let dart_tuning = cli.dart_max_rows.is_some()
         || !cli.dart_calibrate.is_empty()
@@ -789,6 +834,47 @@ fn main() -> Result<()> {
         }
         if cli.format.wants_json() {
             emit_json(&report, cli.json_out.as_deref())?;
+        }
+        return Ok(());
+    }
+
+    // Sortie rapide : chaînes des ELF, écrites en flux dans un fichier. Ni
+    // catalogue MITRE ni moteur de règles.
+    if let Some(motifs) = &cli.native_strings {
+        use parser::native_static::native_strings;
+        if cli.legend {
+            println!("{}", native_strings::legend());
+            return Ok(());
+        }
+        if matches!(cli.format, Format::Both | Format::Csv) {
+            bail!(
+                "--native-strings ne rend que du JSON, écrit en flux dans --json-out : \
+                 --format both et --format csv y sont refusés plutôt qu'ignorés"
+            );
+        }
+        let Some(dest) = cli.json_out.as_deref() else {
+            bail!(
+                "--native-strings écrit son rapport en flux dans un fichier, jamais seulement \
+                 sur stdout : passer --json-out <FILE>"
+            );
+        };
+        let Some(input) = src else {
+            bail!("--native-strings requiert un APK, un XAPK ou un ELF (mode single)");
+        };
+        let options = native_strings::Options {
+            patterns: motifs.clone(),
+            min_length: cli.min_length.unwrap_or(native_strings::DEFAULT_MIN_LENGTH),
+            elf: cli.elf.clone(),
+            xrefs: cli.xrefs,
+            crates: cli.crates,
+        };
+        let outcome = native_strings::run(input, splits, &options, dest)?;
+        for line in outcome.stderr_lines(&input.to_string()) {
+            eprintln!("{line}");
+        }
+        eprintln!("JSON écrit dans {}", dest.display());
+        if let Some(elf) = options.elf.as_deref().filter(|_| outcome.elfs.is_empty()) {
+            bail!("--elf {elf} : aucun ELF de ce chemin (elfs_not_selected dans le rapport)");
         }
         return Ok(());
     }

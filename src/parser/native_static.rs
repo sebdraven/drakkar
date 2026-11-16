@@ -41,6 +41,7 @@ use super::source::Source;
 mod decode;
 mod disasm;
 mod jni_table;
+pub mod native_strings;
 
 pub use self::disasm::{
     parse_listing_spec, parse_root_spec, DisasmCall, DisasmFunction, DisasmInsn, DisasmOptions,
