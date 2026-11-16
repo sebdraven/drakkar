@@ -589,6 +589,7 @@ impl<W: Write> Stream<W> {
             min_length: options.min_length,
             max_string_len: MAX_STRING_LEN,
             code_window: CODE_WINDOW,
+            max_propagated_array: MAX_PROPAGATED_ARRAY,
             sections_not_scanned: SECTIONS_NOT_SCANNED.split_whitespace().collect(),
         };
         out.write_all(b"{\"sha256\":")?;
@@ -665,6 +666,16 @@ impl<W: Write> Stream<W> {
             field(out, "c_libraries", libraries)?;
         }
         field(out, "crypto_constants", &elf.crypto_rows(options))?;
+        out.write_all(b",\"format_arrays\":[")?;
+        let arrays = elf.arrays.iter().filter(|a| a.emitted(options));
+        for (index, array) in arrays.enumerate() {
+            if index > 0 {
+                out.write_all(b",")?;
+            }
+            out.write_all(b"\n")?;
+            serde_json::to_writer(&mut *out, &elf.array_row(array, options))?;
+        }
+        out.write_all(b"\n]")?;
         out.write_all(b"}")?;
         outcome.elfs.push(ElfOutcome {
             label: elf_label(split, path),
@@ -908,6 +919,15 @@ impl ElfStrings {
         let area = &self.areas[found.area];
         let names = &options.patterns;
         let patterns = found.patterns.iter().map(|&i| names[i].as_str());
+        let pairs = found.places.iter().map(|&(index, rank)| {
+            let array = &self.arrays[index];
+            PairRow {
+                pair_vaddr: hex(array.pairs[rank].slot),
+                array_vaddr: hex(array.vaddr),
+                array_index: rank,
+                array_len: array.pairs.len(),
+            }
+        });
         Row {
             elf: &self.path,
             elf_sha256: &self.sha256,
@@ -920,7 +940,22 @@ impl ElfStrings {
             boundary: found.boundary,
             split_from: found.split_from.map(hex),
             patterns: patterns.collect(),
+            pairs: pairs.collect(),
             xrefs: options.xrefs.then(|| self.xref_rows(&found.refs)),
+        }
+    }
+
+    fn array_row<'s>(&'s self, array: &'s FatArray, options: &'s Options) -> FormatArrayRow<'s> {
+        let names = &options.patterns;
+        let patterns = array.patterns.iter().map(|&i| names[i].as_str());
+        FormatArrayRow {
+            array_vaddr: hex(array.vaddr),
+            section: array.area.and_then(|a| self.areas[a].name.as_deref()),
+            len: array.pairs.len(),
+            propagated: array.propagated(),
+            pieces: array.pieces.iter().map(String::as_str).collect(),
+            patterns: patterns.collect(),
+            xrefs: options.xrefs.then(|| self.xref_rows(&array.refs)),
         }
     }
 
@@ -950,6 +985,8 @@ impl ElfStrings {
                 kind: r.kind,
                 offset: r.offset,
                 nearest_export: nearest_export(&self.exports, r.insn),
+                array_vaddr: r.array.map(|(at, _)| hex(at)),
+                target_index: r.array.map(|(_, rank)| rank),
             });
         }
         rows
