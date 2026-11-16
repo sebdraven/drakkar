@@ -23,6 +23,9 @@ pub const MAX_STRING_LEN: u64 = 1 << 20;
 /// Instructions pendant lesquelles une page ADRP, une adresse formée ou une
 /// longueur immédiate restent appariables.
 pub const CODE_WINDOW: usize = 8;
+/// Nombre maximal de couples d'un tableau dont les références sont recopiées
+/// sur chaque morceau.
+pub const MAX_PROPAGATED_ARRAY: usize = 16;
 /// Sections allouées jamais découpées en chaînes.
 pub const SECTIONS_NOT_SCANNED: &str =
     ".eh_frame .eh_frame_hdr .gcc_except_table .got .got.plt .data.rel.ro";
@@ -40,6 +43,7 @@ const KIND_ADRP_ADD: &str = "adrp_add";
 const KIND_ADR: &str = "adr";
 const KIND_LDR_LITERAL: &str = "ldr_literal";
 const KIND_FATPTR: &str = "fatptr";
+const KIND_FATPTR_ARRAY: &str = "fatptr_array";
 
 const SOURCE_SYMTAB: &str = "symtab";
 const SOURCE_EH_FRAME: &str = "eh_frame";
@@ -128,6 +132,11 @@ pub struct ElfSummary {
     pub by_boundary: BoundaryCounts,
     pub by_encoding: EncodingCounts,
     pub fatptr_pairs: usize,
+    pub format_arrays: usize,
+    pub pairs_in_arrays: usize,
+    pub arrays_with_xrefs: usize,
+    pub arrays_without_xrefs: usize,
+    pub arrays_not_propagated: usize,
     pub rust_code_dropped_prefixes: usize,
     pub blocks_split: usize,
     pub pieces_from_split: usize,
@@ -205,6 +214,7 @@ pub struct XrefCounts {
     pub unresolved_text: usize,
     pub non_text_targets: usize,
     pub without_function: usize,
+    pub fatptr_array: usize,
 }
 
 /// Adresses formées qui ne désignent rien, selon l'octet visé.
@@ -219,6 +229,7 @@ struct Limits {
     min_length: usize,
     max_string_len: u64,
     code_window: usize,
+    max_propagated_array: usize,
     sections_not_scanned: Vec<&'static str>,
 }
 
@@ -237,8 +248,18 @@ struct Row<'a> {
     split_from: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     patterns: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pairs: Vec<PairRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     xrefs: Option<Vec<XrefRow<'a>>>,
+}
+
+#[derive(Serialize)]
+struct PairRow {
+    pair_vaddr: String,
+    array_vaddr: String,
+    array_index: usize,
+    array_len: usize,
 }
 
 #[derive(Serialize)]
@@ -248,6 +269,23 @@ struct XrefRow<'a> {
     kind: &'static str,
     offset: u64,
     nearest_export: Option<NearestExport<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    array_vaddr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_index: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct FormatArrayRow<'a> {
+    array_vaddr: String,
+    section: Option<&'a str>,
+    len: usize,
+    propagated: bool,
+    pieces: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    patterns: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    xrefs: Option<Vec<XrefRow<'a>>>,
 }
 
 #[derive(Serialize)]
@@ -330,6 +368,8 @@ struct Found {
     /// Index dans `Options::patterns`.
     patterns: Vec<usize>,
     refs: Vec<Ref>,
+    /// Couples qui désignent la chaîne : (index du tableau, rang).
+    places: Vec<(usize, usize)>,
 }
 
 impl Found {
@@ -349,6 +389,7 @@ impl Found {
             split_from: None,
             patterns: Vec::new(),
             refs: Vec::new(),
+            places: Vec::new(),
         }
     }
 
@@ -415,6 +456,8 @@ struct Ref {
     insn: u64,
     kind: &'static str,
     offset: u64,
+    /// fatptr_array : (adresse du tableau, rang du couple visé).
+    array: Option<(u64, usize)>,
 }
 
 /// Adresse formée par l'instruction `insn`.
@@ -423,6 +466,36 @@ struct Formed {
     insn: u64,
     target: u64,
     kind: &'static str,
+    /// Emplacement du couple dont `target` est le pointeur.
+    pair: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct FatPair {
+    slot: u64,
+    ptr: u64,
+    len: u64,
+}
+
+/// Couples rust_fatptr d'une même zone, aux emplacements consécutifs.
+struct FatArray {
+    area: Option<usize>,
+    vaddr: u64,
+    pairs: Vec<FatPair>,
+    pieces: Vec<String>,
+    /// Index dans `Options::patterns`.
+    patterns: Vec<usize>,
+    refs: Vec<Ref>,
+}
+
+impl FatArray {
+    fn emitted(&self, options: &Options) -> bool {
+        options.patterns.is_empty() || !self.patterns.is_empty()
+    }
+
+    fn propagated(&self) -> bool {
+        self.pairs.len() <= MAX_PROPAGATED_ARRAY
+    }
 }
 
 struct CryptoHit {
@@ -473,6 +546,8 @@ struct ElfStrings {
     areas: Vec<Area>,
     /// Chaînes rendues, triées par adresse.
     strings: Vec<Found>,
+    /// Tous les tableaux, triés par adresse ; les motifs filtrent à l'écriture.
+    arrays: Vec<FatArray>,
     /// Exports STT_FUNC définis, triés par adresse.
     exports: Vec<(u64, String)>,
     bounds: Bounds,
@@ -815,6 +890,7 @@ impl ElfStrings {
             summary,
             areas: Vec::new(),
             strings: Vec::new(),
+            arrays: Vec::new(),
             exports: Vec::new(),
             bounds: Bounds::default(),
             crates: None,
