@@ -23,6 +23,9 @@ pub const MAX_STRING_LEN: u64 = 1 << 20;
 /// Instructions pendant lesquelles une page ADRP, une adresse formée ou une
 /// longueur immédiate restent appariables.
 pub const CODE_WINDOW: usize = 8;
+/// Nombre maximal de couples d'un tableau dont les références sont recopiées
+/// sur chaque morceau.
+pub const MAX_PROPAGATED_ARRAY: usize = 16;
 /// Sections allouées jamais découpées en chaînes.
 pub const SECTIONS_NOT_SCANNED: &str =
     ".eh_frame .eh_frame_hdr .gcc_except_table .got .got.plt .data.rel.ro";
@@ -40,6 +43,7 @@ const KIND_ADRP_ADD: &str = "adrp_add";
 const KIND_ADR: &str = "adr";
 const KIND_LDR_LITERAL: &str = "ldr_literal";
 const KIND_FATPTR: &str = "fatptr";
+const KIND_FATPTR_ARRAY: &str = "fatptr_array";
 
 const SOURCE_SYMTAB: &str = "symtab";
 const SOURCE_EH_FRAME: &str = "eh_frame";
@@ -128,6 +132,11 @@ pub struct ElfSummary {
     pub by_boundary: BoundaryCounts,
     pub by_encoding: EncodingCounts,
     pub fatptr_pairs: usize,
+    pub format_arrays: usize,
+    pub pairs_in_arrays: usize,
+    pub arrays_with_xrefs: usize,
+    pub arrays_without_xrefs: usize,
+    pub arrays_not_propagated: usize,
     pub rust_code_dropped_prefixes: usize,
     pub blocks_split: usize,
     pub pieces_from_split: usize,
@@ -205,6 +214,7 @@ pub struct XrefCounts {
     pub unresolved_text: usize,
     pub non_text_targets: usize,
     pub without_function: usize,
+    pub fatptr_array: usize,
 }
 
 /// Adresses formées qui ne désignent rien, selon l'octet visé.
@@ -219,6 +229,7 @@ struct Limits {
     min_length: usize,
     max_string_len: u64,
     code_window: usize,
+    max_propagated_array: usize,
     sections_not_scanned: Vec<&'static str>,
 }
 
@@ -237,8 +248,18 @@ struct Row<'a> {
     split_from: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     patterns: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pairs: Vec<PairRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     xrefs: Option<Vec<XrefRow<'a>>>,
+}
+
+#[derive(Serialize)]
+struct PairRow {
+    pair_vaddr: String,
+    array_vaddr: String,
+    array_index: usize,
+    array_len: usize,
 }
 
 #[derive(Serialize)]
@@ -248,6 +269,23 @@ struct XrefRow<'a> {
     kind: &'static str,
     offset: u64,
     nearest_export: Option<NearestExport<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    array_vaddr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_index: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct FormatArrayRow<'a> {
+    array_vaddr: String,
+    section: Option<&'a str>,
+    len: usize,
+    propagated: bool,
+    pieces: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    patterns: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    xrefs: Option<Vec<XrefRow<'a>>>,
 }
 
 #[derive(Serialize)]
@@ -330,6 +368,8 @@ struct Found {
     /// Index dans `Options::patterns`.
     patterns: Vec<usize>,
     refs: Vec<Ref>,
+    /// Couples qui désignent la chaîne : (index du tableau, rang).
+    places: Vec<(usize, usize)>,
 }
 
 impl Found {
@@ -349,6 +389,7 @@ impl Found {
             split_from: None,
             patterns: Vec::new(),
             refs: Vec::new(),
+            places: Vec::new(),
         }
     }
 
@@ -415,6 +456,8 @@ struct Ref {
     insn: u64,
     kind: &'static str,
     offset: u64,
+    /// fatptr_array : (adresse du tableau, rang du couple visé).
+    array: Option<(u64, usize)>,
 }
 
 /// Adresse formée par l'instruction `insn`.
@@ -423,6 +466,36 @@ struct Formed {
     insn: u64,
     target: u64,
     kind: &'static str,
+    /// Emplacement du couple dont `target` est le pointeur.
+    pair: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct FatPair {
+    slot: u64,
+    ptr: u64,
+    len: u64,
+}
+
+/// Couples rust_fatptr d'une même zone, aux emplacements consécutifs.
+struct FatArray {
+    area: Option<usize>,
+    vaddr: u64,
+    pairs: Vec<FatPair>,
+    pieces: Vec<String>,
+    /// Index dans `Options::patterns`.
+    patterns: Vec<usize>,
+    refs: Vec<Ref>,
+}
+
+impl FatArray {
+    fn emitted(&self, options: &Options) -> bool {
+        options.patterns.is_empty() || !self.patterns.is_empty()
+    }
+
+    fn propagated(&self) -> bool {
+        self.pairs.len() <= MAX_PROPAGATED_ARRAY
+    }
 }
 
 struct CryptoHit {
@@ -473,6 +546,8 @@ struct ElfStrings {
     areas: Vec<Area>,
     /// Chaînes rendues, triées par adresse.
     strings: Vec<Found>,
+    /// Tous les tableaux, triés par adresse ; les motifs filtrent à l'écriture.
+    arrays: Vec<FatArray>,
     /// Exports STT_FUNC définis, triés par adresse.
     exports: Vec<(u64, String)>,
     bounds: Bounds,
@@ -589,6 +664,7 @@ impl<W: Write> Stream<W> {
             min_length: options.min_length,
             max_string_len: MAX_STRING_LEN,
             code_window: CODE_WINDOW,
+            max_propagated_array: MAX_PROPAGATED_ARRAY,
             sections_not_scanned: SECTIONS_NOT_SCANNED.split_whitespace().collect(),
         };
         out.write_all(b"{\"sha256\":")?;
@@ -665,6 +741,16 @@ impl<W: Write> Stream<W> {
             field(out, "c_libraries", libraries)?;
         }
         field(out, "crypto_constants", &elf.crypto_rows(options))?;
+        out.write_all(b",\"format_arrays\":[")?;
+        let arrays = elf.arrays.iter().filter(|a| a.emitted(options));
+        for (index, array) in arrays.enumerate() {
+            if index > 0 {
+                out.write_all(b",")?;
+            }
+            out.write_all(b"\n")?;
+            serde_json::to_writer(&mut *out, &elf.array_row(array, options))?;
+        }
+        out.write_all(b"\n]")?;
         out.write_all(b"}")?;
         outcome.elfs.push(ElfOutcome {
             label: elf_label(split, path),
@@ -804,6 +890,7 @@ impl ElfStrings {
             summary,
             areas: Vec::new(),
             strings: Vec::new(),
+            arrays: Vec::new(),
             exports: Vec::new(),
             bounds: Bounds::default(),
             crates: None,
@@ -831,6 +918,7 @@ impl ElfStrings {
         let (areas, source) = data_areas(&image);
         let (bounds, functions) = function_bounds(&image, &areas, &symbols, &local_symbols);
         let (mut proven, pairs) = fatptr_strings(&image, &slots, &areas);
+        let mut arrays = fatptr_arrays(&image, &areas, &pairs);
         let mut formed = Vec::new();
         let mut code_scan = None;
         if is_aarch64(&image) {
@@ -850,6 +938,7 @@ impl ElfStrings {
         proven.sort_by_key(|p| (p.vaddr, p.len, p.boundary != BOUNDARY_FATPTR));
         proven.dedup_by_key(|p| (p.vaddr, p.len));
         let dropped_prefixes = drop_code_prefixes(&mut proven);
+        array_refs(&mut arrays, &formed);
         formed.retain(|f| areas.iter().any(|a| !a.exec && a.contains(f.target)));
         let mut targets: Vec<u64> = formed.iter().map(|f| f.target).collect();
         targets.sort_unstable();
@@ -877,19 +966,30 @@ impl ElfStrings {
                 without_function += 1;
             }
         }
+        let fatptr_array = attach_array_refs(&mut found, &arrays);
         if let Some(counts) = &mut self.summary.xrefs {
             *counts = XrefCounts {
                 total,
                 unresolved_text: unresolved.unresolved_text,
                 non_text_targets: unresolved.non_text_targets,
                 without_function,
+                fatptr_array,
             };
         }
         self.summary.strings_found = found.len();
         filter_patterns(&mut found, &options.patterns);
+        mark_array_patterns(&mut arrays, &options.patterns);
         self.summary.strings_emitted = found.len();
         self.summary.areas = Some(source);
         self.summary.fatptr_pairs = pairs.len();
+        let with_xrefs = arrays.iter().filter(|a| !a.refs.is_empty()).count();
+        self.summary.format_arrays = arrays.len();
+        let multi = arrays.iter().filter(|a| a.pairs.len() > 1);
+        self.summary.pairs_in_arrays = multi.map(|a| a.pairs.len()).sum();
+        self.summary.arrays_with_xrefs = with_xrefs;
+        self.summary.arrays_without_xrefs = arrays.len() - with_xrefs;
+        let referenced = arrays.iter().filter(|a| !a.refs.is_empty());
+        self.summary.arrays_not_propagated = referenced.filter(|a| !a.propagated()).count();
         self.summary.rust_code_dropped_prefixes = dropped_prefixes;
         self.summary.blocks_split = blocks_split;
         self.summary.pieces_from_split = pieces;
@@ -900,6 +1000,7 @@ impl ElfStrings {
         self.areas = areas;
         self.bounds = bounds;
         self.strings = found;
+        self.arrays = arrays;
         self.crypto = crypto;
         Ok(())
     }
@@ -908,6 +1009,15 @@ impl ElfStrings {
         let area = &self.areas[found.area];
         let names = &options.patterns;
         let patterns = found.patterns.iter().map(|&i| names[i].as_str());
+        let pairs = found.places.iter().map(|&(index, rank)| {
+            let array = &self.arrays[index];
+            PairRow {
+                pair_vaddr: hex(array.pairs[rank].slot),
+                array_vaddr: hex(array.vaddr),
+                array_index: rank,
+                array_len: array.pairs.len(),
+            }
+        });
         Row {
             elf: &self.path,
             elf_sha256: &self.sha256,
@@ -920,7 +1030,22 @@ impl ElfStrings {
             boundary: found.boundary,
             split_from: found.split_from.map(hex),
             patterns: patterns.collect(),
+            pairs: pairs.collect(),
             xrefs: options.xrefs.then(|| self.xref_rows(&found.refs)),
+        }
+    }
+
+    fn array_row<'s>(&'s self, array: &'s FatArray, options: &'s Options) -> FormatArrayRow<'s> {
+        let names = &options.patterns;
+        let patterns = array.patterns.iter().map(|&i| names[i].as_str());
+        FormatArrayRow {
+            array_vaddr: hex(array.vaddr),
+            section: array.area.and_then(|a| self.areas[a].name.as_deref()),
+            len: array.pairs.len(),
+            propagated: array.propagated(),
+            pieces: array.pieces.iter().map(String::as_str).collect(),
+            patterns: patterns.collect(),
+            xrefs: options.xrefs.then(|| self.xref_rows(&array.refs)),
         }
     }
 
@@ -950,6 +1075,8 @@ impl ElfStrings {
                 kind: r.kind,
                 offset: r.offset,
                 nearest_export: nearest_export(&self.exports, r.insn),
+                array_vaddr: r.array.map(|(at, _)| hex(at)),
+                target_index: r.array.map(|(_, rank)| rank),
             });
         }
         rows
@@ -1061,6 +1188,116 @@ fn fatptr_strings(
         }
     }
     (proven, pairs)
+}
+
+/// Couples de `pairs` regroupés en tableaux : même zone, emplacements
+/// consécutifs au pas de deux mots. Triés par adresse.
+fn fatptr_arrays(image: &Image, areas: &[Area], pairs: &HashMap<u64, u64>) -> Vec<FatArray> {
+    let stride = 2 * image.ptr_size;
+    let mut slots: Vec<(u64, u64)> = pairs.iter().map(|(&slot, &ptr)| (slot, ptr)).collect();
+    slots.sort_unstable();
+    let mut arrays: Vec<FatArray> = Vec::new();
+    for (slot, ptr) in slots {
+        let Some(len) = image.word_at(slot.wrapping_add(image.ptr_size)) else {
+            continue;
+        };
+        let Some(text) = proven_text(image, areas, ptr, len) else {
+            continue;
+        };
+        let area = areas.iter().position(|a| a.contains(slot));
+        let follows = arrays.last().is_some_and(|a| {
+            let last = a.pairs.last().map(|p| p.slot.wrapping_add(stride));
+            a.area == area && last == Some(slot)
+        });
+        if !follows {
+            arrays.push(FatArray {
+                area,
+                vaddr: slot,
+                pairs: Vec::new(),
+                pieces: Vec::new(),
+                patterns: Vec::new(),
+                refs: Vec::new(),
+            });
+        }
+        if let Some(array) = arrays.last_mut() {
+            array.pairs.push(FatPair { slot, ptr, len });
+            array.pieces.push(text.to_string());
+        }
+    }
+    arrays
+}
+
+/// Rattache à son tableau chaque adresse formée sur l'emplacement d'un couple.
+fn array_refs(arrays: &mut [FatArray], formed: &[Formed]) {
+    let mut rank_of: HashMap<u64, (usize, usize)> = HashMap::new();
+    for (index, array) in arrays.iter().enumerate() {
+        for (rank, pair) in array.pairs.iter().enumerate() {
+            rank_of.insert(pair.slot, (index, rank));
+        }
+    }
+    for f in formed {
+        let Some(&(index, rank)) = f.pair.and_then(|slot| rank_of.get(&slot)) else {
+            continue;
+        };
+        let array = &mut arrays[index];
+        let vaddr = array.vaddr;
+        array.refs.push(Ref {
+            insn: f.insn,
+            kind: KIND_FATPTR_ARRAY,
+            offset: 0,
+            array: Some((vaddr, rank)),
+        });
+    }
+}
+
+/// Pose sur chaque chaîne rust_fatptr tous ses couples, et les références de
+/// ceux de ses tableaux qui sont propagés, sauf instruction déjà rattachée à
+/// la chaîne. Rend le nombre de références posées.
+fn attach_array_refs(found: &mut [Found], arrays: &[FatArray]) -> usize {
+    let mut places: HashMap<(u64, u64), Vec<(usize, usize)>> = HashMap::new();
+    for (index, array) in arrays.iter().enumerate() {
+        for (rank, pair) in array.pairs.iter().enumerate() {
+            let key = (pair.ptr, pair.len);
+            places.entry(key).or_default().push((index, rank));
+        }
+    }
+    let mut added = 0;
+    for f in found.iter_mut().filter(|f| f.boundary == BOUNDARY_FATPTR) {
+        let Some(at) = places.get(&(f.vaddr, f.len)) else {
+            continue;
+        };
+        f.places = at.clone();
+        let mut seen: HashSet<u64> = f.refs.iter().map(|r| r.insn).collect();
+        for &(index, _) in at {
+            let array = &arrays[index];
+            if !array.propagated() {
+                continue;
+            }
+            for r in &array.refs {
+                if seen.insert(r.insn) {
+                    f.refs.push(*r);
+                    added += 1;
+                }
+            }
+        }
+    }
+    added
+}
+
+/// Motifs contenus dans au moins un morceau de chaque tableau.
+fn mark_array_patterns(arrays: &mut [FatArray], patterns: &[String]) {
+    if patterns.is_empty() {
+        return;
+    }
+    let needles: Vec<String> = patterns.iter().map(|p| p.to_lowercase()).collect();
+    for array in arrays {
+        let pieces: Vec<String> = array.pieces.iter().map(|p| p.to_lowercase()).collect();
+        for (index, needle) in needles.iter().enumerate() {
+            if pieces.iter().any(|p| p.contains(needle.as_str())) {
+                array.patterns.push(index);
+            }
+        }
+    }
 }
 
 struct Piece<'a> {
@@ -1305,6 +1542,7 @@ fn attribute(
             insn: f.insn,
             kind: f.kind,
             offset,
+            array: None,
         };
         let mut hit = false;
         for &i in constants.get(&f.target).into_iter().flatten() {
@@ -1846,11 +2084,13 @@ impl Sweep {
                 insn: pc,
                 target: string,
                 kind: KIND_FATPTR,
+                pair: Some(target),
             },
             None => Formed {
                 insn: pc,
                 target,
                 kind,
+                pair: None,
             },
         };
         self.formed.push(formed);
@@ -1893,11 +2133,13 @@ impl Sweep {
         } else if w & 0xffc0_0000 == 0xf940_0000 {
             let offset = u64::from((w >> 10) & 0xfff) * 8;
             if let Some(Held::Page(page)) = self.get(rn) {
-                if let Some(&target) = pairs.get(&page.wrapping_add(offset)) {
+                let slot = page.wrapping_add(offset);
+                if let Some(&target) = pairs.get(&slot) {
                     self.formed.push(Formed {
                         insn: pc,
                         target,
                         kind: KIND_FATPTR,
+                        pair: Some(slot),
                     });
                 }
             }
@@ -2342,8 +2584,9 @@ par ce magic est un ELF, quel que soit son chemin. --elf <chemin> restreint l'an
 à un ELF : chemin d'entrée (lib/arm64-v8a/libfoo.so), <split>!<entrée> pour un ELF de
 split, nom du fichier pour un ELF brut.
 Motifs : sous-chaîne, casse ignorée, même sémantique que --strings ; sans motif,
-toutes les chaînes. Les motifs ne filtrent que strings[] : comptes, crates,
-bibliothèques C et constantes portent sur toutes les chaînes extraites.
+toutes les chaînes. Les motifs ne filtrent que strings[] et format_arrays[] :
+comptes, crates, bibliothèques C et constantes portent sur toutes les chaînes
+extraites.
 Sortie : JSON écrit en flux dans --json-out (obligatoire), ELF après ELF et chaîne
 après chaîne ; rien sur stdout. Aucune chaîne, aucun tableau n'est tronqué.
 
@@ -2359,6 +2602,9 @@ RAPPORT
                   rust_fatptr ou rust_code ; un couple plus long est ignoré ;
                   code_window = instructions pendant lesquelles une page ADRP, une
                   adresse formée ou une longueur immédiate restent appariables ;
+                  max_propagated_array = nombre maximal de couples d'un tableau
+                  dont les références sont recopiées sur chaque morceau (section
+                  TABLEAUX) ;
                   sections_not_scanned = sections allouées jamais découpées en
                   chaînes.
   elfs[]          Un objet par ELF retenu, dans l'ordre de l'archive : base, puis
@@ -2377,6 +2623,8 @@ ELF (elfs[])
   strings[]       Chaînes retenues, triées par vaddr (section CHAÎNE).
   crates[], c_libraries[]  Avec --crates seulement (section CRATES).
   crypto_constants[]  Section CONSTANTES.
+  format_arrays[] Tableaux de couples rust_fatptr, triés par adresse (section
+                  TABLEAUX).
 
 RÉSUMÉ (elfs[].summary)
   areas           sections = zones lues d'après les section headers ; segments = sans
@@ -2389,6 +2637,18 @@ RÉSUMÉ (elfs[].summary)
                   heuristic.
   by_encoding     strings_found par encoding : ascii, utf8, utf16le.
   fatptr_pairs    Couples {ptr, len} retenus dans les données.
+  format_arrays   Tableaux de couples (section TABLEAUX), tableaux d'un seul couple
+                  compris, avant filtre des motifs.
+  pairs_in_arrays Couples qui appartiennent à un tableau d'au moins deux couples ;
+                  fatptr_pairs - pairs_in_arrays = couples isolés.
+  arrays_with_xrefs  Tableaux dont au moins un couple a son adresse formée par une
+                  instruction (kind fatptr_array). Calculé avec ou sans --xrefs ;
+                  toujours 0 quand code_scan est null.
+  arrays_without_xrefs  format_arrays - arrays_with_xrefs. Même limite que xrefs vide
+                  (section RÉFÉRENCES) : ce n'est pas une preuve de non-usage.
+  arrays_not_propagated  Tableaux de plus de max_propagated_array couples qui ont au
+                  moins une référence : leurs références restent dans
+                  format_arrays[].xrefs, aucune n'est posée sur leurs morceaux.
   rust_code_dropped_prefixes  Candidats rust_code écartés parce qu'un intervalle
                   prouvé plus long (rust_fatptr ou rust_code) commence à la même
                   adresse (section BORNES).
@@ -2407,7 +2667,7 @@ RÉSUMÉ (elfs[].summary)
                   eh_frame_unread = FDE non lus : CIE introuvable, codage d'adresse
                   non modélisé, début hors du code.
   xrefs           Avec --xrefs, null sinon. total = références rattachées à une
-                  chaîne ou à une constante ;
+                  chaîne ou à une constante, fatptr_array exclues ;
                   unresolved_text = adresses formées qui tombent dans une zone de
                   chaînes en lecture seule, sur un octet de texte (section BORNES)
                   qu'aucune chaîne extraite ne couvre et où ne commence aucune
@@ -2416,7 +2676,11 @@ RÉSUMÉ (elfs[].summary)
                   non_text_targets = mêmes adresses, mais sur un octet qui n'est pas
                   du texte : tables numériques, données binaires de .rodata ;
                   without_function = références dont l'instruction n'est dans
-                  aucune fonction bornée.
+                  aucune fonction bornée, fatptr_array exclues ;
+                  fatptr_array = références de kind fatptr_array effectivement posées
+                  sur les chaînes de strings_found, une par instruction et par
+                  chaîne, donc venues des seuls tableaux propagés ; comptées à part,
+                  ni dans total ni dans without_function.
   crypto_constants  Nombre de constantes reconnues.
   anomalies       Relocations illisibles ou non modélisées, même vocabulaire que
                   --native ; elf_unreadable: <raison> quand l'ELF n'a pas pu être lu
@@ -2449,6 +2713,15 @@ CHAÎNE (elfs[].strings[])
   split_from      vaddr du bloc nul ou heuristic dont la chaîne est un morceau
                   (section DÉCOUPE) ; absent pour une chaîne non découpée.
   patterns        Motifs contenus, tels que passés ; absent sans motif.
+  pairs[]         rust_fatptr seulement, absent pour les autres bornes. Un objet par
+                  couple {ptr, len} qui désigne exactement cette chaîne (même ptr,
+                  même len), triés par adresse du couple : une chaîne désignée par
+                  plusieurs couples sort une fois, avec un objet par couple.
+                  pair_vaddr = adresse du couple ;
+                  array_vaddr = adresse du premier couple de son tableau (section
+                  TABLEAUX) ;
+                  array_index = rang du couple dans le tableau, à partir de 0 ;
+                  array_len = nombre de couples du tableau, 1 pour un couple isolé.
   xrefs[]         Avec --xrefs seulement (section RÉFÉRENCES).
 
 BORNES (boundary)
@@ -2506,7 +2779,8 @@ DÉCOUPE AUX ADRESSES FORMÉES (AArch64, avec ou sans --xrefs)
   lus sur les blocs entiers, avant découpe. Un bloc que rien ne référence en son
   milieu reste heuristic, entier.
 
-RÉFÉRENCES (strings[].xrefs[], crypto_constants[].xrefs[] ; --xrefs, AArch64 seulement)
+RÉFÉRENCES (strings[].xrefs[], crypto_constants[].xrefs[], format_arrays[].xrefs[] ;
+--xrefs, AArch64 seulement)
   Balayage linéaire de toutes les zones exécutables, pas seulement des fonctions
   atteintes depuis JNI. L'état des registres est remis à zéro au début de chaque
   fonction bornée et après B, BR, RET ; x0 à x18 et x30 sont oubliés après BL et BLR.
@@ -2521,11 +2795,24 @@ RÉFÉRENCES (strings[].xrefs[], crypto_constants[].xrefs[] ; --xrefs, AArch64 s
                   l'est, est l'adresse ;
                   fatptr = l'adresse formée (ADRP+ADD, ADR, LDR littéral, ou ADRP puis
                   LDR [xN, #imm]) est l'emplacement d'un couple rust_fatptr : la
-                  référence va à la chaîne du couple.
+                  référence va à la chaîne du couple ;
+                  fatptr_array = la même instruction que fatptr, vue depuis le
+                  tableau du couple visé (section TABLEAUX) : la référence va à
+                  chaque morceau du tableau, sauf à une chaîne qui porte déjà cette
+                  instruction, en fatptr ou sous un autre kind. Une instruction ne
+                  compte qu'une fois par chaîne : le morceau visé garde fatptr, les
+                  autres reçoivent fatptr_array. Seulement depuis un tableau d'au
+                  plus max_propagated_array couples : au-delà, la référence reste
+                  dans format_arrays[].xrefs, et une entrée de ce tableau peut avoir
+                  xrefs vide alors que sa table est référencée (section TABLEAUX).
   offset          Écart en octets entre l'adresse formée et vaddr : 0 quand elle
                   désigne le début, donc pour tout morceau de découpe ; non nul pour
                   une adresse au milieu d'une chaîne qui n'a pas été coupée (chaîne
-                  prouvée, ou milieu d'un caractère).
+                  prouvée, ou milieu d'un caractère). Toujours 0 pour fatptr_array.
+  array_vaddr     fatptr_array seulement : adresse du premier couple du tableau.
+  target_index    fatptr_array seulement : rang, à partir de 0, du couple dont
+                  l'instruction forme l'adresse ; 0 quand elle vise le tableau par
+                  son début.
   nearest_export  Export de .dynsym (STT_FUNC défini, STB_GLOBAL ou STB_WEAK) de plus
                   haute adresse inférieure ou égale à insn_addr : name, et distance =
                   insn_addr - adresse de l'export, en octets. null si aucun ne précède.
@@ -2536,6 +2823,50 @@ RÉFÉRENCES (strings[].xrefs[], crypto_constants[].xrefs[] ; --xrefs, AArch64 s
                   plus de code_window instructions ou par un branchement, le code
                   d'une autre machine qu'AArch64, le code chiffré ou produit à
                   l'exécution, les données lues par une autre bibliothèque.
+
+TABLEAUX (elfs[].format_arrays[])
+  Les morceaux littéraux d'une chaîne de format Rust (fmt::Arguments) forment un
+  tableau de couples {ptr, len} contigus, et le code ne forme que l'adresse du
+  tableau : sans regroupement, les morceaux autres que le premier n'ont aucune
+  référence. Les couples rust_fatptr sont regroupés en tableaux : même zone,
+  emplacements consécutifs au pas de deux mots (16 octets en 64 bits, 8 en 32 bits),
+  chacun validé comme rust_fatptr. Un couple isolé est un tableau de longueur 1. Tous
+  les tableaux sont rendus.
+  array_vaddr     Adresse du premier couple.
+  section         Section qui porte les couples ; null sans section headers.
+  len             Nombre de couples.
+  propagated      true quand len <= max_propagated_array : les références du tableau
+                  sont aussi posées sur ses morceaux, en fatptr_array ; false sinon,
+                  elles ne sont que dans xrefs[] ci-dessous.
+  pieces[]        Valeur de chaque morceau, dans l'ordre des couples, quelle que soit
+                  sa longueur : un morceau plus court que min_length figure ici et
+                  dans aucun strings[]. Les arguments interpolés entre les morceaux ne
+                  sont pas reconstitués.
+  patterns        Motifs contenus dans au moins un morceau ; absent sans motif. Avec
+                  des motifs, seuls les tableaux qui en contiennent un sont rendus ;
+                  un motif à cheval sur deux morceaux n'est pas trouvé.
+  xrefs[]         Avec --xrefs : instructions qui forment l'adresse d'un couple du
+                  tableau, kind fatptr_array, array_vaddr, target_index. Rendues que
+                  le tableau soit propagé ou non.
+  Propagation. Une instruction qui forme l'adresse d'une table de &str la charge ;
+  elle ne lit pas pour autant chacune de ses entrées (table de versions Unicode,
+  d'alias de propriétés, de jetons d'un lexer : le code qui la reçoit peut n'en lire
+  qu'une partie). Recopier sa référence sur chaque entrée ferait passer pour lue
+  chacune d'elles. Elle n'est donc recopiée sur les morceaux que pour un tableau
+  d'au plus max_propagated_array couples ; ce seuil est un paramètre de l'outil, pas
+  une taille mesurée des chaînes de format. Au-delà, propagated = false, la
+  référence reste dans format_arrays[].xrefs, et une entrée peut avoir xrefs vide
+  dans strings[] alors que sa table est référencée : lire format_arrays[], que
+  pairs[] de la chaîne désigne par array_vaddr. pairs[] est renseigné pour tous les
+  tableaux, propagés ou non : il dit où est la chaîne, pas qui la lit. Une chaîne de
+  format de plus de max_propagated_array morceaux est traitée comme une table.
+  Limites. Deux tableaux rangés bout à bout, sans mot intercalé, sont fusionnés en un
+  seul : rien dans les octets ne marque leur frontière, et les références de l'un vont
+  aussi aux morceaux de l'autre. Un couple non validé (longueur 0 ou supérieure à
+  max_string_len, pointeur hors d'une zone de chaînes en lecture seule, texte
+  invalide) coupe le tableau en deux à cet endroit. Le regroupement ne prouve pas
+  qu'un tableau est une chaîne de format : toute table de &str contiguë (liste de
+  noms, de champs) est regroupée de la même façon.
 
 CRATES (--crates)
   crates[]        Chemins de source trouvés dans les chaînes extraites, \\ normalisé en
@@ -2713,15 +3044,25 @@ mod tests {
         spec(".rodata", SHT_PROGBITS, 2, RODATA, data.to_vec())
     }
 
-    /// Couples {ptr, len} dans .data.rel.ro, `ptr` relogé par R_AARCH64_RELATIVE.
+    /// Couples {ptr, len} contigus dans .data.rel.ro, `ptr` relogé par
+    /// R_AARCH64_RELATIVE.
     fn fat_pointers(pairs: &[(u64, u64)]) -> [Spec; 2] {
-        let mut relro = Vec::new();
+        let mut placed = Vec::new();
+        for (i, &(ptr, len)) in pairs.iter().enumerate() {
+            placed.push((16 * i as u64, ptr, len));
+        }
+        fat_pointers_at(&placed)
+    }
+
+    /// (décalage dans .data.rel.ro, ptr, len) ; les mots non écrits restent nuls.
+    fn fat_pointers_at(pairs: &[(u64, u64, u64)]) -> [Spec; 2] {
+        let size = pairs.iter().map(|p| p.0 + 16).max().unwrap_or(0);
+        let mut relro = vec![0u8; size as usize];
         let mut rela = Vec::new();
         let info = u64::from(elf::R_AARCH64_RELATIVE);
-        for (i, &(ptr, len)) in pairs.iter().enumerate() {
-            relro.extend_from_slice(&0u64.to_le_bytes());
-            relro.extend_from_slice(&len.to_le_bytes());
-            rela.extend_from_slice(&(RELRO + 16 * i as u64).to_le_bytes());
+        for &(at, ptr, len) in pairs {
+            put(&mut relro, at + 8, &len.to_le_bytes());
+            rela.extend_from_slice(&(RELRO + at).to_le_bytes());
             rela.extend_from_slice(&info.to_le_bytes());
             rela.extend_from_slice(&ptr.to_le_bytes());
         }
@@ -3065,5 +3406,228 @@ mod tests {
         let xrefs = report.summary.xrefs.as_ref().unwrap();
         assert_eq!(xrefs.non_text_targets, 1);
         assert_eq!(xrefs.unresolved_text, 0);
+    }
+
+    const PIECES: &[u8] = b"alphabravocharliedelta\0";
+
+    fn arrays_of(report: &ElfStrings) -> Vec<(u64, usize)> {
+        let arrays = report.arrays.iter();
+        arrays.map(|a| (a.vaddr, a.pairs.len())).collect()
+    }
+
+    /// (insn, kind, (array_vaddr, index_du_couple)) de chaque reference.
+    type RefTriple = (u64, &'static str, Option<(u64, usize)>);
+
+    fn refs_of(found: &Found) -> Vec<RefTriple> {
+        let refs = found.refs.iter();
+        refs.map(|r| (r.insn, r.kind, r.array)).collect()
+    }
+
+    /// (pair_vaddr, array_index, array_len) de chaque couple de la ligne.
+    fn pairs_of<'r>(row: &'r Row<'_>) -> Vec<(&'r str, usize, usize)> {
+        let pairs = row.pairs.iter();
+        pairs
+            .map(|p| (p.pair_vaddr.as_str(), p.array_index, p.array_len))
+            .collect()
+    }
+
+    #[test]
+    fn an_array_referenced_on_its_first_pair_gives_the_reference_to_every_piece() {
+        let options = options();
+        let code = [adrp(0, TEXT, RELRO), add_imm(0, 0, 0), RET];
+        let [relro, rela] = fat_pointers(&[
+            (RODATA, 5),
+            (RODATA + 5, 5),
+            (RODATA + 10, 7),
+            (RODATA + 17, 5),
+        ]);
+        let bytes = elf_with(&[text(&code), rodata(PIECES), relro, rela]);
+        let report = analyze("libt.so", None, &bytes, &options);
+        assert_eq!(arrays_of(&report), vec![(RELRO, 4)]);
+        let pieces = &report.arrays[0].pieces;
+        assert_eq!(pieces, &["alpha", "bravo", "charlie", "delta"]);
+
+        let add = TEXT + 4;
+        let array = Some((RELRO, 0));
+        let refs: Vec<_> = report.strings.iter().map(refs_of).collect();
+        let expected = vec![
+            vec![(add, KIND_FATPTR, None)],
+            vec![(add, KIND_FATPTR_ARRAY, array)],
+            vec![(add, KIND_FATPTR_ARRAY, array)],
+            vec![(add, KIND_FATPTR_ARRAY, array)],
+        ];
+        assert_eq!(refs, expected);
+
+        let row = report.row(&report.strings[2], &options);
+        assert_eq!(pairs_of(&row), vec![("0x3020", 2, 4)]);
+        assert_eq!(row.pairs[0].array_vaddr, "0x3000");
+        let xref = &row.xrefs.as_ref().unwrap()[0];
+        assert_eq!(xref.array_vaddr.as_deref(), Some("0x3000"));
+        assert_eq!(xref.target_index, Some(0));
+
+        let s = &report.summary;
+        assert_eq!(s.format_arrays, 1);
+        assert_eq!(s.pairs_in_arrays, 4);
+        assert_eq!((s.arrays_with_xrefs, s.arrays_without_xrefs), (1, 0));
+        let xrefs = s.xrefs.as_ref().unwrap();
+        assert_eq!((xrefs.total, xrefs.fatptr_array), (1, 3));
+    }
+
+    #[test]
+    fn a_word_between_two_arrays_keeps_them_apart() {
+        let [relro, rela] = fat_pointers_at(&[
+            (0, RODATA, 5),
+            (16, RODATA + 5, 5),
+            (40, RODATA + 10, 7),
+            (56, RODATA + 17, 5),
+        ]);
+        let bytes = elf_with(&[rodata(PIECES), relro, rela]);
+        let report = analyze("libt.so", None, &bytes, &options());
+        assert_eq!(arrays_of(&report), vec![(RELRO, 2), (RELRO + 40, 2)]);
+        assert_eq!(report.arrays[1].pieces, ["charlie", "delta"]);
+        let s = &report.summary;
+        assert_eq!((s.format_arrays, s.pairs_in_arrays), (2, 4));
+        assert_eq!((s.arrays_with_xrefs, s.arrays_without_xrefs), (0, 2));
+    }
+
+    #[test]
+    fn a_string_named_by_two_pairs_is_emitted_once_with_both_pairs() {
+        let options = options();
+        let code = [
+            adrp(0, TEXT, RELRO + 16),
+            add_imm(0, 0, 16),
+            adrp(1, TEXT + 8, RELRO + 40),
+            add_imm(1, 1, 40),
+            RET,
+        ];
+        let [relro, rela] =
+            fat_pointers_at(&[(0, RODATA, 5), (16, RODATA + 5, 5), (40, RODATA, 5)]);
+        let bytes = elf_with(&[text(&code), rodata(PIECES), relro, rela]);
+        let report = analyze("libt.so", None, &bytes, &options);
+        assert_eq!(arrays_of(&report), vec![(RELRO, 2), (RELRO + 40, 1)]);
+        let alphas = report.strings.iter().filter(|f| f.value == "alpha");
+        let alphas: Vec<&Found> = alphas.collect();
+        assert_eq!(alphas.len(), 1);
+        assert_eq!(alphas[0].places, vec![(0, 0), (1, 0)]);
+
+        let row = report.row(alphas[0], &options);
+        assert_eq!(pairs_of(&row), vec![("0x3000", 0, 2), ("0x3028", 0, 1)]);
+
+        let expected = vec![
+            (TEXT + 12, KIND_FATPTR, None),
+            (TEXT + 4, KIND_FATPTR_ARRAY, Some((RELRO, 1))),
+        ];
+        assert_eq!(refs_of(alphas[0]), expected);
+    }
+
+    #[test]
+    fn a_one_character_piece_is_in_format_arrays_not_in_strings() {
+        let piece = "] should_create_e2ee_channel for ";
+        let data = format!("[{piece}\0");
+        let len = piece.len() as u64;
+        let [relro, rela] = fat_pointers(&[(RODATA, 1), (RODATA + 1, len)]);
+        let bytes = elf_with(&[rodata(data.as_bytes()), relro, rela]);
+        let mut out = Vec::new();
+        let container = Container::Elf("libt.so".into(), bytes);
+        write_report(&mut out, "00", "libt.so", container, &[], &options()).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let elf = &json["elfs"][0];
+        let values: Vec<&str> = elf["strings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["value"].as_str())
+            .collect();
+        assert_eq!(values, vec![piece]);
+        assert_eq!(elf["strings"][0]["pairs"][0]["array_index"], 1);
+        assert_eq!(elf["format_arrays"][0]["array_vaddr"], "0x3000");
+        assert_eq!(elf["format_arrays"][0]["section"], ".data.rel.ro");
+        assert_eq!(elf["format_arrays"][0]["len"], 2);
+        let pieces = &elf["format_arrays"][0]["pieces"];
+        assert_eq!(*pieces, serde_json::json!(["[", piece]));
+    }
+
+    #[test]
+    fn patterns_keep_an_array_when_one_piece_matches() {
+        let [relro, rela] = fat_pointers(&[(RODATA, 5), (RODATA + 5, 5)]);
+        let bytes = elf_with(&[rodata(PIECES), relro, rela]);
+        for (pattern, kept) in [("BRAVO", 1), ("alphabravo", 0)] {
+            let options = Options {
+                patterns: vec![pattern.to_string()],
+                ..options()
+            };
+            let mut out = Vec::new();
+            let container = Container::Elf("libt.so".into(), bytes.clone());
+            write_report(&mut out, "00", "libt.so", container, &[], &options).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            let arrays = json["elfs"][0]["format_arrays"].as_array().unwrap();
+            assert_eq!(arrays.len(), kept, "{pattern}");
+        }
+    }
+
+    /// Tableau de `n` couples sur des morceaux de 4 caractères, `p000`, `p001`…,
+    /// référencé par ADRP+ADD sur son premier couple.
+    fn referenced_array(n: usize) -> ElfStrings {
+        let mut data = Vec::new();
+        let mut pairs = Vec::new();
+        for i in 0..n {
+            pairs.push((RODATA + data.len() as u64, 4));
+            data.extend_from_slice(format!("p{i:03}").as_bytes());
+        }
+        data.push(0);
+        let code = [adrp(0, TEXT, RELRO), add_imm(0, 0, 0), RET];
+        let [relro, rela] = fat_pointers(&pairs);
+        let bytes = elf_with(&[text(&code), rodata(&data), relro, rela]);
+        analyze("libt.so", None, &bytes, &options())
+    }
+
+    #[test]
+    fn a_short_array_gives_its_reference_to_every_piece() {
+        let options = options();
+        let report = referenced_array(3);
+        let add = TEXT + 4;
+        let array = Some((RELRO, 0));
+        let refs: Vec<_> = report.strings.iter().map(refs_of).collect();
+        let expected = vec![
+            vec![(add, KIND_FATPTR, None)],
+            vec![(add, KIND_FATPTR_ARRAY, array)],
+            vec![(add, KIND_FATPTR_ARRAY, array)],
+        ];
+        assert_eq!(refs, expected);
+        for f in &report.strings {
+            let row = report.row(f, &options);
+            assert_eq!(row.pairs.len(), 1);
+            assert_eq!(row.pairs[0].array_len, 3);
+        }
+        assert!(report.array_row(&report.arrays[0], &options).propagated);
+        let s = &report.summary;
+        assert_eq!(s.arrays_not_propagated, 0);
+        assert_eq!(s.xrefs.as_ref().unwrap().fatptr_array, 2);
+    }
+
+    #[test]
+    fn a_long_array_keeps_its_reference_in_format_arrays() {
+        let options = options();
+        let report = referenced_array(MAX_PROPAGATED_ARRAY + 1);
+        assert_eq!(report.strings.len(), 17);
+        let first = refs_of(&report.strings[0]);
+        assert_eq!(first, vec![(TEXT + 4, KIND_FATPTR, None)]);
+        for f in &report.strings[1..] {
+            assert!(f.refs.is_empty(), "{}", f.value);
+        }
+        for f in &report.strings {
+            let row = report.row(f, &options);
+            assert_eq!(row.pairs.len(), 1);
+            assert_eq!(row.pairs[0].array_len, 17);
+        }
+        let row = report.array_row(&report.arrays[0], &options);
+        assert!(!row.propagated);
+        let xrefs = row.xrefs.as_ref().unwrap();
+        assert_eq!(xrefs.len(), 1);
+        assert_eq!(xrefs[0].kind, KIND_FATPTR_ARRAY);
+        assert_eq!(xrefs[0].target_index, Some(0));
+        let s = &report.summary;
+        assert_eq!(s.arrays_not_propagated, 1);
+        assert_eq!(s.xrefs.as_ref().unwrap().fatptr_array, 0);
     }
 }
