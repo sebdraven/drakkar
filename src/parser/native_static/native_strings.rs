@@ -842,6 +842,7 @@ impl ElfStrings {
         let (areas, source) = data_areas(&image);
         let (bounds, functions) = function_bounds(&image, &areas, &symbols, &local_symbols);
         let (mut proven, pairs) = fatptr_strings(&image, &slots, &areas);
+        let mut arrays = fatptr_arrays(&image, &areas, &pairs);
         let mut formed = Vec::new();
         let mut code_scan = None;
         if is_aarch64(&image) {
@@ -861,6 +862,7 @@ impl ElfStrings {
         proven.sort_by_key(|p| (p.vaddr, p.len, p.boundary != BOUNDARY_FATPTR));
         proven.dedup_by_key(|p| (p.vaddr, p.len));
         let dropped_prefixes = drop_code_prefixes(&mut proven);
+        array_refs(&mut arrays, &formed);
         formed.retain(|f| areas.iter().any(|a| !a.exec && a.contains(f.target)));
         let mut targets: Vec<u64> = formed.iter().map(|f| f.target).collect();
         targets.sort_unstable();
@@ -888,19 +890,30 @@ impl ElfStrings {
                 without_function += 1;
             }
         }
+        let fatptr_array = attach_array_refs(&mut found, &arrays);
         if let Some(counts) = &mut self.summary.xrefs {
             *counts = XrefCounts {
                 total,
                 unresolved_text: unresolved.unresolved_text,
                 non_text_targets: unresolved.non_text_targets,
                 without_function,
+                fatptr_array,
             };
         }
         self.summary.strings_found = found.len();
         filter_patterns(&mut found, &options.patterns);
+        mark_array_patterns(&mut arrays, &options.patterns);
         self.summary.strings_emitted = found.len();
         self.summary.areas = Some(source);
         self.summary.fatptr_pairs = pairs.len();
+        let with_xrefs = arrays.iter().filter(|a| !a.refs.is_empty()).count();
+        self.summary.format_arrays = arrays.len();
+        let multi = arrays.iter().filter(|a| a.pairs.len() > 1);
+        self.summary.pairs_in_arrays = multi.map(|a| a.pairs.len()).sum();
+        self.summary.arrays_with_xrefs = with_xrefs;
+        self.summary.arrays_without_xrefs = arrays.len() - with_xrefs;
+        let referenced = arrays.iter().filter(|a| !a.refs.is_empty());
+        self.summary.arrays_not_propagated = referenced.filter(|a| !a.propagated()).count();
         self.summary.rust_code_dropped_prefixes = dropped_prefixes;
         self.summary.blocks_split = blocks_split;
         self.summary.pieces_from_split = pieces;
@@ -911,6 +924,7 @@ impl ElfStrings {
         self.areas = areas;
         self.bounds = bounds;
         self.strings = found;
+        self.arrays = arrays;
         self.crypto = crypto;
         Ok(())
     }
@@ -1098,6 +1112,116 @@ fn fatptr_strings(
         }
     }
     (proven, pairs)
+}
+
+/// Couples de `pairs` regroupés en tableaux : même zone, emplacements
+/// consécutifs au pas de deux mots. Triés par adresse.
+fn fatptr_arrays(image: &Image, areas: &[Area], pairs: &HashMap<u64, u64>) -> Vec<FatArray> {
+    let stride = 2 * image.ptr_size;
+    let mut slots: Vec<(u64, u64)> = pairs.iter().map(|(&slot, &ptr)| (slot, ptr)).collect();
+    slots.sort_unstable();
+    let mut arrays: Vec<FatArray> = Vec::new();
+    for (slot, ptr) in slots {
+        let Some(len) = image.word_at(slot.wrapping_add(image.ptr_size)) else {
+            continue;
+        };
+        let Some(text) = proven_text(image, areas, ptr, len) else {
+            continue;
+        };
+        let area = areas.iter().position(|a| a.contains(slot));
+        let follows = arrays.last().is_some_and(|a| {
+            let last = a.pairs.last().map(|p| p.slot.wrapping_add(stride));
+            a.area == area && last == Some(slot)
+        });
+        if !follows {
+            arrays.push(FatArray {
+                area,
+                vaddr: slot,
+                pairs: Vec::new(),
+                pieces: Vec::new(),
+                patterns: Vec::new(),
+                refs: Vec::new(),
+            });
+        }
+        if let Some(array) = arrays.last_mut() {
+            array.pairs.push(FatPair { slot, ptr, len });
+            array.pieces.push(text.to_string());
+        }
+    }
+    arrays
+}
+
+/// Rattache à son tableau chaque adresse formée sur l'emplacement d'un couple.
+fn array_refs(arrays: &mut [FatArray], formed: &[Formed]) {
+    let mut rank_of: HashMap<u64, (usize, usize)> = HashMap::new();
+    for (index, array) in arrays.iter().enumerate() {
+        for (rank, pair) in array.pairs.iter().enumerate() {
+            rank_of.insert(pair.slot, (index, rank));
+        }
+    }
+    for f in formed {
+        let Some(&(index, rank)) = f.pair.and_then(|slot| rank_of.get(&slot)) else {
+            continue;
+        };
+        let array = &mut arrays[index];
+        let vaddr = array.vaddr;
+        array.refs.push(Ref {
+            insn: f.insn,
+            kind: KIND_FATPTR_ARRAY,
+            offset: 0,
+            array: Some((vaddr, rank)),
+        });
+    }
+}
+
+/// Pose sur chaque chaîne rust_fatptr tous ses couples, et les références de
+/// ceux de ses tableaux qui sont propagés, sauf instruction déjà rattachée à
+/// la chaîne. Rend le nombre de références posées.
+fn attach_array_refs(found: &mut [Found], arrays: &[FatArray]) -> usize {
+    let mut places: HashMap<(u64, u64), Vec<(usize, usize)>> = HashMap::new();
+    for (index, array) in arrays.iter().enumerate() {
+        for (rank, pair) in array.pairs.iter().enumerate() {
+            let key = (pair.ptr, pair.len);
+            places.entry(key).or_default().push((index, rank));
+        }
+    }
+    let mut added = 0;
+    for f in found.iter_mut().filter(|f| f.boundary == BOUNDARY_FATPTR) {
+        let Some(at) = places.get(&(f.vaddr, f.len)) else {
+            continue;
+        };
+        f.places = at.clone();
+        let mut seen: HashSet<u64> = f.refs.iter().map(|r| r.insn).collect();
+        for &(index, _) in at {
+            let array = &arrays[index];
+            if !array.propagated() {
+                continue;
+            }
+            for r in &array.refs {
+                if seen.insert(r.insn) {
+                    f.refs.push(*r);
+                    added += 1;
+                }
+            }
+        }
+    }
+    added
+}
+
+/// Motifs contenus dans au moins un morceau de chaque tableau.
+fn mark_array_patterns(arrays: &mut [FatArray], patterns: &[String]) {
+    if patterns.is_empty() {
+        return;
+    }
+    let needles: Vec<String> = patterns.iter().map(|p| p.to_lowercase()).collect();
+    for array in arrays {
+        let pieces: Vec<String> = array.pieces.iter().map(|p| p.to_lowercase()).collect();
+        for (index, needle) in needles.iter().enumerate() {
+            if pieces.iter().any(|p| p.contains(needle.as_str())) {
+                array.patterns.push(index);
+            }
+        }
+    }
 }
 
 struct Piece<'a> {
@@ -1342,6 +1466,7 @@ fn attribute(
             insn: f.insn,
             kind: f.kind,
             offset,
+            array: None,
         };
         let mut hit = false;
         for &i in constants.get(&f.target).into_iter().flatten() {
@@ -1883,11 +2008,13 @@ impl Sweep {
                 insn: pc,
                 target: string,
                 kind: KIND_FATPTR,
+                pair: Some(target),
             },
             None => Formed {
                 insn: pc,
                 target,
                 kind,
+                pair: None,
             },
         };
         self.formed.push(formed);
@@ -1930,11 +2057,13 @@ impl Sweep {
         } else if w & 0xffc0_0000 == 0xf940_0000 {
             let offset = u64::from((w >> 10) & 0xfff) * 8;
             if let Some(Held::Page(page)) = self.get(rn) {
-                if let Some(&target) = pairs.get(&page.wrapping_add(offset)) {
+                let slot = page.wrapping_add(offset);
+                if let Some(&target) = pairs.get(&slot) {
                     self.formed.push(Formed {
                         insn: pc,
                         target,
                         kind: KIND_FATPTR,
+                        pair: Some(slot),
                     });
                 }
             }
