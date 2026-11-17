@@ -124,6 +124,78 @@ struct Cli {
     #[arg(long, value_name = "SPEC")]
     native_listing: Vec<String>,
 
+    /// (--native) Propagation symbolique de valeurs dans la fonction AArch64
+    /// `<elf|*>@<début>` (hexadécimal), chemin par chemin, sans solveur : d'où
+    /// vient la valeur lue ou écrite par chaque --native-symex-watch. Répétable.
+    /// Indépendant de --native-disasm (--native --legend, section SYMEX).
+    #[arg(long, value_name = "SPEC")]
+    native_symex: Vec<String>,
+
+    /// (--native-symex) Instructions observées, adresses hexadécimales séparées
+    /// par des virgules. Obligatoire.
+    #[arg(long, value_name = "ADRESSES", value_delimiter = ',')]
+    native_symex_watch: Vec<String>,
+
+    /// (--native-symex) Démarre à cette adresse de la fonction (branche d'une
+    /// table de saut), avec l'état initial de son début. Une seule
+    /// --native-symex.
+    #[arg(long, value_name = "ADRESSE")]
+    native_symex_entry: Option<String>,
+
+    /// (--native-symex) Profondeur des appels directs suivis. Défaut 0, max 4.
+    #[arg(long, value_name = "N")]
+    native_symex_depth: Option<u8>,
+
+    /// (--native-symex) Budget d'instructions par chemin. Défaut 20000.
+    #[arg(long, value_name = "N")]
+    native_symex_max_insns: Option<usize>,
+
+    /// (--native-symex) Budget de chemins par fonction. Défaut 256.
+    #[arg(long, value_name = "N")]
+    native_symex_max_paths: Option<usize>,
+
+    /// (--native-symex) Taille maximale, en octets, d'un morceau externalisé
+    /// suivi hors profondeur. Défaut 64 ; 0 désactive.
+    #[arg(long, value_name = "OCTETS")]
+    native_symex_fragment_max: Option<u64>,
+
+    /// (--native-symex) Chemins frères qu'un appel suivi depuis la fonction
+    /// analysée peut ouvrir, tous niveaux confondus. Défaut 2 ; 0 : aucun.
+    #[arg(long, value_name = "N")]
+    native_symex_callee_forks: Option<usize>,
+
+    /// (--native-symex) Relances au plus du raffinement, qui suit les appels
+    /// sautés susceptibles d'écrire ce qu'un watch lit. Défaut 4 ; 0 désactive.
+    #[arg(long, value_name = "N")]
+    native_symex_refine: Option<usize>,
+
+    /// (--native-symex) Appels suivis quelle que soit la profondeur, adresses
+    /// hexadécimales du bl (ou du b) séparées par des virgules.
+    #[arg(long, value_name = "ADRESSES", value_delimiter = ',')]
+    native_symex_follow: Vec<String>,
+
+    /// (--native-symex) Ni élagage ni ordre par distance aux watches.
+    #[arg(long)]
+    native_symex_undirected: bool,
+
+    /// (--native-symex) Octets de la mémoire symbolique lus à un watch, avant
+    /// l'instruction : `<watch>:<registre>+<décalage>:<longueur>` (x0..x30 ou
+    /// sp ; longueur 1 à 64), séparés par des virgules.
+    #[arg(long, value_name = "LECTURES", value_delimiter = ',')]
+    native_symex_peek: Vec<String>,
+
+    /// (--native) Références vers des adresses d'un ELF AArch64, sans exécution :
+    /// fonction contenante, branchements directs, adresses formées ou lues par le
+    /// code, mots de données. `<elf|*>@<adresse>[,<adresse>...]`, de 1 à 64
+    /// adresses hexadécimales. Répétable (--native --legend, section XREFS).
+    #[arg(long, value_name = "SPEC")]
+    native_xrefs: Vec<String>,
+
+    /// (--native-xrefs) Références rendues au plus par liste et par adresse ; les
+    /// totaux restent exacts. Défaut 2000.
+    #[arg(long, value_name = "N")]
+    native_xrefs_max: Option<usize>,
+
     /// (--native-disasm) Racine de désassemblage en plus des points d'entrée
     /// JNI : nom d'un symbole défini, ou adresse `0x…` (ARM 32 bits : bit 0 =
     /// Thumb ; `t:` ou `a:` force le mode). Répétable. Introuvable : WARN.
@@ -711,6 +783,41 @@ fn main() -> Result<()> {
              --native --native-disasm"
         );
     }
+    if !cli.native_symex.is_empty() && !cli.native {
+        bail!(
+            "--native-symex requiert --native : drakkar <APK|ELF> --native --native-symex \
+             <elf|*>@<début> --native-symex-watch <adresses>"
+        );
+    }
+    let symex_tuning = !cli.native_symex_watch.is_empty()
+        || cli.native_symex_entry.is_some()
+        || cli.native_symex_depth.is_some()
+        || cli.native_symex_max_insns.is_some()
+        || cli.native_symex_max_paths.is_some()
+        || cli.native_symex_fragment_max.is_some()
+        || cli.native_symex_callee_forks.is_some()
+        || cli.native_symex_refine.is_some()
+        || !cli.native_symex_follow.is_empty()
+        || cli.native_symex_undirected
+        || !cli.native_symex_peek.is_empty();
+    if symex_tuning && cli.native_symex.is_empty() {
+        bail!(
+            "--native-symex-watch, --native-symex-entry, --native-symex-depth, \
+             --native-symex-max-insns, --native-symex-max-paths, \
+             --native-symex-fragment-max, --native-symex-callee-forks, \
+             --native-symex-refine, --native-symex-follow, --native-symex-undirected \
+             et --native-symex-peek n'ont d'effet qu'avec --native-symex"
+        );
+    }
+    if !cli.native_xrefs.is_empty() && !cli.native {
+        bail!(
+            "--native-xrefs requiert --native : drakkar <APK|ELF> --native --native-xrefs \
+             <elf|*>@<adresse>[,<adresse>...]"
+        );
+    }
+    if cli.native_xrefs_max.is_some() && cli.native_xrefs.is_empty() {
+        bail!("--native-xrefs-max n'a d'effet qu'avec --native-xrefs");
+    }
     let native_strings_tuning =
         cli.min_length.is_some() || cli.elf.is_some() || cli.xrefs || cli.crates;
     if native_strings_tuning && cli.native_strings.is_none() {
@@ -795,6 +902,24 @@ fn main() -> Result<()> {
         if !listings.is_empty() && !cli.native_disasm {
             bail!("--native-listing requiert --native-disasm");
         }
+        let mut symex_specs = Vec::new();
+        for spec in &cli.native_symex {
+            match parser::native_static::parse_symex_spec(spec) {
+                Ok(parsed) => symex_specs.push(parsed),
+                Err(why) => bail!("--native-symex {spec:?} : {why}"),
+            }
+        }
+        let symex = symex_options(&cli, symex_specs.len())?;
+        let mut xrefs_specs = Vec::new();
+        for spec in &cli.native_xrefs {
+            match parser::native_static::parse_xrefs_spec(spec) {
+                Ok(parsed) => xrefs_specs.push(parsed),
+                Err(why) => bail!("--native-xrefs {spec:?} : {why}"),
+            }
+        }
+        let xrefs_max = cli
+            .native_xrefs_max
+            .unwrap_or(parser::native_static::DEFAULT_XREFS_MAX);
         let mut options = parser::native_static::DisasmOptions::default();
         if let Some(depth) = cli.disasm_depth {
             options.depth = depth;
@@ -829,6 +954,8 @@ fn main() -> Result<()> {
             &listings,
             options.max_insns,
         );
+        parser::native_static::add_symex(&mut report, input, splits, &symex_specs, &symex);
+        parser::native_static::add_xrefs(&mut report, input, splits, &xrefs_specs, xrefs_max);
         if cli.format.wants_text() {
             print_native(&report, cli.disasm_full);
         }
@@ -2257,6 +2384,14 @@ fn print_native(r: &drakkar::parser::native_static::NativeReport, full: bool) {
         }
     }
 
+    for s in &r.symex {
+        print_symex(s);
+    }
+
+    for x in &r.xrefs {
+        print_xrefs(x);
+    }
+
     if !r.errors.is_empty() {
         println!("\nNon lu ({}) :", r.errors.len());
         for err in &r.errors {
@@ -2427,6 +2562,125 @@ fn print_native_disasm(d: &drakkar::parser::native_static::ElfDisasm, full: bool
         let names = names.join(", ");
         println!("    import appelé {category:<14} {names}");
     }
+}
+
+/// Réglages de `--native-symex` ; `functions` : nombre de --native-symex.
+fn symex_options(cli: &Cli, functions: usize) -> Result<parser::native_static::SymexOptions> {
+    use parser::native_static::{
+        parse_symex_address, parse_symex_peek, SymexOptions, MAX_SYMEX_DEPTH,
+    };
+    let mut options = SymexOptions::default();
+    if functions == 0 {
+        return Ok(options);
+    }
+    if cli.native_symex_watch.is_empty() {
+        bail!("--native-symex requiert --native-symex-watch <adresse>[,<adresse>…]");
+    }
+    for text in &cli.native_symex_watch {
+        match parse_symex_address(text) {
+            Ok(at) if options.watch.contains(&at) => {}
+            Ok(at) => options.watch.push(at),
+            Err(why) => bail!("--native-symex-watch : {why}"),
+        }
+    }
+    if let Some(text) = &cli.native_symex_entry {
+        if functions != 1 {
+            bail!("--native-symex-entry ne vaut que pour une seule --native-symex");
+        }
+        match parse_symex_address(text) {
+            Ok(at) => options.entry = Some(at),
+            Err(why) => bail!("--native-symex-entry : {why}"),
+        }
+    }
+    if let Some(depth) = cli.native_symex_depth {
+        if depth > MAX_SYMEX_DEPTH {
+            bail!("--native-symex-depth vaut au plus {MAX_SYMEX_DEPTH}");
+        }
+        options.depth = depth;
+    }
+    if let Some(max_insns) = cli.native_symex_max_insns {
+        if max_insns == 0 {
+            bail!("--native-symex-max-insns doit valoir au moins 1");
+        }
+        options.max_insns = max_insns;
+    }
+    if let Some(max_paths) = cli.native_symex_max_paths {
+        if max_paths == 0 {
+            bail!("--native-symex-max-paths doit valoir au moins 1");
+        }
+        options.max_paths = max_paths;
+    }
+    if let Some(fragment_max) = cli.native_symex_fragment_max {
+        options.fragment_max = fragment_max;
+    }
+    if let Some(callee_forks) = cli.native_symex_callee_forks {
+        options.callee_forks = callee_forks;
+    }
+    if let Some(refine) = cli.native_symex_refine {
+        options.refine = refine;
+    }
+    for text in &cli.native_symex_follow {
+        match parse_symex_address(text) {
+            Ok(at) if options.follow.contains(&at) => {}
+            Ok(at) => options.follow.push(at),
+            Err(why) => bail!("--native-symex-follow : {why}"),
+        }
+    }
+    options.directed = !cli.native_symex_undirected;
+    for text in &cli.native_symex_peek {
+        match parse_symex_peek(text, &options.watch) {
+            Ok(peek) => options.peek.push(peek),
+            Err(why) => bail!("--native-symex-peek : {why}"),
+        }
+    }
+    Ok(options)
+}
+
+/// Un bloc par fonction de `--native-symex` : chemins, puis un résumé par watch.
+fn print_symex(s: &drakkar::parser::native_static::SymexReport) {
+    let (elf, start, entry, bound) = (&s.elf, &s.fn_start, &s.entry, s.bound);
+    let end = s.fn_end.as_deref().unwrap_or("?");
+    println!("\nSymex {elf}  fonction {start}-{end}  borne {bound}  entrée {entry} :");
+    let mut cut = Vec::new();
+    for (status, count) in &s.paths_cut {
+        cut.push(format!("{status} {count}"));
+    }
+    let cut = if cut.is_empty() {
+        "-".to_string()
+    } else {
+        cut.join(", ")
+    };
+    let (paths, abandoned) = (s.paths_explored, s.callees_abandoned);
+    let (incomplete, dropped) = (s.callees_incomplete, s.forks_dropped);
+    let mut header = format!("  chemins {paths}  coupés {cut}  appelés abandonnés {abandoned}");
+    header.push_str(&format!("  incomplets {incomplete}  branchements non ouverts {dropped}"));
+    let reruns = s.rounds.len().saturating_sub(1);
+    let followed = s.rounds.last().map_or(0, |round| round.follow.len());
+    header.push_str(&format!("  relances {reruns}  suivis à la demande {followed}"));
+    if !s.directed {
+        header.push_str("  non dirigée");
+    }
+    if s.budget_hit {
+        header.push_str("  budget atteint");
+    }
+    println!("{header}");
+    for w in &s.watches {
+        let insn = w.instruction.as_deref().unwrap_or("?");
+        if !w.reached {
+            println!("  watch {}  {insn}  jamais atteinte", w.insn_addr);
+            continue;
+        }
+        println!("  watch {}  {insn}", w.insn_addr);
+        for r in &w.results {
+            println!("    {}  ({} chemins)", r.summary(), r.paths);
+            for p in &r.peeks {
+                let bytes: Vec<&str> = p.bytes.iter().map(|b| b.text.as_str()).collect();
+                println!("      peek [{}] = {}", p.address.text, bytes.join(", "));
+            }
+        }
+    }
+    let (calls, branches) = (s.calls.len(), s.indirect_branches.len());
+    println!("  appels consignés {calls}  br non résolus {branches}  (détail : JSON)");
 }
 
 /// Extrait les .so natifs vers `out_dir` et affiche le récap (mode `--extract-libs`).
