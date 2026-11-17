@@ -344,7 +344,7 @@ impl Area {
         self.vaddr.saturating_add(self.size)
     }
 
-    fn file_offset(&self, at: u64) -> u64 {
+    pub(super) fn file_offset(&self, at: u64) -> u64 {
         self.offset.wrapping_add(at.wrapping_sub(self.vaddr))
     }
 }
@@ -1169,7 +1169,7 @@ fn proven_text<'i>(image: &'i Image, areas: &[Area], at: u64, len: u64) -> Optio
     text.chars().all(is_text_char).then_some(text)
 }
 
-fn is_text_char(c: char) -> bool {
+pub(super) fn is_text_char(c: char) -> bool {
     !c.is_control() || matches!(c, '\t' | '\n' | '\r')
 }
 

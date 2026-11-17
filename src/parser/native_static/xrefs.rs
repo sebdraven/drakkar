@@ -11,9 +11,12 @@ use serde::Serialize;
 
 use super::decode::{decode, Arch, Flow};
 use super::disasm::{context, Ctx};
-use super::native_strings::{code_addresses, data_areas, fde_ranges, Access};
+use super::native_strings::{code_addresses, data_areas, fde_ranges, Access, Area};
 use super::symex::Bound;
-use super::{hex, parse_elf, parse_symex_address, read_uint, DynSymbol, ElfReport, Image, Section};
+use super::{
+    dyn_tag, dynamic_relocs, hex, parse_elf, parse_symex_address, read_uint, DynSymbol, ElfReport,
+    Image, Section, SHT_ANDROID_REL, SHT_ANDROID_RELA, SHT_ANDROID_RELR,
+};
 
 pub const DEFAULT_XREFS_MAX: usize = 2000;
 pub const MAX_XREFS_TARGETS: usize = 64;
@@ -90,8 +93,13 @@ pub struct XrefFunction {
 
 impl XrefFunction {
     /// Par [`Bound::of`], comme `--native-symex`.
-    fn of(ctx: &Ctx, fdes: &[(u64, u64)], at: u64) -> Self {
-        let bound = Bound::of(ctx, fdes, at);
+    pub(super) fn of(ctx: &Ctx, fdes: &[(u64, u64)], at: u64) -> Self {
+        Bound::of(ctx, fdes, at).into()
+    }
+}
+
+impl From<Bound> for XrefFunction {
+    fn from(bound: Bound) -> Self {
         XrefFunction {
             fn_start: hex(bound.start),
             fn_end: bound.end.map(hex),
@@ -153,15 +161,30 @@ pub(super) fn run(
         return Ok(Vec::new());
     }
     let fdes = fde_ranges(&ctx.image);
-    let job = || search(&ctx, &fdes, symbols, local_symbols, &elf.path, &kept, max);
+    let tables = relocation_tables(&ctx.image, dynamic);
+    let job = || {
+        search(
+            &ctx,
+            &fdes,
+            &tables,
+            symbols,
+            local_symbols,
+            &elf.path,
+            &kept,
+            max,
+        )
+    };
     std::panic::catch_unwind(AssertUnwindSafe(job))
         .map_err(|_| "panique pendant la recherche".to_string())
 }
 
-/// Une seule passe sur le code pour toutes les cibles.
-fn search(
+/// Une seule passe sur le code pour toutes les cibles. `tables` : voir
+/// [`relocation_tables`].
+#[allow(clippy::too_many_arguments)]
+pub(super) fn search(
     ctx: &Ctx,
     fdes: &[(u64, u64)],
+    tables: &[(u64, u64)],
     symbols: &[DynSymbol],
     local_symbols: &[DynSymbol],
     elf: &str,
@@ -185,7 +208,7 @@ fn search(
             addr[i].push((f.insn, (f.adrp, access_kind(f.access))));
         }
     }
-    let data = data_words(ctx, &index);
+    let data = data_words(ctx, tables, &index);
     let function = |at: u64| XrefFunction::of(ctx, fdes, at);
     let mut reports = Vec::new();
     let lists = code.into_iter().zip(addr).zip(data);
@@ -246,10 +269,23 @@ fn access_kind(access: Access) -> &'static str {
 
 /// Mots de 8 octets alignés sur 8 des zones de données, égaux à une cible tels
 /// quels dans le fichier, ou après relocation relative : (section, relogé).
-fn data_words(ctx: &Ctx, index: &HashMap<u64, usize>) -> Found<(Option<String>, bool)> {
+/// Sont exclues les sections de [`is_link_metadata`] et les plages de fichier
+/// `tables`.
+fn data_words(
+    ctx: &Ctx,
+    tables: &[(u64, u64)],
+    index: &HashMap<u64, usize>,
+) -> Found<(Option<String>, bool)> {
     let mut found = vec![Vec::new(); index.len()];
     let (areas, _) = data_areas(&ctx.image);
-    for area in areas.iter().filter(|a| !a.exec) {
+    let sections = ctx.image.sections.iter();
+    let metadata: Vec<&Section> = sections.filter(|s| is_link_metadata(s)).collect();
+    let is_metadata = |a: &Area| {
+        let same = |s: &&Section| a.name.as_deref() == Some(s.name.as_str()) && a.vaddr == s.addr;
+        metadata.iter().any(same)
+    };
+    let in_table = |offset: u64| tables.iter().any(|&(lo, hi)| (lo..hi).contains(&offset));
+    for area in areas.iter().filter(|a| !a.exec && !is_metadata(a)) {
         let Some(bytes) = ctx.image.bytes_at(area.offset, area.size) else {
             continue;
         };
@@ -261,6 +297,9 @@ fn data_words(ctx: &Ctx, index: &HashMap<u64, usize>) -> Found<(Option<String>, 
         };
         for (i, word) in bytes.as_chunks::<8>().0.iter().enumerate() {
             let at = first + 8 * i as u64;
+            if in_table(area.file_offset(at)) {
+                continue;
+            }
             let slot = ctx.slots.get(&at).copied();
             let raw = read_uint(word, ctx.image.big_endian);
             let raw = raw.filter(|&v| slot != Some(v));
@@ -272,6 +311,49 @@ fn data_words(ctx: &Ctx, index: &HashMap<u64, usize>) -> Found<(Option<String>, 
         }
     }
     found
+}
+
+/// Tables de relocations, d'édition de liens et de déroulement : leurs mots
+/// décrivent le programme, ils n'en sont pas les données.
+pub(super) fn is_link_metadata(s: &Section) -> bool {
+    let typed = matches!(
+        s.sh_type,
+        elf::SHT_REL
+            | elf::SHT_RELA
+            | elf::SHT_RELR
+            | SHT_ANDROID_REL
+            | SHT_ANDROID_RELA
+            | SHT_ANDROID_RELR
+            | elf::SHT_DYNSYM
+            | elf::SHT_STRTAB
+            | elf::SHT_HASH
+            | elf::SHT_GNU_HASH
+            | elf::SHT_GNU_VERSYM
+            | elf::SHT_GNU_VERDEF
+            | elf::SHT_GNU_VERNEED
+            | elf::SHT_DYNAMIC
+    );
+    typed || matches!(s.name.as_str(), ".eh_frame" | ".eh_frame_hdr")
+}
+
+/// Plages `[début, fin)`, en offsets de fichier, des tables de relocations que
+/// déclare `PT_DYNAMIC` : celles que lit le chargeur, plus DT_JMPREL. Valent
+/// aussi sans section headers.
+pub(super) fn relocation_tables(image: &Image, dynamic: Option<&[(u64, u64)]>) -> Vec<(u64, u64)> {
+    let Some(dynamic) = dynamic else {
+        return Vec::new();
+    };
+    let tables = dynamic_relocs(image, dynamic, &mut Vec::new());
+    let mut ranges: Vec<(u64, u64)> = tables
+        .iter()
+        .map(|t| (t.offset, t.offset.saturating_add(t.size)))
+        .collect();
+    let jmprel = dyn_tag(dynamic, elf::DT_JMPREL);
+    let jmprel = jmprel.and_then(|at| image.offset_of(at));
+    if let (Some(offset), Some(size)) = (jmprel, dyn_tag(dynamic, elf::DT_PLTRELSZ)) {
+        ranges.push((offset, offset.saturating_add(size)));
+    }
+    ranges
 }
 
 /// Triés par adresse croissante, coupés à `max` ; `total` les compte tous.
@@ -288,13 +370,17 @@ fn capped<T, U>(mut found: Vec<(u64, T)>, max: usize, build: impl Fn(u64, T) -> 
 }
 
 fn section_of(image: &Image, at: u64) -> Option<String> {
+    allocated_section(image, at).map(|s| s.name.clone())
+}
+
+pub(super) fn allocated_section<'i>(image: &'i Image, at: u64) -> Option<&'i Section> {
     let inside = |s: &&Section| at.checked_sub(s.addr).is_some_and(|d| d < s.size);
     let mut allocated = image.sections.iter().filter(|s| s.has(elf::SHF_ALLOC));
-    allocated.find(inside).map(|s| s.name.clone())
+    allocated.find(inside)
 }
 
 /// Une section allouée contient `at` ; sans section headers, un segment LOAD.
-fn holds(image: &Image, at: u64) -> bool {
+pub(super) fn holds(image: &Image, at: u64) -> bool {
     if image.sections.is_empty() {
         let mut loads = image.segments.iter().filter(|s| s.p_type == elf::PT_LOAD);
         loads.any(|s| s.in_memory(at))
@@ -312,6 +398,7 @@ mod tests {
     const DATA: u64 = 0x2000;
     const CALLEE: u64 = 0x1040;
     const SLOT: u64 = 0x2010;
+    const RELA: u64 = 0x1c00;
 
     const PROGRAM: [(u32, &str); 10] = [
         (0x94000010, "1000  bl    0x1040"),
@@ -348,8 +435,8 @@ mod tests {
         }
     }
 
-    /// .text en 0x1000 (R+X), .data.rel.ro en 0x2000 (R+W), chacun chargé à
-    /// l'adresse de son offset.
+    /// .text en 0x1000 (R+X), .rela.dyn en 0x1c00, .data.rel.ro en 0x2000
+    /// (R+W), chacun chargé à l'adresse de son offset.
     fn image(data: &[u8]) -> Image<'_> {
         let exec = elf::SHF_ALLOC | elf::SHF_EXECINSTR;
         let write = elf::SHF_ALLOC | elf::SHF_WRITE;
@@ -364,6 +451,10 @@ mod tests {
             ],
             sections: vec![
                 section(".text", exec, TEXT, 0x100),
+                Section {
+                    sh_type: elf::SHT_RELA,
+                    ..section(".rela.dyn", elf::SHF_ALLOC, RELA, 0x18)
+                },
                 section(".data.rel.ro", write, DATA, 0x40),
             ],
         }
@@ -375,18 +466,27 @@ mod tests {
     }
 
     /// PROGRAM ; en DATA + 0x20, CALLEE tel quel dans le fichier ; en
-    /// DATA + 0x28, un mot nul relogé vers CALLEE. FDE : [TEXT, CALLEE) et
+    /// DATA + 0x28, un mot nul relogé vers CALLEE par l'entrée RELA de
+    /// .rela.dyn, dont l'addend vaut CALLEE. FDE : [TEXT, CALLEE) et
     /// [CALLEE, CALLEE + 0x10).
     fn searched(targets: &[u64], max: usize) -> Vec<XrefReport> {
+        searched_skipping(targets, max, &[])
+    }
+
+    fn searched_skipping(targets: &[u64], max: usize, tables: &[(u64, u64)]) -> Vec<XrefReport> {
         let mut data = vec![0u8; 0x3000];
         for (i, (word, _)) in PROGRAM.iter().enumerate() {
             put(&mut data, TEXT + 4 * i as u64, &word.to_le_bytes());
         }
         put(&mut data, DATA + 0x20, &CALLEE.to_le_bytes());
+        let entry = [DATA + 0x28, u64::from(elf::R_AARCH64_RELATIVE), CALLEE];
+        for (i, word) in entry.iter().enumerate() {
+            put(&mut data, RELA + 8 * i as u64, &word.to_le_bytes());
+        }
         let mut ctx = context(image(&data), None, &[], &[]);
         ctx.slots.insert(DATA + 0x28, CALLEE);
         let fdes = [(TEXT, CALLEE), (CALLEE, CALLEE + 0x10)];
-        search(&ctx, &fdes, &[], &[], "libtest.so", targets, max)
+        search(&ctx, &fdes, tables, &[], &[], "libtest.so", targets, max)
     }
 
     fn rows<'a, T, R>(list: &'a XrefList<T>, row: impl Fn(&'a T) -> R) -> Vec<R> {
@@ -460,6 +560,45 @@ mod tests {
         assert_eq!(words.total, 2);
         assert_eq!(rows(words, data_row), [("0x2020", false), ("0x2028", true)]);
         assert_eq!(words.items[0].section.as_deref(), Some(".data.rel.ro"));
+    }
+
+    #[test]
+    fn data_refs_skip_the_relocation_table_itself() {
+        let reports = searched(&[CALLEE, DATA + 0x28], DEFAULT_XREFS_MAX);
+        let words = &reports[0].data_refs;
+        assert_eq!(rows(words, data_row), [("0x2020", false), ("0x2028", true)]);
+        assert_eq!(words.total, 2);
+        assert_eq!(reports[1].data_refs.total, 0);
+    }
+
+    #[test]
+    fn data_refs_skip_the_dynamic_relocation_tables_by_file_offset() {
+        let tables = [(DATA + 0x20, DATA + 0x28)];
+        let reports = searched_skipping(&[CALLEE], DEFAULT_XREFS_MAX, &tables);
+        let words = &reports[0].data_refs;
+        assert_eq!(rows(words, data_row), [("0x2028", true)]);
+        assert_eq!(words.total, 1);
+    }
+
+    #[test]
+    fn link_metadata_is_told_by_type_and_eh_frame_by_name() {
+        let alloc = elf::SHF_ALLOC;
+        let typed = |sh_type| Section {
+            sh_type,
+            ..section(".x", alloc, 0, 8)
+        };
+        for sh_type in [
+            elf::SHT_RELA,
+            elf::SHT_RELR,
+            elf::SHT_DYNSYM,
+            elf::SHT_GNU_HASH,
+        ] {
+            assert!(is_link_metadata(&typed(sh_type)), "{sh_type:#x}");
+        }
+        assert!(is_link_metadata(&section(".eh_frame", alloc, 0, 8)));
+        for name in [".data.rel.ro", ".got", ".init_array", ".rodata"] {
+            assert!(!is_link_metadata(&section(name, alloc, 0, 8)), "{name}");
+        }
     }
 
     #[test]
