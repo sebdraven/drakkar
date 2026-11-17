@@ -42,11 +42,24 @@ mod decode;
 mod disasm;
 mod jni_table;
 pub mod native_strings;
+mod symex;
+mod xrefs;
 
 pub use self::disasm::{
     parse_listing_spec, parse_root_spec, DisasmCall, DisasmFunction, DisasmInsn, DisasmOptions,
     ElfDisasm, IndexedString, InvalidPath, JavaMember, JniCall, Listing, ListingInsn, ListingSpec,
     RootSpec, StringIndexRef, StringRef, Syscall, TruncatedAt,
+};
+pub use self::symex::{
+    parse_symex_address, parse_symex_peek, parse_symex_spec, Shown, SymexBranch, SymexBudgets,
+    SymexCall, SymexOptions, SymexPeek, SymexPeeked, SymexReport, SymexResult, SymexRound,
+    SymexWatch, DEFAULT_SYMEX_CALLEE_FORKS, DEFAULT_SYMEX_DEPTH, DEFAULT_SYMEX_FRAGMENT_MAX,
+    DEFAULT_SYMEX_MAX_INSNS, DEFAULT_SYMEX_MAX_PATHS, DEFAULT_SYMEX_REFINE, MAX_SYMEX_DEPTH,
+    MAX_SYMEX_PEEK,
+};
+pub use self::xrefs::{
+    parse_xrefs_spec, AddrRef, CodeRef, DataRef, XrefFunction, XrefList, XrefReport, XrefsSpec,
+    DEFAULT_XREFS_MAX, MAX_XREFS_TARGETS,
 };
 
 /// Catégories d'imports : noms exacts, ou préfixes quand ils finissent par `*`.
@@ -133,6 +146,10 @@ pub struct NativeReport {
     pub summary: Summary,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub listings: Vec<Listing>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub symex: Vec<SymexReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub xrefs: Vec<XrefReport>,
     pub errors: Vec<String>,
 }
 
@@ -559,6 +576,8 @@ fn finish(
         binding,
         summary,
         listings: Vec::new(),
+        symex: Vec::new(),
+        xrefs: Vec::new(),
         errors,
     }
 }
@@ -576,14 +595,7 @@ pub fn add_listings(
     if specs.is_empty() {
         return;
     }
-    let input = input.into();
-    let in_archive = report.elfs.iter().any(|e| e.origin != ORIGIN_RAW);
-    let base_zip = in_archive.then(|| input.tolerant());
-    let split_zips: Vec<(&str, Option<Result<TolerantZip>>)> = splits
-        .iter()
-        .filter(|s| s.native)
-        .map(|s| (s.id.as_str(), in_archive.then(|| s.source.tolerant())))
-        .collect();
+    let reread = Reread::open(&report.elfs, input.into(), splits);
     self::disasm::silence_panics(|| {
         for spec in specs {
             let mut matched = false;
@@ -592,20 +604,7 @@ pub fn add_listings(
                     continue;
                 }
                 matched = true;
-                let zip = match elf.split.as_deref() {
-                    None => base_zip.as_ref(),
-                    Some(split) => split_zips
-                        .iter()
-                        .find(|(label, _)| *label == split)
-                        .and_then(|(_, zip)| zip.as_ref()),
-                };
-                let bytes = match (zip, elf.origin) {
-                    (_, ORIGIN_RAW) => input.read_all().map_err(|e| format!("{e:#}")),
-                    (Some(Ok(zip)), _) => zip.read_by_name(&elf.path).map_err(|e| format!("{e:#}")),
-                    (Some(Err(e)), _) => Err(format!("archive illisible ({e:#})")),
-                    (None, _) => Err("archive non ouverte".to_string()),
-                };
-                let listing = match bytes {
+                let listing = match reread.bytes(elf) {
                     Ok(bytes) => self::disasm::listing(&bytes, elf, spec, max_insns),
                     Err(why) => Err(why),
                 };
@@ -623,6 +622,166 @@ pub fn add_listings(
             }
         }
     });
+}
+
+/// `--native-symex` : propagation symbolique dans chaque fonction de `specs`,
+/// octets relus comme pour [`add_listings`]. `*` ne retient que les ELF AArch64
+/// dont un segment exécutable contient le début ; aucun = erreur.
+pub fn add_symex(
+    report: &mut NativeReport,
+    input: impl Into<Source>,
+    splits: &[super::xapk::Split],
+    specs: &[ListingSpec],
+    options: &SymexOptions,
+) {
+    if specs.is_empty() {
+        return;
+    }
+    let reread = Reread::open(&report.elfs, input.into(), splits);
+    self::disasm::silence_panics(|| {
+        for spec in specs {
+            let named = spec.elf.as_deref();
+            let start = hex(spec.start);
+            let mut answered = false;
+            for elf in &report.elfs {
+                let wanted = match named {
+                    Some(path) => path == elf.path,
+                    None => elf.machine == "aarch64",
+                };
+                if !wanted {
+                    continue;
+                }
+                let outcome = match reread.bytes(elf) {
+                    Ok(bytes) => self::symex::run(&bytes, elf, spec.start, options),
+                    Err(why) => Err(why),
+                };
+                let error = match outcome {
+                    Ok(Some(found)) => {
+                        report.symex.push(found);
+                        None
+                    }
+                    Ok(None) if named.is_none() => continue,
+                    Ok(None) => Some(format!("{start} hors segment LOAD exécutable")),
+                    Err(why) => Some(why),
+                };
+                if let Some(why) = error {
+                    let message = format!("symex {spec} ({}) : {why}", elf.path);
+                    report.errors.push(message);
+                }
+                answered = true;
+            }
+            if !answered {
+                let why = match named {
+                    Some(_) => "aucun ELF de ce chemin".to_string(),
+                    None => format!("aucun ELF AArch64 n'a de code exécutable en {start}"),
+                };
+                report.errors.push(format!("symex {spec} : {why}"));
+            }
+        }
+    });
+}
+
+/// `--native-xrefs` : références vers les adresses de chaque spec, octets relus
+/// comme pour [`add_listings`]. `*` ne retient, pour chaque adresse, que les ELF
+/// AArch64 qui la contiennent ; aucun = erreur.
+pub fn add_xrefs(
+    report: &mut NativeReport,
+    input: impl Into<Source>,
+    splits: &[super::xapk::Split],
+    specs: &[XrefsSpec],
+    max: usize,
+) {
+    if specs.is_empty() {
+        return;
+    }
+    let reread = Reread::open(&report.elfs, input.into(), splits);
+    self::disasm::silence_panics(|| {
+        for spec in specs {
+            let named = spec.elf.as_deref();
+            let mut matched = false;
+            let mut held = HashSet::new();
+            for elf in &report.elfs {
+                let wanted = match named {
+                    Some(path) => path == elf.path,
+                    None => elf.machine == "aarch64",
+                };
+                if !wanted {
+                    continue;
+                }
+                matched = true;
+                let every = named.is_some();
+                let outcome = match reread.bytes(elf) {
+                    Ok(bytes) => self::xrefs::run(&bytes, elf, &spec.targets, every, max),
+                    Err(why) => Err(why),
+                };
+                match outcome {
+                    Ok(found) => {
+                        held.extend(found.iter().map(|x| x.target.clone()));
+                        report.xrefs.extend(found);
+                    }
+                    Err(why) => {
+                        let message = format!("xrefs {spec} ({}) : {why}", elf.path);
+                        report.errors.push(message);
+                    }
+                }
+            }
+            if named.is_some() {
+                if !matched {
+                    let why = "aucun ELF de ce chemin";
+                    report.errors.push(format!("xrefs {spec} : {why}"));
+                }
+                continue;
+            }
+            for target in spec.targets.iter().map(|&at| hex(at)) {
+                if !held.contains(&target) {
+                    let why = format!("aucun ELF AArch64 n'a de section qui contient {target}");
+                    report.errors.push(format!("xrefs {spec} : {why}"));
+                }
+            }
+        }
+    });
+}
+
+/// Octets des ELF d'un rapport, relus dans l'APK, ses splits ou l'ELF brut
+/// analysé.
+struct Reread<'s> {
+    input: Source,
+    base: Option<Result<TolerantZip>>,
+    splits: Vec<(&'s str, Option<Result<TolerantZip>>)>,
+}
+
+impl<'s> Reread<'s> {
+    fn open(elfs: &[ElfReport], input: Source, splits: &'s [super::xapk::Split]) -> Self {
+        let in_archive = elfs.iter().any(|e| e.origin != ORIGIN_RAW);
+        let base = in_archive.then(|| input.tolerant());
+        let splits = splits
+            .iter()
+            .filter(|s| s.native)
+            .map(|s| (s.id.as_str(), in_archive.then(|| s.source.tolerant())))
+            .collect();
+        Reread {
+            input,
+            base,
+            splits,
+        }
+    }
+
+    fn bytes(&self, elf: &ElfReport) -> Result<Vec<u8>, String> {
+        let zip = match elf.split.as_deref() {
+            None => self.base.as_ref(),
+            Some(split) => self
+                .splits
+                .iter()
+                .find(|(label, _)| *label == split)
+                .and_then(|(_, zip)| zip.as_ref()),
+        };
+        match (zip, elf.origin) {
+            (_, ORIGIN_RAW) => self.input.read_all().map_err(|e| format!("{e:#}")),
+            (Some(Ok(zip)), _) => zip.read_by_name(&elf.path).map_err(|e| format!("{e:#}")),
+            (Some(Err(e)), _) => Err(format!("archive illisible ({e:#})")),
+            (None, _) => Err("archive non ouverte".to_string()),
+        }
+    }
 }
 
 fn analyze_elf(path: &str, bytes: &[u8]) -> ElfReport {
