@@ -42,11 +42,24 @@ mod decode;
 mod disasm;
 mod jni_table;
 pub mod native_strings;
+mod symex;
+mod xrefs;
 
 pub use self::disasm::{
     parse_listing_spec, parse_root_spec, DisasmCall, DisasmFunction, DisasmInsn, DisasmOptions,
     ElfDisasm, IndexedString, InvalidPath, JavaMember, JniCall, Listing, ListingInsn, ListingSpec,
     RootSpec, StringIndexRef, StringRef, Syscall, TruncatedAt,
+};
+pub use self::symex::{
+    parse_symex_address, parse_symex_peek, parse_symex_spec, Shown, SymexBranch, SymexBudgets,
+    SymexCall, SymexOptions, SymexPeek, SymexPeeked, SymexReport, SymexResult, SymexRound,
+    SymexWatch, DEFAULT_SYMEX_CALLEE_FORKS, DEFAULT_SYMEX_DEPTH, DEFAULT_SYMEX_FRAGMENT_MAX,
+    DEFAULT_SYMEX_MAX_INSNS, DEFAULT_SYMEX_MAX_PATHS, DEFAULT_SYMEX_REFINE, MAX_SYMEX_DEPTH,
+    MAX_SYMEX_PEEK,
+};
+pub use self::xrefs::{
+    parse_xrefs_spec, AddrRef, CodeRef, DataRef, XrefFunction, XrefList, XrefReport, XrefsSpec,
+    DEFAULT_XREFS_MAX, MAX_XREFS_TARGETS,
 };
 
 /// Catégories d'imports : noms exacts, ou préfixes quand ils finissent par `*`.
@@ -133,6 +146,10 @@ pub struct NativeReport {
     pub summary: Summary,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub listings: Vec<Listing>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub symex: Vec<SymexReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub xrefs: Vec<XrefReport>,
     pub errors: Vec<String>,
 }
 
@@ -559,6 +576,8 @@ fn finish(
         binding,
         summary,
         listings: Vec::new(),
+        symex: Vec::new(),
+        xrefs: Vec::new(),
         errors,
     }
 }
@@ -576,14 +595,7 @@ pub fn add_listings(
     if specs.is_empty() {
         return;
     }
-    let input = input.into();
-    let in_archive = report.elfs.iter().any(|e| e.origin != ORIGIN_RAW);
-    let base_zip = in_archive.then(|| input.tolerant());
-    let split_zips: Vec<(&str, Option<Result<TolerantZip>>)> = splits
-        .iter()
-        .filter(|s| s.native)
-        .map(|s| (s.id.as_str(), in_archive.then(|| s.source.tolerant())))
-        .collect();
+    let reread = Reread::open(&report.elfs, input.into(), splits);
     self::disasm::silence_panics(|| {
         for spec in specs {
             let mut matched = false;
@@ -592,20 +604,7 @@ pub fn add_listings(
                     continue;
                 }
                 matched = true;
-                let zip = match elf.split.as_deref() {
-                    None => base_zip.as_ref(),
-                    Some(split) => split_zips
-                        .iter()
-                        .find(|(label, _)| *label == split)
-                        .and_then(|(_, zip)| zip.as_ref()),
-                };
-                let bytes = match (zip, elf.origin) {
-                    (_, ORIGIN_RAW) => input.read_all().map_err(|e| format!("{e:#}")),
-                    (Some(Ok(zip)), _) => zip.read_by_name(&elf.path).map_err(|e| format!("{e:#}")),
-                    (Some(Err(e)), _) => Err(format!("archive illisible ({e:#})")),
-                    (None, _) => Err("archive non ouverte".to_string()),
-                };
-                let listing = match bytes {
+                let listing = match reread.bytes(elf) {
                     Ok(bytes) => self::disasm::listing(&bytes, elf, spec, max_insns),
                     Err(why) => Err(why),
                 };
@@ -623,6 +622,166 @@ pub fn add_listings(
             }
         }
     });
+}
+
+/// `--native-symex` : propagation symbolique dans chaque fonction de `specs`,
+/// octets relus comme pour [`add_listings`]. `*` ne retient que les ELF AArch64
+/// dont un segment exécutable contient le début ; aucun = erreur.
+pub fn add_symex(
+    report: &mut NativeReport,
+    input: impl Into<Source>,
+    splits: &[super::xapk::Split],
+    specs: &[ListingSpec],
+    options: &SymexOptions,
+) {
+    if specs.is_empty() {
+        return;
+    }
+    let reread = Reread::open(&report.elfs, input.into(), splits);
+    self::disasm::silence_panics(|| {
+        for spec in specs {
+            let named = spec.elf.as_deref();
+            let start = hex(spec.start);
+            let mut answered = false;
+            for elf in &report.elfs {
+                let wanted = match named {
+                    Some(path) => path == elf.path,
+                    None => elf.machine == "aarch64",
+                };
+                if !wanted {
+                    continue;
+                }
+                let outcome = match reread.bytes(elf) {
+                    Ok(bytes) => self::symex::run(&bytes, elf, spec.start, options),
+                    Err(why) => Err(why),
+                };
+                let error = match outcome {
+                    Ok(Some(found)) => {
+                        report.symex.push(found);
+                        None
+                    }
+                    Ok(None) if named.is_none() => continue,
+                    Ok(None) => Some(format!("{start} hors segment LOAD exécutable")),
+                    Err(why) => Some(why),
+                };
+                if let Some(why) = error {
+                    let message = format!("symex {spec} ({}) : {why}", elf.path);
+                    report.errors.push(message);
+                }
+                answered = true;
+            }
+            if !answered {
+                let why = match named {
+                    Some(_) => "aucun ELF de ce chemin".to_string(),
+                    None => format!("aucun ELF AArch64 n'a de code exécutable en {start}"),
+                };
+                report.errors.push(format!("symex {spec} : {why}"));
+            }
+        }
+    });
+}
+
+/// `--native-xrefs` : références vers les adresses de chaque spec, octets relus
+/// comme pour [`add_listings`]. `*` ne retient, pour chaque adresse, que les ELF
+/// AArch64 qui la contiennent ; aucun = erreur.
+pub fn add_xrefs(
+    report: &mut NativeReport,
+    input: impl Into<Source>,
+    splits: &[super::xapk::Split],
+    specs: &[XrefsSpec],
+    max: usize,
+) {
+    if specs.is_empty() {
+        return;
+    }
+    let reread = Reread::open(&report.elfs, input.into(), splits);
+    self::disasm::silence_panics(|| {
+        for spec in specs {
+            let named = spec.elf.as_deref();
+            let mut matched = false;
+            let mut held = HashSet::new();
+            for elf in &report.elfs {
+                let wanted = match named {
+                    Some(path) => path == elf.path,
+                    None => elf.machine == "aarch64",
+                };
+                if !wanted {
+                    continue;
+                }
+                matched = true;
+                let every = named.is_some();
+                let outcome = match reread.bytes(elf) {
+                    Ok(bytes) => self::xrefs::run(&bytes, elf, &spec.targets, every, max),
+                    Err(why) => Err(why),
+                };
+                match outcome {
+                    Ok(found) => {
+                        held.extend(found.iter().map(|x| x.target.clone()));
+                        report.xrefs.extend(found);
+                    }
+                    Err(why) => {
+                        let message = format!("xrefs {spec} ({}) : {why}", elf.path);
+                        report.errors.push(message);
+                    }
+                }
+            }
+            if named.is_some() {
+                if !matched {
+                    let why = "aucun ELF de ce chemin";
+                    report.errors.push(format!("xrefs {spec} : {why}"));
+                }
+                continue;
+            }
+            for target in spec.targets.iter().map(|&at| hex(at)) {
+                if !held.contains(&target) {
+                    let why = format!("aucun ELF AArch64 n'a de section qui contient {target}");
+                    report.errors.push(format!("xrefs {spec} : {why}"));
+                }
+            }
+        }
+    });
+}
+
+/// Octets des ELF d'un rapport, relus dans l'APK, ses splits ou l'ELF brut
+/// analysé.
+struct Reread<'s> {
+    input: Source,
+    base: Option<Result<TolerantZip>>,
+    splits: Vec<(&'s str, Option<Result<TolerantZip>>)>,
+}
+
+impl<'s> Reread<'s> {
+    fn open(elfs: &[ElfReport], input: Source, splits: &'s [super::xapk::Split]) -> Self {
+        let in_archive = elfs.iter().any(|e| e.origin != ORIGIN_RAW);
+        let base = in_archive.then(|| input.tolerant());
+        let splits = splits
+            .iter()
+            .filter(|s| s.native)
+            .map(|s| (s.id.as_str(), in_archive.then(|| s.source.tolerant())))
+            .collect();
+        Reread {
+            input,
+            base,
+            splits,
+        }
+    }
+
+    fn bytes(&self, elf: &ElfReport) -> Result<Vec<u8>, String> {
+        let zip = match elf.split.as_deref() {
+            None => self.base.as_ref(),
+            Some(split) => self
+                .splits
+                .iter()
+                .find(|(label, _)| *label == split)
+                .and_then(|(_, zip)| zip.as_ref()),
+        };
+        match (zip, elf.origin) {
+            (_, ORIGIN_RAW) => self.input.read_all().map_err(|e| format!("{e:#}")),
+            (Some(Ok(zip)), _) => zip.read_by_name(&elf.path).map_err(|e| format!("{e:#}")),
+            (Some(Err(e)), _) => Err(format!("archive illisible ({e:#})")),
+            (None, _) => Err("archive non ouverte".to_string()),
+        }
+    }
 }
 
 fn analyze_elf(path: &str, bytes: &[u8]) -> ElfReport {
@@ -2015,7 +2174,9 @@ fn section_flags(section: &Section) -> String {
 const LEGEND: &str = "\
 --native : analyse statique de TOUS les ELF de l'APK et liaison avec les méthodes
 `native` du DEX. Ni exécution, ni émulation ; désassemblage seulement avec
---native-disasm (section DÉSASSEMBLAGE).
+--native-disasm (section DÉSASSEMBLAGE), propagation symbolique de valeurs seulement
+avec --native-symex (section SYMEX), références vers des adresses seulement avec
+--native-xrefs (section XREFS).
 Mode ELF brut : une entrée dont les 4 premiers octets valent 7F 45 4C 46 est
 analysée seule, quelle que soit son extension ; --native-dex <APK|DEX>, répétable,
 fournit les méthodes natives à lier, sans quoi binding est vide.
@@ -2035,11 +2196,13 @@ RAPPORT
                   commande. Un XAPK s'y écrit <chemin du .xapk>!<entrée du base>. Vide en mode brut sans --native-dex. Une source illisible
                   reste listée, avec sa raison dans errors.
   listings[]      --native-listing seulement, absent sinon (section LISTING).
+  symex[]         --native-symex seulement, absent sinon (section SYMEX).
+  xrefs[]         --native-xrefs seulement, absent sinon (section XREFS).
   errors          Une entrée de longueur nulle (empty : stored vide ou flux deflate vide)
                   est lue, vide, et n'y figure jamais.
                   Ce qui n'a pas pu être lu : entrée d'archive illisible (on ignore alors
                   si c'était un ELF), DEX illisible, classes sautées, panique du parseur
-                  DEX, listing impossible. Une méthode native manquante peut faire
+                  DEX, listing, symex ou xrefs impossible. Une méthode native manquante peut faire
                   apparaître à tort son export en native_unclaimed. Une source illisible
                   est ignorée, les autres sont liées ; si aucune n'a pu être lue,
                   binding est vide et native_methods_declared vaut 0.
@@ -2482,6 +2645,105 @@ LISTING (listings[]) — --native-listing <spec>, répétable, avec --native-dis
                   appelé, sinon kind et cible de l'appel (internal, unresolved,
                   indirect), puis nom de la fonction JNIEnv ou JavaVM appelée ; null si
                   rien. Un indirect résolu en appel JNI ne garde que le nom JNI.
+
+SYMEX (symex[]) — --native-symex <elf|*>@<début>, répétable, avec --native-symex-watch
+  Une entrée par fonction et par ELF analysé. Indépendant de --native-disasm ; AArch64 seulement.
+  symex             Propagation de valeurs symboliques dans une fonction, chemin par chemin, sans solveur ni exécution : d'où vient la valeur lue ou écrite par une instruction.
+  watch             Instruction observée (--native-symex-watch, adresses hexadécimales séparées par des virgules), relevée à chaque passage d'un chemin.
+  chemin            Suite d'instructions depuis entry ; b.cond, cbz, cbnz, tbz, tbnz et les cibles d'une table de saut ouvrent des chemins frères, sans aucun test de faisabilité ; csel, csinc, csinv, csneg et leurs alias n'en ouvrent pas (voir ite). Dans la fonction analysée, tous, sauf ceux arrêtés en off_target ; dans les appelés suivis, plafonnés par callee_forks.
+  ordre d'exploration Le chemin courant continue après un branchement, le frère attend. Les frères ouverts dans la fonction analysée passent tous avant ceux ouverts dans des appelés. Parmi les premiers : avec directed vrai, celui dont le point de reprise a la plus petite distance aux watches, le plus récent à égalité ; avec directed faux, du plus récent au plus ancien. Parmi les seconds, du plus récent au plus ancien. max_paths compte les deux groupes.
+  directed          Vrai : exploration dirigée vers les watches. Avant d'explorer, graphe de flot de la fonction analysée dans sa plage (bound), par désassemblage linéaire, sans exécution : blocs ; arêtes des branchements directs ; cibles d'un br reconnues comme table de saut (même lecture que table de saut, état pris au début du bloc du br) ; arête de retour après chaque bl et blr. Distance d'un bloc = nombre minimal de blocs jusqu'à un bloc qui contient un watch, par parcours arrière ; infinie sans chemin vers un watch ; un br non résolu est supposé pouvoir mener à un watch (distance finie, la plus grande). Sert à l'ordre d'exploration et au statut off_target, jamais dans un appelé. Faux avec --native-symex-undirected, avec bound = none, ou dès qu'un watch est hors de la plage de la fonction analysée : ni élagage ni ordre par distance pour toute l'analyse.
+  drapeaux          NZCV opaques : cmp, tst, ccmp ne sont jamais évalués ; c'est pourquoi les deux issues d'un branchement sont explorées et les deux valeurs d'une sélection gardées (ite).
+  elf               elfs[].path de l'ELF analysé ; avec *, chaque ELF AArch64 dont un segment LOAD exécutable contient l'adresse demandée.
+  fn_start          Début de la plage qui borne la fonction (symbol ou eh_frame), même quand l'adresse demandée tombe au milieu ; l'adresse demandée elle-même si bound vaut none. L'état initial est pris à entry.
+  fn_end            Fin, exclue, de la plage qui borne la fonction, en hexadécimal ; null si bound vaut none.
+  bound             Origine de la plage : symbol = st_size non nul du symbole qui commence à l'adresse demandée ; eh_frame = FDE de .eh_frame qui contient l'adresse demandée (il peut commencer avant) ; none = ni l'un ni l'autre, et toute adresse exécutable qui n'est pas le début d'une autre fonction connue est dans la fonction (borne lâche sur un ELF strippé). Même règle pour chaque fonction entrée par bl ou par appel terminal, d'après sa première instruction.
+  entry             Adresse de départ, avec l'état initial : l'adresse demandée, ou --native-symex-entry (une seule --native-symex), dans la fonction.
+  budgets           Par exploration : depth = profondeur des appels suivis, morceaux et ensemble follow exclus (--native-symex-depth, défaut 0, max 4) ; max_insns = instructions par chemin (défaut 20000) ; max_paths = chemins par exploration (défaut 256) ; fragment_max = taille maximale d'un morceau ; callee_forks = frères par appel suivi. Et refine = relances au plus (--native-symex-refine, défaut 4 ; 0 : aucun raffinement).
+  callee_forks      Nombre de chemins frères qu'un appel suivi depuis la fonction analysée peut ouvrir, tous niveaux d'imbrication confondus, de l'entrée dans cet appelé à son retour (--native-symex-callee-forks, défaut 2 ; 0 : aucun). Le compteur suit le chemin, un frère hérite de celui de son parent, et il revient à zéro dans la fonction analysée. Quota atteint : un branchement conditionnel continue en séquence, une table de saut ne garde que sa première cible.
+  forks_dropped     Nombre de branchements d'appelés non ouverts à cause de callee_forks (une cible de table de saut écartée compte pour un), dans la dernière exploration.
+  fragment_max      Taille maximale d'un morceau, en octets (--native-symex-fragment-max, défaut 64) ; 0 : aucun morceau, toute fonction suivie compte dans la profondeur.
+  follow            Ensemble à suivre : adresses de bl, ou de b hors de la fonction courante, suivis quelle que soit la profondeur et à tout niveau. Donné par --native-symex-follow (adresses hexadécimales séparées par des virgules), puis complété par le raffinement.
+  raffinement       Quand un watch relève sur un chemin une adresse, une valeur ou une cible qui contient, même imbriqué, un load(n, A), chaque appel direct sauté plus tôt sur ce chemin (bl, ou b hors de la fonction courante, vers du code exécutable, ni import ni copie, non suivi) dont l'un des arguments x0..x8 au moment de l'appel n'est pas une constante, a la même base que A et un décalage constant inférieur ou égal à celui de A, est désigné. Les appels désignés hors de follow y sont ajoutés et la fonction est réexplorée depuis entry. Au plus refine relances ; arrêt dès qu'une exploration n'ajoute aucun appel. Désigner un appel ne prouve pas qu'il écrit en A.
+  rounds[]          Une entrée par exploration complète de la fonction : round = 0 pour la première, puis un par relance ; follow = adresses des appels de l'ensemble follow pendant cette exploration ; paths = chemins explorés. Tous les autres champs de symex[] (paths_explored, paths_cut, compteurs, watches, calls, indirect_branches) sont ceux de la dernière exploration.
+  couverture        Celle d'un appelé suivi est partielle (callee_forks, abandon sur boucle coupée). Avec depth = 0 (défaut), les seuls appelés parcourus sont les morceaux et ceux de follow : désignés par le raffinement ou par --native-symex-follow.
+  paths_explored    Chemins menés à leur fin, quel que soit leur statut.
+  paths_cut         Nombre de chemins par statut de fin autre que returned.
+  budget_hit        Un chemin s'est arrêté sur max_insns, ou des chemins ont été abandonnés faute de max_paths : la couverture est partielle.
+  returned          Statut : ret de la fonction analysée ; fin normale, absente de paths_cut.
+  cut_loop          Statut : le chemin arrive une troisième fois à la même adresse dans le même contexte d'appel (boucle coupée), dans la fonction analysée elle-même (aucun bl suivi en cours). Dans un appelé, la même coupure abandonne l'appelé (abandoned) et le chemin continue.
+  callees_abandoned Nombre de chemins qui ont abandonné au moins un appelé.
+  callees_incomplete Nombre de chemins qui ont dépilé au moins un cadre incomplet : appelé suivi par bl dont un appel direct interne (bl, ou b hors de sa plage) n'a pas été suivi, profondeur atteinte et hors de follow. Un import, un appel indirect ou une copie modélisée ne rendent pas un cadre incomplet ; un morceau ne l'est jamais, l'appel non suivi marque alors la fonction suivie qui l'englobe.
+  indirect_branch   Statut : br, dans la fonction analysée elle-même (aucun appel suivi en cours), vers une cible qui n'est ni une adresse connue ni une table de saut reconnue ; cible dans indirect_branches. Dans une fonction appelée, ce br est un indirect_tail.
+  budget            Statut : max_insns atteint sur ce chemin.
+  noreturn          Statut : appel non suivi d'un import sans retour (liste IMPORTS SANS RETOUR).
+  trap              Statut : brk, hlt ou udf.
+  invalid           Statut : octets indécodables, ou adresse hors segment LOAD exécutable.
+  off_target        Statut, avec directed vrai seulement : le chemin entre, dans la fonction analysée elle-même (aucun appel suivi en cours), dans un bloc de distance infinie, d'où aucun watch n'est atteignable. Un chemin qui a passé son dernier watch finit souvent ainsi ; ce qu'il a relevé compte.
+  const             Forme : constante, écrite en hexadécimal (0x112).
+  init(r)           Forme : valeur du registre r à entry, x0..x30 ou sp ; q0..q31 pour un registre vectoriel de 128 bits.
+  global(a)         Forme : adresse virtuelle a formée par adrp+add, adr ou une constante ; global(a) + 0x10 se replie en global(a+0x10).
+  load(n, a)        Forme : n octets lus en a, jamais écrits sur le chemin et non repliés (voir repli) ; contenu inconnu, étendu par des zéros.
+  repli             Une lecture jamais écrite sur le chemin, à une adresse absolue (constante ou global), est remplacée par sa valeur dans deux cas seulement : octets présents dans le fichier d'un segment PT_LOAD sans PF_W (constantes) ; lecture de 8 octets alignée, entière, dans PT_GNU_RELRO, sur un emplacement de relocation relative connu (global(valeur relogée)). Restent des load : .data, .bss, octets hors fichier, emplacement RELRO d'un import, lecture RELRO partielle ou non alignée, toute adresse relative à un registre. La valeur repliée a pour origine l'instruction de lecture.
+  a + b, a - 0xN    Forme add : somme normalisée en base + décalage, termes triés, constantes repliées en un décalage final.
+  sub(a, b)         Forme : différence qui ne se replie pas en décalage constant.
+  and, or, xor      Formes : opérations bit à bit, constantes repliées ; and(e, 0xff), and(e, 0xffff), and(e, 0xffffffff) s'écrivent zext.
+  lsl, lsr, asr     Formes : décalage à gauche, logique à droite, arithmétique à droite.
+  mul               Forme : produit modulo 2^64 (madd, msub, mul, smaddl, umaddl).
+  zextN(e)          Forme : N bits de poids faible de e (N = 8, 16 ou 32) étendus par des zéros ; écriture d'un registre w, uxtb, uxth.
+  sextN(e)          Forme : N bits de poids faible de e étendus par le bit de signe ; ldrsb, ldrsh, ldrsw, sxtb, sxth, sxtw.
+  truncN(e)         Forme : N bits de poids faible de e ; valeur rangée sur N bits, ou octets extraits d'une valeur plus large.
+  ite(c, a, b)      Forme : a si la condition c est vraie, b sinon ; écrite par csel, csinc, csinv, csneg et leurs alias (cset, csetm, cinc, cinv, cneg), qui n'ouvrent pas de chemin. c = code de condition @ adresse de l'instruction de sélection (eq@0x1a2c) : condition opaque, jamais évaluée ni rapprochée d'une autre. ite(c, a, a) s'écrit a ; condition al ou nv : a ; une opération sur un ite n'est pas distribuée dans ses branches. Sa trace réunit celles de a et de b.
+  unknown(r, i, s)  Forme : valeur inconnue, de raison r, née à l'instruction i, dans le registre s, ou au décalage s (+0x…) depuis le début de la zone perdue.
+  call_not_followed Raison : x0..x18, q0..q7, q16..q31 et moitié haute de q8..q15 après un appel non suivi (import, cible hors code exécutable, profondeur atteinte), un memcpy modélisé ou un appelé abandonné.
+  indirect_call     Raison : les mêmes registres après un blr, jamais suivi, ou un indirect_tail.
+  unsupported_insn  Raison : registre, ou zone mémoire, écrit par une instruction non modélisée ; registre de statut de stxr.
+  budget            Raison : expression de plus de 256 nœuds, ou zone destination d'un memcpy de plus de 4096 octets.
+  havoc             Raison : zone destination d'un memcpy/memmove de longueur non constante, de son adresse à la fin de sa base.
+  bases             Adresse = base + décalage constant. Deux accès qui se chevauchent sur la même base sont découpés par octets ; deux bases différentes sont SUPPOSÉES NE PAS SE RECOUVRIR (hypothèse jamais vérifiée : init(x0) et init(x1) peuvent désigner la même mémoire).
+  mémoire           Vide à l'entrée ; conservée à travers un appel non suivi (hypothèse : l'appelé n'écrit rien que l'appelant relise) ; ce qu'un appelé suivi a écrit reste, même s'il est quitté sans parcourir sa fin.
+  registres préservés Hypothèse AAPCS64 : un appelé pris en entier rend sp et x19..x29 intacts. Appliquée quand un appelé suivi par bl est quitté sans que sa fin soit parcourue (appel terminal non suivi, direct ou indirect_tail, ou abandon), et quand le ret d'un cadre incomplet est parcouru (voir callees_incomplete) : sp et x19..x29 reprennent leur valeur à l'entrée du bl, traces comprises. Non appliquée quand le ret d'un appelé complet est parcouru : les valeurs calculées sont gardées, un morceau externalisé appelé par bl pouvant modifier ces registres à dessein.
+  appel suivi       bl vers un segment exécutable, si la profondeur le permet ou si l'adresse du bl est dans follow : l'appelé est parcouru avec l'état courant jusqu'à son ret ; un b hors de la plage de la fonction courante est un appel terminal, suivi aux mêmes conditions (adresse du b) et compté dans la profondeur jusqu'au ret. Un morceau est suivi dans tous les cas, sans compter dans la profondeur.
+  morceau           Appelé (par bl ou par b terminal) dont la cible commence une plage connue (bound symbol ou eh_frame) d'au plus fragment_max octets : fragment externalisé par le compilateur (prologue, épilogue, ajustement de sp). Toujours suivi, hors profondeur (ni cadres comptés, ni appels terminaux) ; entré par bl, il a son cadre pour le ret, jamais incomplet. Au plus 8 morceaux imbriqués : au-delà, appel ordinaire. Imports et memcpy restent reconnus avant.
+  table de saut     br vers global(B) + (entrée << k), l'entrée (1, 2 ou 4 octets, signée ou non) lue dans une table global(T) + index : entrées relues dans l'ELF, un chemin par cible distincte, arrêt à la première cible hors de la plage de la fonction (bound), 64 entrées au plus ; avec bound = none, la lecture peut déborder sur une table voisine. Index constant : une seule entrée lue, une seule cible (souvent déjà repliée en global, voir repli).
+  watches[]         insn_addr ; instruction = texte désassemblé ; reached = false si aucun chemin n'y passe ; results[] = résultats distincts entre chemins.
+  kind              De results[] : load, store, call (bl, blr), branch (br), def (registre écrit par une autre instruction), other (rien de relevé).
+  address           Adresse lue ou écrite ; pour ldp/stp, celle du premier registre.
+  value, value2     Valeur lue ou écrite ; value2 = second registre de ldp/stp ; pour def, valeur du registre écrit.
+  target, args      Cible de bl, blr ou br, et x0..x3 avant l'instruction.
+  sp                De results[] : expression de sp juste avant l'instruction, texte et arbre ; deux résultats qui ne diffèrent que par sp restent distincts. En fin de ligne (sp = …) dans la sortie texte.
+  paths             Nombre de chemins qui ont produit ce résultat, ou rencontré cet appel.
+  trace             Instructions qui ont produit ou déplacé la valeur (calcul d'adresse exclu), dans l'ordre d'exécution, relevées sur le premier chemin du résultat ; les 256 dernières.
+  trace_truncated   Présent et vrai si trace a été tronquée.
+  peeks             De results[], avec --native-symex-peek <watch>:<registre>+<décalage>:<longueur> (éléments séparés par des virgules ; watch parmi --native-symex-watch ; registre x0..x30 ou sp ; décalage décimal ou 0x hexadécimal, signe - accepté ; longueur de 1 à 64 octets) : une entrée par lecture demandée pour ce watch, dans l'ordre de l'option. reg, offset, len tels que demandés ; address = valeur du registre juste avant l'instruction, plus le décalage ; bytes = len octets aux adresses croissantes, chacun lu comme le lirait un ldrb à cet endroit (octet extrait d'une écriture plus large, copie modélisée, repli ; un octet jamais écrit donne load(1, …) ; un emplacement RELRO, lu par octets, n'est jamais replié). Ni l'état, ni les chemins, ni les budgets, ni le raffinement n'en dépendent. Deux résultats qui ne diffèrent que par peeks restent distincts. Absent sans lecture demandée pour ce watch. Sortie texte : peek [address] = octets, sous le résultat.
+  calls[]           Appels non suivis et copies modélisées : insn_addr, kind, target, import (nom de l'import, s'il y en a un), args = x0..x8 au moment de l'appel (texte seul ; deux entrées qui ne diffèrent que par args restent distinctes), paths.
+  indirect          kind de calls[] : blr, jamais suivi.
+  direct            kind de calls[] : bl, ou b hors de la fonction, non suivi.
+  indirect_tail     kind de calls[] : br non résolu dans une fonction appelée (un cadre d'appel empilé, ou un appel terminal suivi) : appel terminal indirect, registres perdus comme pour un blr (indirect_call), puis retour à l'appelant.
+  abandoned         kind de calls[] : appelé abandonné sur une boucle coupée ; insn_addr = bl du dernier appel suivi, target = sa cible. Le cadre est dépilé (appels terminaux compris), x0..x18 et les registres vectoriels sont perdus (call_not_followed), sp et x19..x29 restaurés (registres préservés), et le chemin reprend après le bl.
+  copy              kind de calls[] : memcpy, memmove, __memcpy_chk ou __memmove_chk, reconnu par PLT, symbole ou emplacement de GOT (blr), y compris au bout de b ; x2 constante = copie octet par octet de [x1] vers [x0], x0 = destination.
+  indirect_branches[] br non résolus : insn_addr, target, paths.
+  text, expr        Chaque expression est donnée deux fois : texte stable, et arbre JSON ({\"load\": {\"size\": 1, \"addr\": …}}, {\"add\": [a, b]}, {\"ite\": {\"cond\", \"then\", \"else\"}}, {\"unknown\": {\"reason\", \"insn\", \"slot\"}}).
+
+XREFS (xrefs[]) — --native-xrefs <elf|*>@<adresse>[,<adresse>...], répétable
+  Une entrée par ELF et par adresse cible : la fonction qui la contient, les instructions qui y branchent, les instructions et les données qui en portent l'adresse. Rien n'est exécuté ; AArch64 seulement ; indépendant de --native-disasm. Une seule passe sur le code de l'ELF pour toutes les adresses d'une --native-xrefs.
+  adresses          Hexadécimales, préfixe 0x facultatif, séparées par des virgules, de 1 à 64 par --native-xrefs ; doublons retirés. Un élément mal formé est cité dans l'erreur.
+  elf               elfs[].path de l'ELF. Avec *, chaque ELF AArch64 dont une section allouée contient la cible (sans section headers : un segment LOAD), les autres ELF ignorés ; une cible qu'aucun ne contient est dans errors. Nommé explicitement : toutes les cibles, même hors de toute section ; un ELF non AArch64 est une erreur.
+  target            Adresse cherchée.
+  section           Nom de la section allouée qui contient la cible ; null s'il n'y en a pas.
+  function          Fonction qui contient la cible, par le même code que SYMEX : fn_start, fn_end, bound (symbol, eh_frame ou none) ; avec none, fn_start est l'adresse elle-même et fn_end est null. Absent si la cible n'est pas dans un segment LOAD exécutable.
+  code_refs         Branchements directs des sections exécutables dont la destination est exactement la cible : bl, b, b.cond, bc.cond, cbz, cbnz, tbz, tbnz, chaque mot aligné sur 4 octets étant décodé. insn_addr ; mnemonic ; kind ; function = celle qui contient l'instruction, même règle.
+  call              kind de code_refs : bl.
+  jump              kind de code_refs : b.
+  cond_jump         kind de code_refs : b.cond, bc.cond, cbz, cbnz, tbz, tbnz.
+  addr_refs         Instructions des sections exécutables qui forment ou accèdent exactement à l'adresse de la cible, par le balayage des xrefs de --native-strings : adr ; adrp puis add immédiat 64 bits qui lit le registre de l'adrp (sa destination peut être un autre registre) ; adrp puis ldr ou str à décalage immédiat non signé, toutes largeurs et registres vectoriels compris, prfm exclu, sur le registre de l'adrp ; ldr littéral. Appariement : au plus 8 instructions de l'adrp à l'instruction qui s'en sert ; tout est oublié au début de chaque zone exécutable et de chaque fonction connue (symbole ou FDE), après b, br et ret ; x0..x18 et x30 après bl et blr ; une instruction qui réécrit le registre de l'adrp entre les deux défait la paire ; sp n'est jamais suivi. insn_addr = instruction qui achève l'adresse ; adrp_addr = l'adrp, absent pour adr et ldr littéral ; kind ; function.
+  address           kind de addr_refs : l'instruction met l'adresse de la cible dans un registre (adr ; adrp puis add ; ldr littéral 64 bits dont le mot lu, relogé s'il y a lieu, vaut la cible).
+  load              kind de addr_refs : lecture à l'adresse de la cible (adrp puis ldr ; ldr littéral, toutes largeurs, dont l'adresse lue est la cible).
+  store             kind de addr_refs : écriture à l'adresse de la cible (adrp puis str).
+  data_refs         Mots de 8 octets alignés sur 8 des sections allouées non exécutables présentes dans le fichier (RELRO, .got, .data compris ; sans section headers : segments LOAD non exécutables) qui valent la cible. vaddr ; section (null sans section headers) ; relocated = vrai si la valeur après relocation relative (R_AARCH64_RELATIVE en REL ou RELA, RELR) vaut la cible, faux si seul le mot du fichier la vaut.
+  total, truncated, items Chaque liste est triée par adresse croissante puis coupée à --native-xrefs-max (défaut 2000, par liste et par cible) ; total compte toutes les références trouvées ; truncated vaut vrai si items en garde moins que total.
+  limites           Une absence de référence n'est pas une preuve : branchement indirect (br, blr), adresse calculée, adrp et son add, ldr ou str éloignés ou séparés par une fin de fonction, table de sauts, code chiffré ou généré à l'exécution échappent à la recherche. code_refs ne compte que les branchements dont la destination est exactement la cible, pas ceux qui visent l'intérieur de la fonction. data_refs ne voit que les mots alignés sur 8 ; les relocations autres que relatives (R_AARCH64_ABS64 vers un symbole, formats packés APS2) ne sont pas appliquées. function ne lit le st_size que d'un symbole qui commence exactement à l'adresse : l'intérieur d'une fonction connue seulement par son symbole, sans FDE, donne bound = none.
+  Sortie texte : une ligne par entrée (elf, cible, section, fonction), puis chaque liste avec son total, (tronqué) si truncated, et une ligne par référence.
 ";
 
 /// Légende autonome : chaque champ, statut, catégorie et anomalie de `--native`.

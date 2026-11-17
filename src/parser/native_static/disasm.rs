@@ -467,32 +467,14 @@ fn disassemble(bytes: &[u8], report: &ElfReport, options: &DisasmOptions) -> Elf
     let Ok(parsed) = parse_elf(bytes) else {
         return ElfDisasm::default();
     };
-    let mut scratch = Vec::new();
-    let tables = match &parsed.dynamic {
-        Some(entries) => dynamic_relocs(&parsed.image, entries, &mut scratch),
-        None => section_relocs(&parsed.image, &mut scratch),
-    };
-    let slots = relocated_slots(&parsed.image, &tables, &mut scratch);
-    let mut ctx = Ctx::new(parsed.image);
-    ctx.slots = slots;
-    if let Some(dynamic) = &parsed.dynamic {
-        ctx.got = got_imports(&ctx.image, dynamic);
-        ctx.plt_got = dyn_tag(dynamic, elf::DT_PLTGOT);
-    }
+    let dynamic = parsed.dynamic.as_deref();
+    let ctx = context(
+        parsed.image,
+        dynamic,
+        &parsed.symbols,
+        &parsed.local_symbols,
+    );
     let arm = ctx.image.machine == elf::EM_ARM;
-    for sym in parsed.symbols.iter().chain(&parsed.local_symbols) {
-        if let Some((address, thumb)) = symbol_mode(arm, sym) {
-            ctx.modes.entry(address).or_insert(thumb);
-        }
-        if !sym.defined || !sym.func || sym.value == 0 {
-            continue;
-        }
-        let (address, _) = split_thumb(arm, sym.value);
-        ctx.starts.insert(address);
-        let slot = ctx.symbols.entry(address);
-        slot.or_insert_with(|| (sym.name.clone(), sym.size));
-        ctx.defined.entry(sym.name.clone()).or_insert(sym.value);
-    }
 
     let mut entries = Vec::new();
     for export in &report.jni.static_exports {
@@ -558,6 +540,43 @@ fn disassemble(bytes: &[u8], report: &ElfReport, options: &DisasmOptions) -> Elf
         }
     }
     out
+}
+
+/// Contexte d'évaluation d'un ELF : emplacements relogés, imports de la GOT,
+/// fonctions connues par leurs symboles. Partagé avec `--native-symex`.
+pub(super) fn context<'a>(
+    image: Image<'a>,
+    dynamic: Option<&[(u64, u64)]>,
+    symbols: &[DynSymbol],
+    local_symbols: &[DynSymbol],
+) -> Ctx<'a> {
+    let mut scratch = Vec::new();
+    let tables = match dynamic {
+        Some(entries) => dynamic_relocs(&image, entries, &mut scratch),
+        None => section_relocs(&image, &mut scratch),
+    };
+    let slots = relocated_slots(&image, &tables, &mut scratch);
+    let mut ctx = Ctx::new(image);
+    ctx.slots = slots;
+    if let Some(dynamic) = dynamic {
+        ctx.got = got_imports(&ctx.image, dynamic);
+        ctx.plt_got = dyn_tag(dynamic, elf::DT_PLTGOT);
+    }
+    let arm = ctx.image.machine == elf::EM_ARM;
+    for sym in symbols.iter().chain(local_symbols) {
+        if let Some((address, thumb)) = symbol_mode(arm, sym) {
+            ctx.modes.entry(address).or_insert(thumb);
+        }
+        if !sym.defined || !sym.func || sym.value == 0 {
+            continue;
+        }
+        let (address, _) = split_thumb(arm, sym.value);
+        ctx.starts.insert(address);
+        let slot = ctx.symbols.entry(address);
+        slot.or_insert_with(|| (sym.name.clone(), sym.size));
+        ctx.defined.entry(sym.name.clone()).or_insert(sym.value);
+    }
+    ctx
 }
 
 /// Adresse et mode d'une racine `--native-root` dans cet ELF ; `None` si le
@@ -1022,7 +1041,7 @@ impl DynSyms {
 
 impl Image<'_> {
     /// Octets à partir de `at`, au plus 16, pris dans un segment LOAD exécutable.
-    fn code_window(&self, at: u64) -> Option<&[u8]> {
+    pub(super) fn code_window(&self, at: u64) -> Option<&[u8]> {
         for s in &self.segments {
             if s.p_type != elf::PT_LOAD || !s.has(elf::PF_X) || !s.in_file(at) {
                 continue;
@@ -1143,18 +1162,18 @@ fn is_callee_saved(arch: Arch, reg: u8) -> bool {
     }
 }
 
-struct Ctx<'a> {
-    image: Image<'a>,
-    arch: Option<Arch>,
-    slots: HashMap<u64, u64>,
-    got: HashMap<u64, String>,
+pub(super) struct Ctx<'a> {
+    pub(super) image: Image<'a>,
+    pub(super) arch: Option<Arch>,
+    pub(super) slots: HashMap<u64, u64>,
+    pub(super) got: HashMap<u64, String>,
     /// Adresse de fonction → (nom, st_size).
-    symbols: HashMap<u64, (String, u64)>,
+    pub(super) symbols: HashMap<u64, (String, u64)>,
     /// Nom de fonction définie → st_value, bit Thumb compris.
     defined: HashMap<String, u64>,
     /// ARM 32 bits : adresse d'un symbole défini → Thumb, par [`symbol_mode`].
     modes: HashMap<u64, bool>,
-    starts: HashSet<u64>,
+    pub(super) starts: HashSet<u64>,
     plt_got: Option<u64>,
     plt_cache: RefCell<HashMap<u64, Option<String>>>,
     /// Fonction déjà désassemblée → aucun de ses chemins ne revient.
@@ -1461,7 +1480,7 @@ impl Machine {
     }
 }
 
-fn read_le(bytes: &[u8]) -> u64 {
+pub(super) fn read_le(bytes: &[u8]) -> u64 {
     let mut value = 0;
     for &b in bytes.iter().rev() {
         value = (value << 8) | u64::from(b);
@@ -1469,7 +1488,7 @@ fn read_le(bytes: &[u8]) -> u64 {
     value
 }
 
-fn in_function(ctx: &Ctx, start: u64, at: u64) -> bool {
+pub(super) fn in_function(ctx: &Ctx, start: u64, at: u64) -> bool {
     if let Some(&(_, size)) = ctx.symbols.get(&start) {
         if size > 0 {
             return at >= start && at - start < size;
@@ -1543,7 +1562,7 @@ fn is_noreturn(ctx: &Ctx, target: u64, thumb: bool) -> bool {
 
 /// Les entrées PLT sont en ARM sur ARM 32 bits : une cible Thumb n'en est pas
 /// une, et la décoder en ARM ferait lire du Thumb comme de l'ARM.
-fn plt_import(ctx: &Ctx, at: u64, thumb: bool) -> Option<String> {
+pub(super) fn plt_import(ctx: &Ctx, at: u64, thumb: bool) -> Option<String> {
     if ctx.got.is_empty() || thumb {
         return None;
     }

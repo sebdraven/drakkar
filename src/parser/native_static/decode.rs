@@ -172,14 +172,33 @@ fn sext(value: u64, bits: u32) -> i64 {
     ((value << shift) as i64) >> shift
 }
 
+/// AArch64 seul : l'instruction de yaxpeax-arm avec sa forme commune, pour un
+/// évaluateur qui lit les opérandes lui-même (`symex`). Panique rattrapée comme
+/// dans [`decode`].
+pub(super) fn decode_a64_full(
+    code: &[u8],
+    address: u64,
+) -> Result<(a64::Instruction, Insn), Failure> {
+    let job = AssertUnwindSafe(|| a64_full(code, address));
+    match std::panic::catch_unwind(job) {
+        Ok(Some(found)) => Ok(found),
+        Ok(None) => Err(Failure::Invalid),
+        Err(_) => Err(Failure::Panic),
+    }
+}
+
 fn decode_a64(code: &[u8], address: u64) -> Option<Insn> {
+    a64_full(code, address).map(|(_, insn)| insn)
+}
+
+fn a64_full(code: &[u8], address: u64) -> Option<(a64::Instruction, Insn)> {
     let mut reader = U8Reader::new(code);
     let inst = a64::InstDecoder::default().decode(&mut reader).ok()?;
     let len = usize::try_from(inst.len().to_const()).ok()?;
     let raw = code.get(..len)?;
     let mut insn = Insn::from_text(address, raw, &inst.to_string());
     a64_semantics(&inst, address, &mut insn);
-    Some(insn)
+    Some((inst, insn))
 }
 
 /// Registre écrit ; `None` pour xzr / wzr.
