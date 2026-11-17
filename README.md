@@ -116,6 +116,7 @@ published empirical values.
 | `--native-arch` | ABI, word size and machine of each `.so`. |
 | `--native` | every ELF of the APK, found by content (`lib/`, `assets/`, `res/raw/`, elsewhere): sections with entropy, segments, `DT_NEEDED`, classified imports and strings, demangled `Java_*` exports, `JNINativeMethod` tables rebuilt through relative relocations (RELA, REL, RELR), and the binding of each DEX `native` method to its implementation. A raw ELF can be passed directly, with `--native-dex` for the DEX to bind. |
 | `--native --native-disasm` | static disassembly (AArch64, ARM, Thumb-2, x86, x86_64) of the functions at the Java↔native boundary — bound functions, `JNI_OnLoad` / `JNI_OnUnload`, `DT_INIT`, `DT_INIT_ARRAY`, `e_entry` — and of the internal functions they call, up to `--disasm-depth`: `JNIEnv` calls decoded with class, name and signature when the strings are local, PLT/GOT imports called, strings referenced, system calls. |
+| `--native --native-symex <elf\|*>@<start>` | symbolic value propagation inside one AArch64 function, path by path, without a solver: for each `--native-symex-watch` instruction, the expression of the address and of the value it reads or writes (of the target and `x0..x3` for a call), with the instructions that produced it. Exploration is directed toward the watches (`--native-symex-undirected` turns this off); conditional selects merge into `ite(c, a, b)` instead of forking. Called functions are skipped by default (`--native-symex-depth 0`) and followed on demand: by hand (`--native-symex-follow`), or when a watch reads memory never written and a skipped call received a pointer into it (`--native-symex-refine`, up to 4 reruns). Constant-length `memcpy` / `memmove` copy bytes, jump tables are enumerated. Distinct memory bases are assumed not to overlap. |
 | `--native-strings [PATTERN…]` | the strings of every ELF (APK, XAPK splits, raw ELF), each with how its bound was found: NUL byte, Rust `{ptr, len}` pair rebuilt through relative relocations, AArch64 immediate length next to the address, or an unsplit heuristic block. `--xrefs`: the instructions that form each address, over the whole code, with the enclosing function from symbols or `.eh_frame`. `--crates`: Rust crates named by source paths, banners of statically linked C libraries. Cryptographic constants recognised by content. JSON streamed to `--json-out`. |
 
 `--native-disasm` follows paths, not bytes: a function stops at a return, a
@@ -126,7 +127,22 @@ usual trace of OLLVM flattening. Extra roots: `--native-root`,
 `--native-roots exports`; listings: `--native-listing`; heuristic string
 index: `--native-string-index`.
 
-It does not execute, emulate or run symbolically; it does not follow `JNIEnv`
+`--native-symex-peek=<watch>:<reg>+<offset>:<len>[,…]` reads the symbolic
+memory a register points to at a watch, without any instruction of the binary
+reading it, e.g. `--native-symex-peek=36ffbd0:x0+0x110:3,36ffbd0:x0+0xf8:3`.
+`<watch>` is hexadecimal without prefix and must be one of
+`--native-symex-watch`; `<reg>` is `x0`..`x30` or `sp`; `<offset>` is decimal
+or `0x` hexadecimal, a `-` sign is accepted; `<len>` is 1 to 64 bytes. On every
+path that reaches the watch, before the watched instruction takes effect, each
+byte is read as an `ldrb` at that point would read it; the state, the paths,
+the budgets and the on-demand refinement are left untouched. Each
+`watches[].results[]` entry then carries `peeks`, in option order: `reg`,
+`offset` and `len` as requested, `address` (register value plus offset, as
+`{text, expr}`), and `bytes` (`len` values `{text, expr}`, one per byte, by
+increasing address). Two paths whose peeks differ give two results.
+
+It does not execute or emulate, and runs symbolically only under
+`--native-symex`, without a solver; it does not follow `JNIEnv`
 past the first argument of a callee; strings built or decrypted at run time,
 and native code absent from the APK, are invisible.
 
