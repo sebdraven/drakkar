@@ -4744,7 +4744,7 @@ mod tests {
         let masked = and(&zext(32, &x0), &konst(0xff));
         assert_eq!(masked.to_string(), "zext8(init(x0))");
         assert_eq!(trunc(8, &zext(32, &byte)), byte);
-        let json = serde_json::to_value(&add(&byte, &konst(1))).unwrap();
+        let json = serde_json::to_value(add(&byte, &konst(1))).unwrap();
         assert_eq!(json["add"][1]["const"], "0x1");
         assert_eq!(json["add"][0]["load"]["size"], 1);
     }
