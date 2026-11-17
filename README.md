@@ -117,6 +117,7 @@ published empirical values.
 | `--native` | every ELF of the APK, found by content (`lib/`, `assets/`, `res/raw/`, elsewhere): sections with entropy, segments, `DT_NEEDED`, classified imports and strings, demangled `Java_*` exports, `JNINativeMethod` tables rebuilt through relative relocations (RELA, REL, RELR), and the binding of each DEX `native` method to its implementation. A raw ELF can be passed directly, with `--native-dex` for the DEX to bind. |
 | `--native --native-disasm` | static disassembly (AArch64, ARM, Thumb-2, x86, x86_64) of the functions at the Java↔native boundary — bound functions, `JNI_OnLoad` / `JNI_OnUnload`, `DT_INIT`, `DT_INIT_ARRAY`, `e_entry` — and of the internal functions they call, up to `--disasm-depth`: `JNIEnv` calls decoded with class, name and signature when the strings are local, PLT/GOT imports called, strings referenced, system calls. |
 | `--native --native-symex <elf\|*>@<start>` | symbolic value propagation inside one AArch64 function, path by path, without a solver: for each `--native-symex-watch` instruction, the expression of the address and of the value it reads or writes (of the target and `x0..x3` for a call), with the instructions that produced it. Exploration is directed toward the watches (`--native-symex-undirected` turns this off); conditional selects merge into `ite(c, a, b)` instead of forking. Called functions are skipped by default (`--native-symex-depth 0`) and followed on demand: by hand (`--native-symex-follow`), or when a watch reads memory never written and a skipped call received a pointer into it (`--native-symex-refine`, up to 4 reruns). Constant-length `memcpy` / `memmove` copy bytes, jump tables are enumerated. Distinct memory bases are assumed not to overlap. |
+| `--native --native-xrefs <elf\|*>@<addr>[,<addr>…]` | cross-references to up to 64 addresses of an AArch64 ELF, without executing anything: the enclosing function, the direct branches that land exactly on each address, the instructions that form or access it, and the data words that hold it. One pass over the code for all addresses. |
 | `--native-strings [PATTERN…]` | the strings of every ELF (APK, XAPK splits, raw ELF), each with how its bound was found: NUL byte, Rust `{ptr, len}` pair rebuilt through relative relocations, AArch64 immediate length next to the address, or an unsplit heuristic block. `--xrefs`: the instructions that form each address, over the whole code, with the enclosing function from symbols or `.eh_frame`. `--crates`: Rust crates named by source paths, banners of statically linked C libraries. Cryptographic constants recognised by content. JSON streamed to `--json-out`. |
 
 `--native-disasm` follows paths, not bytes: a function stops at a return, a
@@ -140,6 +141,39 @@ the budgets and the on-demand refinement are left untouched. Each
 `offset` and `len` as requested, `address` (register value plus offset, as
 `{text, expr}`), and `bytes` (`len` values `{text, expr}`, one per byte, by
 increasing address). Two paths whose peeks differ give two results.
+
+`--native-symex` reports in `fn_start` the start of the function found by
+symbol or `.eh_frame`, even when the requested address falls inside it; the
+exploration still starts at the requested address, carried by `entry`. With
+`bound` = `none`, `fn_start` stays the requested address.
+
+`--native-xrefs=<elf|*>@<addr>[,<addr>…]` answers, for each address, which
+function contains it, which instructions branch to it and which instructions
+or data words carry it, e.g.
+`--native --native-xrefs='lib/arm64-v8a/libapp.so@36ffbd0,0x4a2f10'`.
+Addresses are hexadecimal, `0x` optional, 1 to 64 per option (repeatable); a
+malformed item is named in the error. `*` takes every AArch64 ELF one of whose
+allocated sections contains the address; an ELF named explicitly that is not
+AArch64 is an error. Each `xrefs[]` entry, one per (ELF, address), carries
+`elf`, `target`, `section`, `function` (`fn_start`, `fn_end`, `bound` =
+`symbol`, `eh_frame` or `none`, by the same code as `--native-symex`; absent
+when the address is not in executable code), and three lists, each sorted by
+address and cut at `--native-xrefs-max` (default 2000) with an exact `total`
+and a `truncated` flag:
+`code_refs` (`bl`, `b`, `b.cond`, `cbz`, `cbnz`, `tbz`, `tbnz` whose
+destination is exactly the address: `insn_addr`, `mnemonic`, `kind` = `call`,
+`jump` or `cond_jump`, enclosing `function`); `addr_refs` (`adr`, `adrp` then
+`add`, `adrp` then `ldr`/`str`, literal `ldr`, paired as the
+`--native-strings --xrefs` scan pairs them, within 8 instructions: `insn_addr`
+of the instruction that completes the address, `adrp_addr`, `kind` =
+`address`, `load` or `store`, `function`); `data_refs` (8-byte words aligned
+on 8 in non-executable sections, RELRO included, equal to the address as
+stored in the file or after relative relocation, `R_AARCH64_RELATIVE` and
+RELR: `vaddr`, `section`, `relocated`). No reference is not proof of absence:
+indirect branches (`br`, `blr`), computed addresses, an `adrp` far from its
+`add`/`ldr`/`str`, jump tables, encrypted or generated code escape it;
+`code_refs` only counts branches to the exact address, not into the function;
+`data_refs` only sees words aligned on 8.
 
 It does not execute or emulate, and runs symbolically only under
 `--native-symex`, without a solver; it does not follow `JNIEnv`

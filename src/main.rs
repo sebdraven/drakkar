@@ -2636,6 +2636,51 @@ fn symex_options(cli: &Cli, functions: usize) -> Result<parser::native_static::S
     Ok(options)
 }
 
+fn print_xrefs(x: &drakkar::parser::native_static::XrefReport) {
+    let function = |f: &drakkar::parser::native_static::XrefFunction| {
+        let end = f.fn_end.as_deref().unwrap_or("?");
+        format!("{}-{end} ({})", f.fn_start, f.bound)
+    };
+    let section = x.section.as_deref().unwrap_or("-");
+    let target_function = x.function.as_ref().map_or_else(|| "-".into(), function);
+    println!(
+        "\nXrefs {}  cible {}  section {section}  fonction {target_function} :",
+        x.elf, x.target
+    );
+    let header = |name: &str, total: usize, truncated: bool| {
+        let suffix = if truncated { " (tronqué)" } else { "" };
+        println!("  {name}  {total}{suffix}");
+    };
+    header("code_refs", x.code_refs.total, x.code_refs.truncated);
+    for r in &x.code_refs.items {
+        println!(
+            "    {}  {}  {}  fonction {}",
+            r.insn_addr,
+            r.kind,
+            r.mnemonic,
+            function(&r.function)
+        );
+    }
+    header("addr_refs", x.addr_refs.total, x.addr_refs.truncated);
+    for r in &x.addr_refs.items {
+        let adrp = r.adrp_addr.as_deref().unwrap_or("-");
+        println!(
+            "    {}  {}  adrp {adrp}  fonction {}",
+            r.insn_addr,
+            r.kind,
+            function(&r.function)
+        );
+    }
+    header("data_refs", x.data_refs.total, x.data_refs.truncated);
+    for r in &x.data_refs.items {
+        let section = r.section.as_deref().unwrap_or("-");
+        println!(
+            "    {}  section {section}  relocated {}",
+            r.vaddr, r.relocated
+        );
+    }
+}
+
 /// Un bloc par fonction de `--native-symex` : chemins, puis un résumé par watch.
 fn print_symex(s: &drakkar::parser::native_static::SymexReport) {
     let (elf, start, entry, bound) = (&s.elf, &s.fn_start, &s.entry, s.bound);
