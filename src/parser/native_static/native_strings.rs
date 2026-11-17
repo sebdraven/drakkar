@@ -324,13 +324,13 @@ struct CryptoRow<'a> {
 
 /// Section allouée présente dans le fichier ou, sans section headers, segment
 /// LOAD.
-struct Area {
-    name: Option<String>,
-    vaddr: u64,
-    offset: u64,
-    size: u64,
+pub(super) struct Area {
+    pub(super) name: Option<String>,
+    pub(super) vaddr: u64,
+    pub(super) offset: u64,
+    pub(super) size: u64,
     read_only: bool,
-    exec: bool,
+    pub(super) exec: bool,
     /// Découpée en chaînes.
     strings: bool,
 }
@@ -468,6 +468,24 @@ struct Formed {
     kind: &'static str,
     /// Emplacement du couple dont `target` est le pointeur.
     pair: Option<u64>,
+    adrp: Option<u64>,
+}
+
+/// Ce que fait une instruction de l'adresse qu'elle forme ou lit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Access {
+    Address,
+    Load,
+    Store,
+}
+
+/// Adresse formée ou accédée par `insn` ; `adrp` : l'ADRP qui a posé la page.
+#[derive(Clone, Copy)]
+pub(super) struct CodeAddress {
+    pub(super) insn: u64,
+    pub(super) adrp: Option<u64>,
+    pub(super) target: u64,
+    pub(super) access: Access,
 }
 
 #[derive(Clone, Copy)]
@@ -1087,7 +1105,7 @@ fn is_aarch64(image: &Image) -> bool {
     image.machine == elf::EM_AARCH64 && image.ptr_size == 8 && !image.big_endian
 }
 
-fn data_areas(image: &Image) -> (Vec<Area>, &'static str) {
+pub(super) fn data_areas(image: &Image) -> (Vec<Area>, &'static str) {
     let skipped: Vec<&str> = SECTIONS_NOT_SCANNED.split_whitespace().collect();
     let mut areas = Vec::new();
     for s in &image.sections {
@@ -1688,6 +1706,15 @@ fn function_bounds(
     (Bounds { entries }, counts)
 }
 
+/// Plages `[début, fin)` des FDE de `.eh_frame`, triées. Partagé avec
+/// `--native-symex`.
+pub(super) fn fde_ranges(image: &Image) -> Vec<(u64, u64)> {
+    let (areas, _) = data_areas(image);
+    let mut fdes = eh_frame_fdes(image, &areas).fdes;
+    fdes.sort_unstable();
+    fdes
+}
+
 fn eh_frame_fdes(image: &Image, areas: &[Area]) -> EhFrame {
     let section = areas
         .iter()
@@ -1923,9 +1950,10 @@ impl<'a> Reader<'a> {
 // ---------------------------------------------------------------------------
 // Balayage linéaire du code AArch64.
 
+/// `Page(page, adrp)`.
 #[derive(Clone, Copy)]
 enum Held {
-    Page(u64),
+    Page(u64, u64),
     Addr(u64),
     Imm(u64),
 }
@@ -1953,6 +1981,8 @@ struct Sweep {
     formed: Vec<Formed>,
     /// Couples (adresse, longueur immédiate) candidats à rust_code.
     lengths: Vec<(u64, u64)>,
+    /// `--native-xrefs` seulement : lectures et écritures d'adresse connue.
+    accesses: Option<Vec<CodeAddress>>,
 }
 
 /// Toutes les zones exécutables, quatre octets par quatre octets : adresses
@@ -1965,6 +1995,47 @@ fn scan_code(
     bounds: &Bounds,
 ) -> (Vec<Formed>, Vec<(u64, u64)>) {
     let mut sweep = Sweep::new();
+    sweep_code(&mut sweep, image, slots, areas, pairs, bounds, |_, _| {});
+    (sweep.formed, sweep.lengths)
+}
+
+/// Le balayage de [`scan_code`] sur tout le code AArch64, sans couple : chaque
+/// adresse formée, ou lue et écrite à travers une page ADRP ou un ldr
+/// littéral. `each` reçoit chaque mot d'instruction. Partagé avec
+/// `--native-xrefs`.
+pub(super) fn code_addresses(
+    image: &Image,
+    slots: &HashMap<u64, u64>,
+    symbols: &[DynSymbol],
+    local_symbols: &[DynSymbol],
+    each: impl FnMut(u64, u32),
+) -> Vec<CodeAddress> {
+    let (areas, _) = data_areas(image);
+    let (bounds, _) = function_bounds(image, &areas, symbols, local_symbols);
+    let mut sweep = Sweep::new();
+    sweep.accesses = Some(Vec::new());
+    let pairs = HashMap::new();
+    sweep_code(&mut sweep, image, slots, &areas, &pairs, &bounds, each);
+    let formed = sweep.formed.iter().map(|f| CodeAddress {
+        insn: f.insn,
+        adrp: f.adrp,
+        target: f.target,
+        access: Access::Address,
+    });
+    let mut found: Vec<CodeAddress> = formed.collect();
+    found.extend(sweep.accesses.unwrap_or_default());
+    found
+}
+
+fn sweep_code(
+    sweep: &mut Sweep,
+    image: &Image,
+    slots: &HashMap<u64, u64>,
+    areas: &[Area],
+    pairs: &HashMap<u64, u64>,
+    bounds: &Bounds,
+    mut each: impl FnMut(u64, u32),
+) {
     let starts = &bounds.entries;
     for area in areas.iter().filter(|a| a.exec) {
         let Some(code) = image.bytes_at(area.offset, area.size) else {
@@ -1986,10 +2057,11 @@ fn scan_code(
                 sweep.reset();
             }
             sweep.index += 1;
-            sweep.step(pc, u32::from_le_bytes(*word), image, slots, pairs);
+            let w = u32::from_le_bytes(*word);
+            each(pc, w);
+            sweep.step(pc, w, image, slots, pairs);
         }
     }
-    (sweep.formed, sweep.lengths)
 }
 
 impl Sweep {
@@ -2000,6 +2072,7 @@ impl Sweep {
             index: 0,
             formed: Vec::new(),
             lengths: Vec::new(),
+            accesses: None,
         }
     }
 
@@ -2077,6 +2150,7 @@ impl Sweep {
         rd: u32,
         target: u64,
         kind: &'static str,
+        adrp: Option<u64>,
         pairs: &HashMap<u64, u64>,
     ) {
         let formed = match pairs.get(&target) {
@@ -2085,16 +2159,59 @@ impl Sweep {
                 target: string,
                 kind: KIND_FATPTR,
                 pair: Some(target),
+                adrp,
             },
             None => Formed {
                 insn: pc,
                 target,
                 kind,
                 pair: None,
+                adrp,
             },
         };
         self.formed.push(formed);
         self.put(rd, Some(Held::Addr(target)));
+    }
+
+    /// ldr littéral, ou ldr / str à décalage immédiat non signé dont la base
+    /// tient une page ADRP ; prfm et encodages non alloués exclus.
+    fn access(&mut self, pc: u64, w: u32) {
+        let size = w >> 30;
+        let vector = w & (1 << 26) != 0;
+        let found = if w & 0x3b00_0000 == 0x1800_0000 {
+            let words = sext(u64::from((w >> 5) & 0x7ffff), 19);
+            let target = pc.wrapping_add_signed(words * 4);
+            (size != 3).then_some((None, target, Access::Load))
+        } else if w & 0x3b00_0000 == 0x3900_0000 {
+            let opc = (w >> 22) & 3;
+            let access = match (vector, opc) {
+                (_, 0) => Some(Access::Store),
+                (_, 1) => Some(Access::Load),
+                (true, 2) if size == 0 => Some(Access::Store),
+                (true, 3) if size == 0 => Some(Access::Load),
+                (false, 2) if size < 3 => Some(Access::Load),
+                (false, 3) if size < 2 => Some(Access::Load),
+                _ => None,
+            };
+            let scale = if vector && opc >= 2 { 4 } else { size };
+            let offset = u64::from((w >> 10) & 0xfff) << scale;
+            match (access, self.get((w >> 5) & 31)) {
+                (Some(access), Some(Held::Page(page, adrp))) => {
+                    Some((Some(adrp), page.wrapping_add(offset), access))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let (Some((adrp, target, access)), Some(list)) = (found, &mut self.accesses) {
+            list.push(CodeAddress {
+                insn: pc,
+                adrp,
+                target,
+                access,
+            });
+        }
     }
 
     fn step(
@@ -2107,19 +2224,22 @@ impl Sweep {
     ) {
         let rd = w & 31;
         let rn = (w >> 5) & 31;
+        if self.accesses.is_some() {
+            self.access(pc, w);
+        }
         if w & 0x9f00_0000 == 0x9000_0000 {
             let page = (pc & !0xfff).wrapping_add_signed(adr_offset(w) << 12);
-            self.put(rd, Some(Held::Page(page)));
+            self.put(rd, Some(Held::Page(page, pc)));
         } else if w & 0x9f00_0000 == 0x1000_0000 {
             let target = pc.wrapping_add_signed(adr_offset(w));
-            self.address(pc, rd, target, KIND_ADR, pairs);
+            self.address(pc, rd, target, KIND_ADR, None, pairs);
         } else if w & 0xff80_0000 == 0x9100_0000 {
             let shift = if w & (1 << 22) != 0 { 12 } else { 0 };
             let imm = u64::from((w >> 10) & 0xfff) << shift;
             match self.get(rn) {
-                Some(Held::Page(page)) => {
+                Some(Held::Page(page, adrp)) => {
                     let target = page.wrapping_add(imm);
-                    self.address(pc, rd, target, KIND_ADRP_ADD, pairs);
+                    self.address(pc, rd, target, KIND_ADRP_ADD, Some(adrp), pairs);
                 }
                 _ => self.put(rd, None),
             }
@@ -2127,12 +2247,12 @@ impl Sweep {
             let words = sext(u64::from((w >> 5) & 0x7ffff), 19);
             let at = pc.wrapping_add_signed(words * 4);
             match pointer(image, slots, at) {
-                Some(value) => self.address(pc, rd, value, KIND_LDR_LITERAL, pairs),
+                Some(value) => self.address(pc, rd, value, KIND_LDR_LITERAL, None, pairs),
                 None => self.put(rd, None),
             }
         } else if w & 0xffc0_0000 == 0xf940_0000 {
             let offset = u64::from((w >> 10) & 0xfff) * 8;
-            if let Some(Held::Page(page)) = self.get(rn) {
+            if let Some(Held::Page(page, adrp)) = self.get(rn) {
                 let slot = page.wrapping_add(offset);
                 if let Some(&target) = pairs.get(&slot) {
                     self.formed.push(Formed {
@@ -2140,6 +2260,7 @@ impl Sweep {
                         target,
                         kind: KIND_FATPTR,
                         pair: Some(slot),
+                        adrp: Some(adrp),
                     });
                 }
             }
