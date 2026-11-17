@@ -259,7 +259,7 @@ fn data_words(ctx: &Ctx, index: &HashMap<u64, usize>) -> Found<(Option<String>, 
         let Some(bytes) = bytes.get((first - area.vaddr) as usize..) else {
             continue;
         };
-        for (i, word) in bytes.chunks_exact(8).enumerate() {
+        for (i, word) in bytes.as_chunks::<8>().0.iter().enumerate() {
             let at = first + 8 * i as u64;
             let slot = ctx.slots.get(&at).copied();
             let raw = read_uint(word, ctx.image.big_endian);
