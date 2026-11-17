@@ -275,11 +275,7 @@ fn data_words(ctx: &Ctx, index: &HashMap<u64, usize>) -> Found<(Option<String>, 
 }
 
 /// Triés par adresse croissante, coupés à `max` ; `total` les compte tous.
-fn capped<T, U>(
-    mut found: Vec<(u64, T)>,
-    max: usize,
-    build: impl Fn(u64, T) -> U,
-) -> XrefList<U> {
+fn capped<T, U>(mut found: Vec<(u64, T)>, max: usize, build: impl Fn(u64, T) -> U) -> XrefList<U> {
     found.sort_by_key(|&(at, _)| at);
     let total = found.len();
     found.truncate(max);

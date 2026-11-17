@@ -159,11 +159,16 @@ pub fn parse_symex_peek(item: &str, watches: &[u64]) -> Result<SymexPeek, String
     let fail = |why: String| format!("élément {item:?} : {why}");
     let parts: Vec<&str> = item.trim().split(':').collect();
     let [watch, place, len] = parts.as_slice() else {
-        return Err(fail("attendu <watch>:<registre>+<décalage>:<longueur>".into()));
+        return Err(fail(
+            "attendu <watch>:<registre>+<décalage>:<longueur>".into(),
+        ));
     };
     let watch = parse_symex_address(watch).map_err(fail)?;
     if !watches.contains(&watch) {
-        return Err(fail(format!("{} absente de --native-symex-watch", hex(watch))));
+        return Err(fail(format!(
+            "{} absente de --native-symex-watch",
+            hex(watch)
+        )));
     }
     let (reg, offset) = parse_peek_place(place).map_err(fail)?;
     let invalid = || fail(format!("longueur {len:?} : de 1 à {MAX_SYMEX_PEEK} octets"));
@@ -363,7 +368,12 @@ pub(super) fn run(
 ) -> Result<Option<SymexReport>, String> {
     let parsed = parse_elf(bytes).map_err(|e| format!("ELF illisible ({e})"))?;
     let dynamic = parsed.dynamic.as_deref();
-    let ctx = context(parsed.image, dynamic, &parsed.symbols, &parsed.local_symbols);
+    let ctx = context(
+        parsed.image,
+        dynamic,
+        &parsed.symbols,
+        &parsed.local_symbols,
+    );
     if ctx.arch != Some(Arch::Aarch64) {
         return Err(format!("machine {} : AArch64 seulement", elf.machine));
     }
@@ -377,8 +387,8 @@ pub(super) fn run(
         return Err(format!("entrée {entry} hors de la fonction {start}"));
     }
     let job = AssertUnwindSafe(|| analyze(&ctx, &fdes, &elf.path, fn_start, entry, options));
-    let report = std::panic::catch_unwind(job)
-        .map_err(|_| "panique pendant la propagation".to_string())?;
+    let report =
+        std::panic::catch_unwind(job).map_err(|_| "panique pendant la propagation".to_string())?;
     Ok(Some(report))
 }
 
@@ -667,7 +677,9 @@ impl Serialize for Expr {
             Kind::Const(value) => map.serialize_entry("const", &hex(*value))?,
             Kind::Global(at) => map.serialize_entry("global", &hex(*at))?,
             Kind::Init(reg) => map.serialize_entry("init", &reg_name(*reg))?,
-            Kind::Load(size, addr) => map.serialize_entry("load", &LoadOut { size: *size, addr })?,
+            Kind::Load(size, addr) => {
+                map.serialize_entry("load", &LoadOut { size: *size, addr })?
+            }
             Kind::Bin(op, a, b) => map.serialize_entry(op.name(), &(a, b))?,
             Kind::Zext(bits, of) => map.serialize_entry("zext", &ExtOut { bits: *bits, of })?,
             Kind::Sext(bits, of) => map.serialize_entry("sext", &ExtOut { bits: *bits, of })?,
@@ -2139,7 +2151,10 @@ impl State {
             Operand::SIMDRegister(size, r) | Operand::SIMDRegisterElements(size, r, _) => {
                 let w = usize::from(simd_bytes(size));
                 let (expr, traces) = assemble(&self.v[usize::from(r % 32)][..w]);
-                Some(Val::new(expr, traces.into_iter().next().unwrap_or_default()))
+                Some(Val::new(
+                    expr,
+                    traces.into_iter().next().unwrap_or_default(),
+                ))
             }
             _ => None,
         }
@@ -2499,7 +2514,10 @@ impl Path {
     }
 
     fn args(&self) -> Vec<Expr> {
-        self.state.x[..ARGS].iter().map(|v| v.expr.clone()).collect()
+        self.state.x[..ARGS]
+            .iter()
+            .map(|v| v.expr.clone())
+            .collect()
     }
 
     fn skip(&mut self, at: u64) {
@@ -2619,10 +2637,14 @@ impl Path {
                 let cells = cells.iter().map(|c| c.moved(at)).collect();
                 state.mem.write(&dst.expr, cells);
             }
-            Some(n) => state.mem.zone(&dst.expr, Some(n), Reason::Budget, at.addr, at.origin()),
+            Some(n) => state
+                .mem
+                .zone(&dst.expr, Some(n), Reason::Budget, at.addr, at.origin()),
             None => {
                 let trace = at.def(&[&len.trace]);
-                state.mem.zone(&dst.expr, None, Reason::Havoc, at.addr, trace)
+                state
+                    .mem
+                    .zone(&dst.expr, None, Reason::Havoc, at.addr, trace)
             }
         }
         state.clobber_call(Reason::CallNotFollowed, at);
@@ -3307,7 +3329,9 @@ impl<'c, 'a> Explorer<'c, 'a> {
     /// fragment_max octets, sous la limite d'imbrication.
     fn fragment(&self, path: &Path, bound: &Bound, target: u64) -> bool {
         let max = self.options.fragment_max;
-        let small = bound.end.is_some_and(|end| end.saturating_sub(target) <= max);
+        let small = bound
+            .end
+            .is_some_and(|end| end.saturating_sub(target) <= max);
         let nested = path.fragments < MAX_FRAGMENTS;
         max > 0 && bound.start == target && small && nested && self.ctx.image.is_exec(target)
     }
@@ -4010,10 +4034,8 @@ mod tests {
         (0xd65f03c0, "100c  ret"),
     ];
 
-    const POINTER_TAIL: &[(u32, &str)] = &[
-        (0xf9400010, "ldr   x16, [x0]"),
-        (0xd61f0200, "br    x16"),
-    ];
+    const POINTER_TAIL: &[(u32, &str)] =
+        &[(0xf9400010, "ldr   x16, [x0]"), (0xd61f0200, "br    x16")];
 
     #[test]
     fn an_unresolved_br_in_a_called_function_is_an_indirect_tail_call() {
@@ -4728,7 +4750,9 @@ mod tests {
     }
 
     fn peeking(watch: u64, items: &[&str]) -> SymexOptions {
-        let peek = items.iter().map(|item| parse_symex_peek(item, &[watch]).unwrap());
+        let peek = items
+            .iter()
+            .map(|item| parse_symex_peek(item, &[watch]).unwrap());
         SymexOptions {
             peek: peek.collect(),
             ..options(&[watch], 0)
@@ -4751,7 +4775,10 @@ mod tests {
         assert_eq!(report.paths_explored, 1);
         let read = only(&report, 0x1004);
         let peek = &read.peeks[0];
-        assert_eq!((peek.reg.as_str(), peek.offset.as_str(), peek.len), ("x0", "0x10f", 3));
+        assert_eq!(
+            (peek.reg.as_str(), peek.offset.as_str(), peek.len),
+            ("x0", "0x10f", 3)
+        );
         assert_eq!(peek.address.text, "init(x0) + 0x10f");
         let bytes: Vec<&str> = peek.bytes.iter().map(|b| b.text.as_str()).collect();
         assert_eq!(bytes[0], "load(1, init(x0) + 0x10f)");
@@ -4797,7 +4824,10 @@ mod tests {
     fn peek_items_are_parsed_or_refused_with_the_item() {
         let watches = [0x36ffbd0];
         let peek = parse_symex_peek("36ffbd0:x0+0x110:3", &watches).unwrap();
-        assert_eq!((peek.watch, peek.reg, peek.offset, peek.len), (0x36ffbd0, 0, 0x110, 3));
+        assert_eq!(
+            (peek.watch, peek.reg, peek.offset, peek.len),
+            (0x36ffbd0, 0, 0x110, 3)
+        );
         let below = parse_symex_peek("36ffbd0:sp-16:64", &watches).unwrap();
         assert_eq!((below.reg, below.offset, below.len), (SP, -16, 64));
         let signed = parse_symex_peek("36ffbd0:x29+-0x8:1", &watches).unwrap();

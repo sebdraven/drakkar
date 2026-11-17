@@ -2653,10 +2653,14 @@ fn print_symex(s: &drakkar::parser::native_static::SymexReport) {
     let (paths, abandoned) = (s.paths_explored, s.callees_abandoned);
     let (incomplete, dropped) = (s.callees_incomplete, s.forks_dropped);
     let mut header = format!("  chemins {paths}  coupés {cut}  appelés abandonnés {abandoned}");
-    header.push_str(&format!("  incomplets {incomplete}  branchements non ouverts {dropped}"));
+    header.push_str(&format!(
+        "  incomplets {incomplete}  branchements non ouverts {dropped}"
+    ));
     let reruns = s.rounds.len().saturating_sub(1);
     let followed = s.rounds.last().map_or(0, |round| round.follow.len());
-    header.push_str(&format!("  relances {reruns}  suivis à la demande {followed}"));
+    header.push_str(&format!(
+        "  relances {reruns}  suivis à la demande {followed}"
+    ));
     if !s.directed {
         header.push_str("  non dirigée");
     }

@@ -468,7 +468,12 @@ fn disassemble(bytes: &[u8], report: &ElfReport, options: &DisasmOptions) -> Elf
         return ElfDisasm::default();
     };
     let dynamic = parsed.dynamic.as_deref();
-    let ctx = context(parsed.image, dynamic, &parsed.symbols, &parsed.local_symbols);
+    let ctx = context(
+        parsed.image,
+        dynamic,
+        &parsed.symbols,
+        &parsed.local_symbols,
+    );
     let arm = ctx.image.machine == elf::EM_ARM;
 
     let mut entries = Vec::new();
