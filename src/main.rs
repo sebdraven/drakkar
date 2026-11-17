@@ -196,6 +196,49 @@ struct Cli {
     #[arg(long, value_name = "N")]
     native_xrefs_max: Option<usize>,
 
+    /// (--native) Mots de 8 octets lus à des adresses d'un ELF AArch64,
+    /// relocations relatives appliquées, sans exécution : code, données, texte
+    /// ou entier. `<elf|*>@<adresse>:<nombre>[,<adresse>:<nombre>...]`, adresse
+    /// hexadécimale alignée sur 8, de 1 à 512 mots, de 1 à 64 plages. Répétable
+    /// (--native --legend, section WORDS).
+    #[arg(long, value_name = "SPEC")]
+    native_words: Vec<String>,
+
+    /// (--native) Tables de méthodes Rust d'un ELF AArch64, reconnues à leur
+    /// forme, sans exécution : `<elf|*>` (--native --legend, section VTABLES).
+    #[arg(long, value_name = "ELF")]
+    native_vtables: Option<String>,
+
+    /// (--native-vtables) Ne garder que les tables dont le destructeur ou une
+    /// méthode vaut l'une de ces adresses hexadécimales (1 à 64).
+    #[arg(long, value_name = "ADRESSES", value_delimiter = ',')]
+    native_vtables_fn: Vec<String>,
+
+    /// (--native-vtables) Ne garder que les tables qui ont une méthode à ce
+    /// décalage (0x hexadécimal ou décimal, multiple de 8, au moins 0x18).
+    #[arg(long, value_name = "DÉCALAGE")]
+    native_vtables_slot: Option<String>,
+
+    /// (--native-vtables) Ne garder que les tables de cette taille (0x
+    /// hexadécimal ou décimal).
+    #[arg(long, value_name = "N")]
+    native_vtables_size: Option<String>,
+
+    /// (--native-vtables) Ne garder que les tables qui commencent à l'une de
+    /// ces adresses hexadécimales (1 à 64).
+    #[arg(long, value_name = "ADRESSES", value_delimiter = ',')]
+    native_vtables_at: Vec<String>,
+
+    /// (--native-vtables) Tables rendues au plus par ELF ; les totaux restent
+    /// exacts. Défaut 500.
+    #[arg(long, value_name = "N")]
+    native_vtables_max: Option<usize>,
+
+    /// (--native-vtables) Instructions et mots de données qui portent
+    /// l'adresse de chaque table rendue.
+    #[arg(long)]
+    native_vtables_refs: bool,
+
     /// (--native-disasm) Racine de désassemblage en plus des points d'entrée
     /// JNI : nom d'un symbole défini, ou adresse `0x…` (ARM 32 bits : bit 0 =
     /// Thumb ; `t:` ou `a:` force le mode). Répétable. Introuvable : WARN.
@@ -818,6 +861,31 @@ fn main() -> Result<()> {
     if cli.native_xrefs_max.is_some() && cli.native_xrefs.is_empty() {
         bail!("--native-xrefs-max n'a d'effet qu'avec --native-xrefs");
     }
+    if !cli.native_words.is_empty() && !cli.native {
+        bail!(
+            "--native-words requiert --native : drakkar <APK|ELF> --native --native-words \
+             <elf|*>@<adresse>:<nombre>[,<adresse>:<nombre>...]"
+        );
+    }
+    if cli.native_vtables.is_some() && !cli.native {
+        bail!(
+            "--native-vtables requiert --native : drakkar <APK|ELF> --native \
+             --native-vtables <elf|*>"
+        );
+    }
+    let vtables_tuning = !cli.native_vtables_fn.is_empty()
+        || cli.native_vtables_slot.is_some()
+        || cli.native_vtables_size.is_some()
+        || !cli.native_vtables_at.is_empty()
+        || cli.native_vtables_max.is_some()
+        || cli.native_vtables_refs;
+    if vtables_tuning && cli.native_vtables.is_none() {
+        bail!(
+            "--native-vtables-fn, --native-vtables-slot, --native-vtables-size, \
+             --native-vtables-at, --native-vtables-max et --native-vtables-refs n'ont d'effet \
+             qu'avec --native-vtables"
+        );
+    }
     let native_strings_tuning =
         cli.min_length.is_some() || cli.elf.is_some() || cli.xrefs || cli.crates;
     if native_strings_tuning && cli.native_strings.is_none() {
@@ -920,6 +988,14 @@ fn main() -> Result<()> {
         let xrefs_max = cli
             .native_xrefs_max
             .unwrap_or(parser::native_static::DEFAULT_XREFS_MAX);
+        let mut words_specs = Vec::new();
+        for spec in &cli.native_words {
+            match parser::native_static::parse_words_spec(spec) {
+                Ok(parsed) => words_specs.push(parsed),
+                Err(why) => bail!("--native-words {spec:?} : {why}"),
+            }
+        }
+        let vtables = vtables_options(&cli)?;
         let mut options = parser::native_static::DisasmOptions::default();
         if let Some(depth) = cli.disasm_depth {
             options.depth = depth;
@@ -956,6 +1032,8 @@ fn main() -> Result<()> {
         );
         parser::native_static::add_symex(&mut report, input, splits, &symex_specs, &symex);
         parser::native_static::add_xrefs(&mut report, input, splits, &xrefs_specs, xrefs_max);
+        parser::native_static::add_words(&mut report, input, splits, &words_specs);
+        parser::native_static::add_vtables(&mut report, input, splits, vtables.as_ref());
         if cli.format.wants_text() {
             print_native(&report, cli.disasm_full);
         }
@@ -2392,6 +2470,14 @@ fn print_native(r: &drakkar::parser::native_static::NativeReport, full: bool) {
         print_xrefs(x);
     }
 
+    for w in &r.words {
+        print_words(w);
+    }
+
+    for v in &r.vtables {
+        print_vtables(v);
+    }
+
     if !r.errors.is_empty() {
         println!("\nNon lu ({}) :", r.errors.len());
         for err in &r.errors {
@@ -2678,6 +2764,131 @@ fn print_xrefs(x: &drakkar::parser::native_static::XrefReport) {
             "    {}  section {section}  relocated {}",
             r.vaddr, r.relocated
         );
+    }
+}
+
+/// Une ligne par plage de `--native-words`, puis une par mot.
+fn print_words(w: &drakkar::parser::native_static::WordsReport) {
+    let (elf, start, count) = (&w.elf, &w.start, w.count);
+    let mut header = format!("\nWords {elf}  début {start}  {count} mots");
+    if let (true, Some(size), Some(align)) = (w.vtable_like, &w.size, &w.align) {
+        header.push_str(&format!("  vtable_like (size {size}, align {align})"));
+    }
+    println!("{header} :");
+    for word in &w.items {
+        let (offset, vaddr) = (&word.offset, &word.vaddr);
+        let section = word.section.as_deref().unwrap_or("-");
+        let raw = word.raw.as_deref().unwrap_or("-");
+        let mut line = format!("    +{offset}  {vaddr}  {section}  raw {raw}");
+        if let Some(value) = &word.value {
+            let relocated = if word.relocated { " (relogé)" } else { "" };
+            line.push_str(&format!("  value {value}{relocated}"));
+        }
+        line.push_str(&format!("  {}", word.kind));
+        if let Some(f) = &word.function {
+            let end = f.fn_end.as_deref().unwrap_or("?");
+            line.push_str(&format!("  fonction {}-{end} ({})", f.fn_start, f.bound));
+        }
+        if word.at_start == Some(true) {
+            line.push_str("  début");
+        }
+        if let Some(target) = &word.target_section {
+            line.push_str(&format!("  vers {target}"));
+        }
+        if let Some(text) = &word.text {
+            let truncated = word.text_truncated == Some(true);
+            let more = if truncated { "…" } else { "" };
+            line.push_str(&format!("  {text:?}{more}"));
+        }
+        println!("{line}");
+    }
+}
+
+fn vtables_options(cli: &Cli) -> Result<Option<parser::native_static::VtablesOptions>> {
+    use parser::native_static::{
+        parse_vtables_addresses, parse_vtables_elf, parse_vtables_number, parse_vtables_slot,
+        VtablesOptions,
+    };
+    let Some(spec) = &cli.native_vtables else {
+        return Ok(None);
+    };
+    let mut options = VtablesOptions::default();
+    match parse_vtables_elf(spec) {
+        Ok(elf) => options.elf = elf,
+        Err(why) => bail!("--native-vtables {spec:?} : {why}"),
+    }
+    match parse_vtables_addresses(&cli.native_vtables_fn) {
+        Ok(functions) => options.functions = functions,
+        Err(why) => bail!("--native-vtables-fn : {why}"),
+    }
+    match parse_vtables_addresses(&cli.native_vtables_at) {
+        Ok(at) => options.at = at,
+        Err(why) => bail!("--native-vtables-at : {why}"),
+    }
+    if let Some(text) = &cli.native_vtables_slot {
+        match parse_vtables_slot(text) {
+            Ok(slot) => options.slot = Some(slot),
+            Err(why) => bail!("--native-vtables-slot : {why}"),
+        }
+    }
+    if let Some(text) = &cli.native_vtables_size {
+        match parse_vtables_number(text) {
+            Ok(size) => options.size = Some(size),
+            Err(why) => bail!("--native-vtables-size : {why}"),
+        }
+    }
+    if let Some(max) = cli.native_vtables_max {
+        options.max = max;
+    }
+    options.refs = cli.native_vtables_refs;
+    Ok(Some(options))
+}
+
+/// Une ligne par ELF de `--native-vtables`, puis une par table, ses méthodes
+/// et ses références.
+fn print_vtables(v: &drakkar::parser::native_static::VtablesReport) {
+    let (total, matched) = (v.tables_total, v.tables_matched);
+    let suffix = if v.truncated { " (tronqué)" } else { "" };
+    println!(
+        "\nVtables {}  détectées {total}  retenues {matched}{suffix} :",
+        v.elf
+    );
+    let function = |f: &drakkar::parser::native_static::XrefFunction| {
+        let end = f.fn_end.as_deref().unwrap_or("?");
+        format!("{}-{end} ({})", f.fn_start, f.bound)
+    };
+    for t in &v.tables {
+        let section = t.section.as_deref().unwrap_or("-");
+        let drop = t.drop.as_deref().unwrap_or("-");
+        let (vaddr, size, align, count) = (&t.vaddr, &t.size, &t.align, t.methods_count);
+        let mut line = format!("  {vaddr}  {section}  drop {drop}");
+        line.push_str(&format!("  size {size}  align {align}  {count} méthodes"));
+        if let Some(matched) = &t.matched {
+            line.push_str(&format!("  trouvée en {}", matched.join(",")));
+        }
+        println!("{line}");
+        for m in &t.methods {
+            let (offset, value, at) = (&m.offset, &m.value, function(&m.function));
+            println!("    +{offset}  {value}  fonction {at}");
+        }
+        if let Some(refs) = &t.addr_refs {
+            let suffix = if refs.truncated { " (tronqué)" } else { "" };
+            println!("    addr_refs  {}{suffix}", refs.total);
+            for r in &refs.items {
+                let adrp = r.adrp_addr.as_deref().unwrap_or("-");
+                let (insn, kind, at) = (&r.insn_addr, r.kind, function(&r.function));
+                println!("      {insn}  {kind}  adrp {adrp}  fonction {at}");
+            }
+        }
+        if let Some(refs) = &t.data_refs {
+            let suffix = if refs.truncated { " (tronqué)" } else { "" };
+            println!("    data_refs  {}{suffix}", refs.total);
+            for r in &refs.items {
+                let section = r.section.as_deref().unwrap_or("-");
+                let (vaddr, relocated) = (&r.vaddr, r.relocated);
+                println!("      {vaddr}  section {section}  relocated {relocated}");
+            }
+        }
     }
 }
 

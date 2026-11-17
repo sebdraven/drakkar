@@ -118,6 +118,8 @@ published empirical values.
 | `--native --native-disasm` | static disassembly (AArch64, ARM, Thumb-2, x86, x86_64) of the functions at the Java↔native boundary — bound functions, `JNI_OnLoad` / `JNI_OnUnload`, `DT_INIT`, `DT_INIT_ARRAY`, `e_entry` — and of the internal functions they call, up to `--disasm-depth`: `JNIEnv` calls decoded with class, name and signature when the strings are local, PLT/GOT imports called, strings referenced, system calls. |
 | `--native --native-symex <elf\|*>@<start>` | symbolic value propagation inside one AArch64 function, path by path, without a solver: for each `--native-symex-watch` instruction, the expression of the address and of the value it reads or writes (of the target and `x0..x3` for a call), with the instructions that produced it. Exploration is directed toward the watches (`--native-symex-undirected` turns this off); conditional selects merge into `ite(c, a, b)` instead of forking. Called functions are skipped by default (`--native-symex-depth 0`) and followed on demand: by hand (`--native-symex-follow`), or when a watch reads memory never written and a skipped call received a pointer into it (`--native-symex-refine`, up to 4 reruns). Constant-length `memcpy` / `memmove` copy bytes, jump tables are enumerated. Distinct memory bases are assumed not to overlap. |
 | `--native --native-xrefs <elf\|*>@<addr>[,<addr>…]` | cross-references to up to 64 addresses of an AArch64 ELF, without executing anything: the enclosing function, the direct branches that land exactly on each address, the instructions that form or access it, and the data words that hold it. One pass over the code for all addresses. |
+| `--native --native-words <elf\|*>@<addr>:<n>[,<addr>:<n>…]` | 8-byte words read at addresses of an AArch64 ELF, relative relocations applied, without executing anything: what each word designates (code with its enclosing function, data with its section and text, plain integer), and whether a range starts like a Rust vtable header. |
+| `--native --native-vtables <elf\|*>` | the Rust method tables (vtables) of an AArch64 ELF, found by their shape in read-only and RELRO data, without executing anything: destructor, size, alignment and methods of each, filtered by function, slot offset, size or start address, and on request the instructions and data words that carry each table's address. |
 | `--native-strings [PATTERN…]` | the strings of every ELF (APK, XAPK splits, raw ELF), each with how its bound was found: NUL byte, Rust `{ptr, len}` pair rebuilt through relative relocations, AArch64 immediate length next to the address, or an unsplit heuristic block. `--xrefs`: the instructions that form each address, over the whole code, with the enclosing function from symbols or `.eh_frame`. `--crates`: Rust crates named by source paths, banners of statically linked C libraries. Cryptographic constants recognised by content. JSON streamed to `--json-out`. |
 
 `--native-disasm` follows paths, not bytes: a function stops at a return, a
@@ -174,6 +176,89 @@ indirect branches (`br`, `blr`), computed addresses, an `adrp` far from its
 `add`/`ldr`/`str`, jump tables, encrypted or generated code escape it;
 `code_refs` only counts branches to the exact address, not into the function;
 `data_refs` only sees words aligned on 8.
+`data_refs` reads program data only: link-time metadata is skipped — sections
+of type REL, RELA, RELR (and their Android variants), DYNSYM, STRTAB, HASH,
+GNU_HASH, versym/verdef/verneed and DYNAMIC, sections named `.eh_frame` and
+`.eh_frame_hdr`, and any word whose file offset lies in a relocation table
+declared by `PT_DYNAMIC` (`DT_RELA`, `DT_REL`, `DT_RELR`, `DT_ANDROID_RELR`,
+`DT_JMPREL`) — so a relocated reference is no longer listed a second time
+through the addend of its own `.rela.dyn` entry.
+
+`--native-words=<elf|*>@<addr>:<n>[,<addr>:<n>…]` reads `n` 8-byte words from
+each address and says what each one designates, e.g. the header and the
+methods of a Rust vtable in a stripped library:
+`--native --native-words='lib/arm64-v8a/libapp.so@4a2f10:6,0x4a3c08:3'`.
+Addresses are hexadecimal, `0x` optional, aligned on 8; `n` is decimal, 1 to
+512; 1 to 64 ranges per option (repeatable); a malformed item is named in the
+error. `*` and an explicit ELF behave as for `--native-xrefs` (the range start
+selects the ELF). Each `words[]` entry, one per (ELF, range), carries `elf`,
+`start`, `count`, `vtable_like`, `size` and `align` when it applies, and
+`items[]`: `index`, `offset` (hex from `start`), `vaddr`, `section`, `raw`
+(the word in the file), `value` (after relative relocation, otherwise `raw`),
+`relocated`, and `kind`. In a shared library or position-independent
+executable (`ET_DYN`), a word that is not relocated is always an integer:
+`int`, whatever its value; only a relocated word can be `code` or `data`
+there. Otherwise `kind` comes from `value`: `code` (in an executable section,
+with `function` = `fn_start`, `fn_end`, `bound` as in `--native-xrefs`, and
+`at_start` when `value` is exactly a function start), `data` (in an allocated
+non-executable section other than the link-time metadata skipped by
+`data_refs`: `target_section`, and `text`, at most 96 bytes cut at
+the first NUL, with `text_truncated`, when it is printable), `int` (anything
+else), or `none` (word in `.bss` or outside any section: no `raw`, no
+`value`). `vtable_like` is true when word 0 is `code` at a function start or
+null, word 1 is an `int` below `0x100000` and word 2 an `int` power of two up
+to 4096; `size` and `align` are then words 1 and 2. It is a hint, not a proof.
+Limits: only relative relocations are applied (`R_AARCH64_ABS64` against a
+symbol and packed APS2 relocations are not); in an `ET_EXEC`, `kind` only
+looks at the address, so an integer that happens to fall inside a code or data
+section is classified `code` or `data`; no Rust string length or table type is
+guessed. Addresses and values are `0x` hexadecimal strings in JSON.
+
+`--native-vtables=<elf|*>` lists the Rust method tables of an AArch64 ELF,
+stripped or not, to answer three questions: which tables hold a given function
+and at which offset, which tables have a method at a given offset, and which
+instructions build a given table — e.g. to list the candidate targets of a
+`blr` on the word at `+0x38` of a table, or to climb from an async function
+back to the one that creates its task. Read-only sections and sections fully
+covered by `PT_GNU_RELRO` are scanned on 8-byte aligned words (link-time
+metadata excluded, as for `data_refs`); without section headers, read-only
+`PT_LOAD` and `PT_GNU_RELRO` segments. An address `T` starts a table when
+`T+0x0` is relocated onto a function start or is zero without relocation (no
+destructor), `T+0x8` is not relocated and at most `0x1000000` (size),
+`T+0x10` is not relocated, a power of two up to 4096 (alignment), and
+`T+0x18` is relocated onto a function start. Methods are the consecutive
+words from `T+0x18` relocated onto a function start; the table ends at the
+first other word or at the start of another detected table. Function starts
+come from symbols or `.eh_frame`, and each word is classified by the
+`--native-words` code. Filters, optional and combined with AND:
+`--native-vtables-fn=<a1>[,<a2>…]` (1 to 64 hex addresses, destructor or
+method), `--native-vtables-slot=<offset>` (a method at that offset, `0x` hex
+or decimal, multiple of 8, at least `0x18`), `--native-vtables-size=<n>`,
+`--native-vtables-at=<a1>[,<a2>…]` (table start); `--native-vtables-max`
+caps the tables rendered per ELF (default 500, totals stay exact);
+`--native-vtables-refs` adds, in one pass over the code, `addr_refs` and
+`data_refs` for each rendered table, by the `--native-xrefs` code and cap.
+Examples:
+`--native --native-vtables='lib/arm64-v8a/libapp.so' --native-vtables-fn=0x36ffbd0`
+(tables that hold this function, with the offsets in `matched`), and
+`--native --native-vtables='*' --native-vtables-slot=0x38 --native-vtables-refs`
+(tables with a method at `+0x38`, with the instructions and words that carry
+them). Each `vtables[]` entry, one per ELF, carries `elf`, `tables_total`
+(detected), `tables_matched` (after filters), `truncated`, and `tables[]`
+sorted by address: `vaddr`, `section`, `drop` (address or null), `size`,
+`align`, `methods_count`, `methods[]` (`offset` from the table start, `value`,
+`function` = `fn_start`, `fn_end`, `bound`), `matched[]` with
+`--native-vtables-fn` (offsets where a requested address was found, `0x0` for
+the destructor), `addr_refs` and `data_refs` with `--native-vtables-refs`. An
+AArch64-only mode: a non-AArch64 ELF named explicitly is an error, `*` skips
+it. Limits: detection is structural, so a data block that happens to have this
+shape is reported and a table without methods is missed; a table's end is not
+marked in the binary, so two adjacent tables whose second has no valid
+destructor can merge, and a foreign function pointer right after the last
+method can be counted; a function in a table does not prove that a given
+indirect call targets it — the mode returns candidates; no reference to a
+table is no proof either (computed address, distant `adrp`/`add`); only
+relative relocations are read.
 
 It does not execute or emulate, and runs symbolically only under
 `--native-symex`, without a solver; it does not follow `JNIEnv`

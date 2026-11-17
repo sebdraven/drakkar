@@ -43,6 +43,8 @@ mod disasm;
 mod jni_table;
 pub mod native_strings;
 mod symex;
+mod vtables;
+mod words;
 mod xrefs;
 
 pub use self::disasm::{
@@ -56,6 +58,14 @@ pub use self::symex::{
     SymexWatch, DEFAULT_SYMEX_CALLEE_FORKS, DEFAULT_SYMEX_DEPTH, DEFAULT_SYMEX_FRAGMENT_MAX,
     DEFAULT_SYMEX_MAX_INSNS, DEFAULT_SYMEX_MAX_PATHS, DEFAULT_SYMEX_REFINE, MAX_SYMEX_DEPTH,
     MAX_SYMEX_PEEK,
+};
+pub use self::vtables::{
+    parse_vtables_addresses, parse_vtables_elf, parse_vtables_number, parse_vtables_slot, Vtable,
+    VtableMethod, VtablesOptions, VtablesReport, DEFAULT_VTABLES_MAX, MAX_VTABLES_ADDRESSES,
+};
+pub use self::words::{
+    parse_words_spec, Word, WordsReport, WordsSpec, MAX_WORDS_COUNT, MAX_WORDS_RANGES,
+    MAX_WORDS_TEXT,
 };
 pub use self::xrefs::{
     parse_xrefs_spec, AddrRef, CodeRef, DataRef, XrefFunction, XrefList, XrefReport, XrefsSpec,
@@ -150,6 +160,10 @@ pub struct NativeReport {
     pub symex: Vec<SymexReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub xrefs: Vec<XrefReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<WordsReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub vtables: Vec<VtablesReport>,
     pub errors: Vec<String>,
 }
 
@@ -578,6 +592,8 @@ fn finish(
         listings: Vec::new(),
         symex: Vec::new(),
         xrefs: Vec::new(),
+        words: Vec::new(),
+        vtables: Vec::new(),
         errors,
     }
 }
@@ -738,6 +754,113 @@ pub fn add_xrefs(
                     report.errors.push(format!("xrefs {spec} : {why}"));
                 }
             }
+        }
+    });
+}
+
+/// `--native-words` : mots lus à chaque plage de `specs`, octets relus comme
+/// pour [`add_listings`]. `*` ne retient, pour chaque plage, que les ELF AArch64
+/// qui contiennent son début ; aucun = erreur.
+pub fn add_words(
+    report: &mut NativeReport,
+    input: impl Into<Source>,
+    splits: &[super::xapk::Split],
+    specs: &[WordsSpec],
+) {
+    if specs.is_empty() {
+        return;
+    }
+    let reread = Reread::open(&report.elfs, input.into(), splits);
+    self::disasm::silence_panics(|| {
+        for spec in specs {
+            let named = spec.elf.as_deref();
+            let mut matched = false;
+            let mut held = HashSet::new();
+            for elf in &report.elfs {
+                let wanted = match named {
+                    Some(path) => path == elf.path,
+                    None => elf.machine == "aarch64",
+                };
+                if !wanted {
+                    continue;
+                }
+                matched = true;
+                let every = named.is_some();
+                let outcome = match reread.bytes(elf) {
+                    Ok(bytes) => self::words::run(&bytes, elf, &spec.ranges, every),
+                    Err(why) => Err(why),
+                };
+                match outcome {
+                    Ok(found) => {
+                        held.extend(found.iter().map(|w| w.start.clone()));
+                        report.words.extend(found);
+                    }
+                    Err(why) => {
+                        let message = format!("words {spec} ({}) : {why}", elf.path);
+                        report.errors.push(message);
+                    }
+                }
+            }
+            if named.is_some() {
+                if !matched {
+                    let why = "aucun ELF de ce chemin";
+                    report.errors.push(format!("words {spec} : {why}"));
+                }
+                continue;
+            }
+            for start in spec.ranges.iter().map(|&(at, _)| hex(at)) {
+                if !held.contains(&start) {
+                    let why = format!("aucun ELF AArch64 n'a de section qui contient {start}");
+                    report.errors.push(format!("words {spec} : {why}"));
+                }
+            }
+        }
+    });
+}
+
+/// `--native-vtables` : tables de méthodes de chaque ELF retenu, octets relus
+/// comme pour [`add_listings`]. `*` retient les ELF AArch64 ; aucun = erreur.
+pub fn add_vtables(
+    report: &mut NativeReport,
+    input: impl Into<Source>,
+    splits: &[super::xapk::Split],
+    options: Option<&VtablesOptions>,
+) {
+    let Some(options) = options else {
+        return;
+    };
+    let reread = Reread::open(&report.elfs, input.into(), splits);
+    let named = options.elf.as_deref();
+    let label = named.unwrap_or("*");
+    self::disasm::silence_panics(|| {
+        let mut matched = false;
+        for elf in &report.elfs {
+            let wanted = match named {
+                Some(path) => path == elf.path,
+                None => elf.machine == "aarch64",
+            };
+            if !wanted {
+                continue;
+            }
+            matched = true;
+            let outcome = match reread.bytes(elf) {
+                Ok(bytes) => self::vtables::run(&bytes, elf, options),
+                Err(why) => Err(why),
+            };
+            match outcome {
+                Ok(found) => report.vtables.push(found),
+                Err(why) => {
+                    let message = format!("vtables {label} ({}) : {why}", elf.path);
+                    report.errors.push(message);
+                }
+            }
+        }
+        if !matched {
+            let why = match named {
+                Some(_) => "aucun ELF de ce chemin",
+                None => "aucun ELF AArch64",
+            };
+            report.errors.push(format!("vtables {label} : {why}"));
         }
     });
 }
@@ -2176,7 +2299,9 @@ const LEGEND: &str = "\
 `native` du DEX. Ni exécution, ni émulation ; désassemblage seulement avec
 --native-disasm (section DÉSASSEMBLAGE), propagation symbolique de valeurs seulement
 avec --native-symex (section SYMEX), références vers des adresses seulement avec
---native-xrefs (section XREFS).
+--native-xrefs (section XREFS), mots lus à des adresses seulement avec --native-words
+(section WORDS), tables de méthodes Rust seulement avec --native-vtables (section
+VTABLES).
 Mode ELF brut : une entrée dont les 4 premiers octets valent 7F 45 4C 46 est
 analysée seule, quelle que soit son extension ; --native-dex <APK|DEX>, répétable,
 fournit les méthodes natives à lier, sans quoi binding est vide.
@@ -2198,11 +2323,13 @@ RAPPORT
   listings[]      --native-listing seulement, absent sinon (section LISTING).
   symex[]         --native-symex seulement, absent sinon (section SYMEX).
   xrefs[]         --native-xrefs seulement, absent sinon (section XREFS).
+  words[]         --native-words seulement, absent sinon (section WORDS).
+  vtables[]       --native-vtables seulement, absent sinon (section VTABLES).
   errors          Une entrée de longueur nulle (empty : stored vide ou flux deflate vide)
                   est lue, vide, et n'y figure jamais.
                   Ce qui n'a pas pu être lu : entrée d'archive illisible (on ignore alors
                   si c'était un ELF), DEX illisible, classes sautées, panique du parseur
-                  DEX, listing, symex ou xrefs impossible. Une méthode native manquante peut faire
+                  DEX, listing, symex, xrefs, words ou vtables impossible. Une méthode native manquante peut faire
                   apparaître à tort son export en native_unclaimed. Une source illisible
                   est ignorée, les autres sont liées ; si aucune n'a pu être lue,
                   binding est vide et native_methods_declared vaut 0.
@@ -2741,9 +2868,50 @@ XREFS (xrefs[]) — --native-xrefs <elf|*>@<adresse>[,<adresse>...], répétable
   load              kind de addr_refs : lecture à l'adresse de la cible (adrp puis ldr ; ldr littéral, toutes largeurs, dont l'adresse lue est la cible).
   store             kind de addr_refs : écriture à l'adresse de la cible (adrp puis str).
   data_refs         Mots de 8 octets alignés sur 8 des sections allouées non exécutables présentes dans le fichier (RELRO, .got, .data compris ; sans section headers : segments LOAD non exécutables) qui valent la cible. vaddr ; section (null sans section headers) ; relocated = vrai si la valeur après relocation relative (R_AARCH64_RELATIVE en REL ou RELA, RELR) vaut la cible, faux si seul le mot du fichier la vaut.
+  métadonnées       Exclues de data_refs, qui ne lit que les données du programme : les sections de type REL, RELA, RELR (et leurs variantes Android), DYNSYM, STRTAB, HASH, GNU_HASH, GNU_versym, GNU_verdef, GNU_verneed et DYNAMIC, et les sections nommées .eh_frame et .eh_frame_hdr ; et, avec ou sans section headers, tout mot dont l'offset de fichier tombe dans une table de relocations déclarée par PT_DYNAMIC (DT_RELA, DT_REL, DT_RELR, DT_ANDROID_RELR, DT_JMPREL). Sans section headers, .dynsym, .dynstr, les tables de hachage et .eh_frame ne sont pas reconnues et restent lues.
   total, truncated, items Chaque liste est triée par adresse croissante puis coupée à --native-xrefs-max (défaut 2000, par liste et par cible) ; total compte toutes les références trouvées ; truncated vaut vrai si items en garde moins que total.
   limites           Une absence de référence n'est pas une preuve : branchement indirect (br, blr), adresse calculée, adrp et son add, ldr ou str éloignés ou séparés par une fin de fonction, table de sauts, code chiffré ou généré à l'exécution échappent à la recherche. code_refs ne compte que les branchements dont la destination est exactement la cible, pas ceux qui visent l'intérieur de la fonction. data_refs ne voit que les mots alignés sur 8 ; les relocations autres que relatives (R_AARCH64_ABS64 vers un symbole, formats packés APS2) ne sont pas appliquées. function ne lit le st_size que d'un symbole qui commence exactement à l'adresse : l'intérieur d'une fonction connue seulement par son symbole, sans FDE, donne bound = none.
   Sortie texte : une ligne par entrée (elf, cible, section, fonction), puis chaque liste avec son total, (tronqué) si truncated, et une ligne par référence.
+
+WORDS (words[]) — --native-words <elf|*>@<adresse>:<nombre>[,<adresse>:<nombre>...], répétable
+  Mots de 8 octets lus à partir d'une adresse, relocations relatives appliquées, et ce que chacun désigne. Rien n'est exécuté ; AArch64 seulement ; indépendant de --native-disasm. Aucune interprétation au-delà de kind : ni longueur de chaîne Rust devinée, ni type de table.
+  plages            Adresse hexadécimale, préfixe 0x facultatif, alignée sur 8 ; nombre de mots décimal, de 1 à 512 ; de 1 à 64 plages par --native-words, séparées par des virgules, dans l'ordre donné, doublons gardés. Un élément mal formé est cité dans l'erreur.
+  elf               elfs[].path de l'ELF. Avec *, chaque ELF AArch64 dont une section allouée contient le début de la plage (sans section headers : un segment LOAD), les autres ELF ignorés ; une plage qu'aucun ne contient est dans errors. Nommé explicitement : toutes les plages, même hors de toute section ; un ELF non AArch64 est une erreur.
+  start, count      Début de la plage et nombre de mots, tels que demandés. Une plage n'est jamais refusée parce qu'elle déborde de sa section : chaque mot est jugé seul.
+  items[]           Un mot par élément, dans l'ordre des adresses : index (rang depuis 0) ; offset = 8 × index, en hexadécimal depuis start ; vaddr ; section = section allouée qui contient le mot, null s'il n'y en a pas ou sans section headers.
+  raw               Valeur du mot lue dans le fichier, petit-boutiste. Absent si le mot n'a pas d'octets dans le fichier : section sans contenu (SHT_NOBITS, .bss), hors de toute section allouée, ou, sans section headers, hors de la partie fichier des segments LOAD.
+  value             Valeur après relocation relative (R_AARCH64_RELATIVE en REL ou RELA, RELR, base de chargement 0) si le mot en porte une, sinon raw. Absent quand raw l'est.
+  relocated         Vrai si une relocation relative porte sur le mot ; value est alors l'addend, pas le contenu du fichier.
+  kind              code, data, int ou none. Un mot non relogé d'une bibliothèque partagée ou d'un exécutable indépendant de la position (ET_DYN) est toujours un entier : int, quelle que soit sa valeur ; seul un mot relogé y est code ou data. Dans un ET_EXEC, d'après value seulement.
+  code              kind : value est dans une section allouée exécutable (sans section headers : un segment LOAD exécutable). function = fonction qui contient value, par le même code que SYMEX et XREFS : fn_start, fn_end, bound (symbol, eh_frame ou none). at_start = vrai si value est exactement le début d'une fonction : début de la plage d'un symbole ou d'un FDE, ou adresse d'un symbole de fonction défini ; avec bound = none et sans symbole, faux.
+  data              kind : value est dans une section allouée non exécutable qui n'est pas une section de métadonnées de l'édition de liens (même règle que les métadonnées de data_refs, section XREFS ; sans section headers : un segment LOAD non exécutable, aucune exclusion). target_section = nom de cette section, absent sans section headers. text = au plus 96 octets du fichier à value, coupés au premier octet nul, quand c'est du texte UTF-8 non vide sans caractère de contrôle autre que tabulation et fin de ligne ; text_truncated = vrai si ni ces 96 octets ni l'octet suivant ne sont nuls. Absents sinon (section sans contenu comprise).
+  int               kind : mot non relogé d'un ET_DYN ; sinon toute autre valeur, y compris une valeur qui tombe dans une section de métadonnées de l'édition de liens, et zéro si aucune section ne contient l'adresse 0.
+  none              kind : le mot n'a pas de raw ; value absent.
+  vtable_like       Par plage : vrai quand les trois premiers mots ont la forme d'un en-tête de table de méthodes Rust (destructeur, taille, alignement) : mot 0 de kind code avec at_start vrai, ou de value nulle ; mot 1 de kind int, inférieur à 0x100000 ; mot 2 de kind int, puissance de deux, au plus 4096. size et align = values des mots 1 et 2, en hexadécimal, présents seulement si vtable_like est vrai. C'est un indice, pas une preuve : trois mots quelconques peuvent avoir cette forme, et, dans un ET_EXEC, une taille qui tombe dans une section de code ou de données (sans section headers : dans un segment LOAD) est classée code ou data et fait manquer une vraie table.
+  limites           Seules les relocations relatives sont appliquées : un mot relogé par R_AARCH64_ABS64 vers un symbole, ou par un format packé APS2, garde sa valeur du fichier. Dans un ET_EXEC, kind ne regarde que l'adresse : un entier qui tombe dans une section de code ou de données y est classé code ou data.
+  Sortie texte : une ligne par plage (elf, début, nombre de mots, vtable_like avec size et align), puis une ligne par mot : offset, vaddr, section, raw, value (relogé), kind et ses champs.
+
+VTABLES (vtables[]) — --native-vtables <elf|*>
+  Tables de méthodes Rust (destructeur, taille, alignement, méthodes) recensées dans un ELF AArch64, reconnues à leur forme. Rien n'est exécuté ; indépendant de --native-disasm. Chaque mot est classé par le code de WORDS (relocation relative, kind, at_start), sans autre définition.
+  zones parcourues  Sections allouées non exécutables présentes dans le fichier, en lecture seule, ou inscriptibles mais entièrement couvertes par PT_GNU_RELRO (non inscriptibles après relocation : .data.rel.ro, .got) ; les sections de métadonnées de l'édition de liens (règle de data_refs, section XREFS) sont exclues. Sans section headers : segments LOAD ni inscriptibles ni exécutables, et segments PT_GNU_RELRO. Mots de 8 octets alignés sur 8, une table ne débordant jamais de sa zone.
+  détection         Une adresse T est le début d'une table quand : le mot T+0x0 est relogé et pointe exactement sur le début d'une fonction (kind code, at_start vrai), ou vaut zéro sans relocation ; le mot T+0x8 n'est pas relogé et vaut au plus 0x1000000 ; le mot T+0x10 n'est pas relogé, est une puissance de deux, au plus 4096 ; le mot T+0x18 est relogé et pointe exactement sur le début d'une fonction. Début d'une fonction : symbole ou FDE de .eh_frame, comme XREFS.
+  méthodes          Mots consécutifs à partir de T+0x18, relogés et pointant exactement sur le début d'une fonction ; la table s'arrête au premier mot qui ne l'est pas ou au début d'une autre table détectée, selon ce qui vient en premier. Une table dont la première méthode est le début d'une autre table n'a aucune méthode et n'est pas rendue.
+  elf               elfs[].path de l'ELF ; une entrée par ELF retenu. Avec *, chaque ELF AArch64, les autres ignorés ; aucun ELF AArch64 est une erreur. Nommé explicitement : un ELF non AArch64 est une erreur.
+  tables_total      Tables détectées dans l'ELF, avant filtres.
+  tables_matched    Tables qui passent tous les filtres.
+  truncated         Vrai si tables en rend moins que tables_matched (--native-vtables-max).
+  tables[]          Triées par adresse croissante, coupées à --native-vtables-max (défaut 500). vaddr = T ; section = zone qui la contient (null sans section headers) ; drop = adresse du destructeur, null si le mot T+0x0 vaut zéro ; size, align = mots T+0x8 et T+0x10 ; methods_count ; methods[] = offset depuis T (0x18, 0x20…), value = adresse de la méthode, function = fn_start, fn_end, bound comme XREFS.
+  matched           Avec --native-vtables-fn seulement : décalages depuis T où une adresse demandée figure, 0x0 pour le destructeur.
+  addr_refs, data_refs Avec --native-vtables-refs seulement : instructions qui forment exactement l'adresse T et mots de données qui la valent, par le code et selon les règles de XREFS (addr_refs, data_refs, métadonnées), en une seule passe sur le code pour toutes les tables rendues ; total et truncated, plafond 2000 par liste et par table (défaut de --native-xrefs-max, que cette option ne règle pas).
+  --native-vtables-fn Adresses hexadécimales, préfixe 0x facultatif, séparées par des virgules, de 1 à 64, doublons retirés : ne garder que les tables dont le destructeur ou une méthode vaut l'une d'elles.
+  --native-vtables-slot Décalage, 0x hexadécimal ou décimal, multiple de 8, au moins 0x18 : ne garder que les tables qui ont une méthode à ce décalage.
+  --native-vtables-size Nombre, 0x hexadécimal ou décimal : ne garder que les tables dont size le vaut.
+  --native-vtables-at Adresses hexadécimales comme --native-vtables-fn : ne garder que les tables qui commencent à l'une d'elles.
+  --native-vtables-max Plafond du nombre de tables rendues par ELF, défaut 500 ; tables_total et tables_matched restent exacts.
+  --native-vtables-refs Cherche addr_refs et data_refs des tables rendues ; sans elle, aucune recherche de références.
+  filtres           Optionnels, combinés par ET. Un élément mal formé est cité dans l'erreur.
+  limites           La détection structurelle ne prouve rien : un bloc de données qui a par hasard cette forme est rendu comme une table, et une table sans méthode n'est pas détectée. La fin d'une table n'est pas marquée dans le binaire : deux tables collées dont la seconde n'a pas de destructeur valide peuvent être fusionnées, et un pointeur de fonction étranger placé juste après la dernière méthode peut être compté en trop. Une fonction présente dans une table n'est pas la preuve qu'un appel indirect donné la vise : le mode rend des candidats. Une absence de référence à une table n'est pas une preuve : adresse calculée, ADRP et ADD éloignés. Seules les relocations relatives sont lues : un ELF ET_EXEC sans relocation relative, ou une table relogée par R_AARCH64_ABS64 ou par un format packé APS2, n'est pas détectée.
+  Sortie texte : une ligne par ELF (tables_total, tables_matched, tronqué), puis une ligne par table (adresse, section, destructeur, taille, alignement, nombre de méthodes, décalages trouvés), les méthodes indentées avec leur décalage et leur fonction, puis les références s'il y en a.
 ";
 
 /// Légende autonome : chaque champ, statut, catégorie et anomalie de `--native`.
