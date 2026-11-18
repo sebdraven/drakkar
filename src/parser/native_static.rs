@@ -38,21 +38,33 @@ use super::dex_facade::DexBin;
 use super::native_arch::{expected_arch, parse_elf_header, Abi, Bits, ElfArch, Endian, Machine};
 use super::source::Source;
 
+mod async_graph;
 mod decode;
 mod disasm;
+mod fields;
 mod find;
 mod jni_table;
 mod labels;
 pub mod native_strings;
+mod slice;
 mod symex;
 mod vtables;
 mod words;
 mod xrefs;
 
+pub use self::async_graph::{
+    check_async_queries, parse_async_kinds, parse_async_paths, AsyncEdge, AsyncGraphOptions,
+    AsyncGraphReport, AsyncNode, AsyncQuery, AsyncStore, DEFAULT_ASYNC_DEPTH, DEFAULT_ASYNC_MAX,
+    DEFAULT_ASYNC_PATH_DEPTH, MAX_ASYNC_DEPTH, MAX_ASYNC_PAIRS,
+};
 pub use self::disasm::{
     parse_listing_spec, parse_root_spec, DisasmCall, DisasmFunction, DisasmInsn, DisasmOptions,
     ElfDisasm, IndexedString, InvalidPath, JavaMember, JniCall, Listing, ListingInsn, ListingSpec,
     RootSpec, StringIndexRef, StringRef, Syscall, TruncatedAt,
+};
+pub use self::fields::{
+    parse_fields_names, Field, FieldsBound, FieldsCaller, FieldsFunction, FieldsOptions,
+    FieldsReport, DEFAULT_FIELDS_FRAGMENT_FANOUT, DEFAULT_FIELDS_MAX, DEFAULT_FIELDS_MIN,
 };
 pub use self::find::{
     parse_find_access, parse_find_base, parse_find_offsets, parse_find_sizes, FindBase, FindCount,
@@ -61,6 +73,11 @@ pub use self::find::{
 pub use self::labels::{
     parse_labels_patterns, LabeledFunction, LabeledString, LabelsOptions, LabelsReport,
     DEFAULT_LABELS_FRAGMENT_FANOUT, DEFAULT_LABELS_MAX, DEFAULT_LABELS_STRINGS_MAX,
+};
+pub use self::slice::{
+    parse_slice_at, SliceLocation, SliceOptions, SliceQuery, SliceQueryReport, SliceReport,
+    SliceSource, SliceStep, DEFAULT_SLICE_DEPTH, DEFAULT_SLICE_MAX_SOURCES,
+    DEFAULT_SLICE_MAX_STEPS, MAX_SLICE_DEPTH, MAX_SLICE_LEN, MAX_SLICE_QUERIES,
 };
 pub use self::symex::{
     parse_symex_address, parse_symex_peek, parse_symex_spec, Shown, SymexBranch, SymexBudgets,
@@ -178,6 +195,12 @@ pub struct NativeReport {
     pub labels: Vec<LabelsReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub find: Vec<FindReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub slices: Vec<SliceReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub async_graph: Vec<AsyncGraphReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<FieldsReport>,
     pub errors: Vec<String>,
 }
 
@@ -610,6 +633,9 @@ fn finish(
         vtables: Vec::new(),
         labels: Vec::new(),
         find: Vec::new(),
+        slices: Vec::new(),
+        async_graph: Vec::new(),
+        fields: Vec::new(),
         errors,
     }
 }
@@ -973,6 +999,159 @@ pub fn add_find(
                 None => "aucun ELF AArch64",
             };
             report.errors.push(format!("find {label} : {why}"));
+        }
+    });
+}
+
+/// `--native-slice` : remontée depuis les requêtes de `options` dans la
+/// fonction de `spec`, octets relus comme pour [`add_listings`]. `*` retient
+/// les ELF AArch64 dont un segment LOAD exécutable contient la fonction ;
+/// aucun = erreur.
+pub fn add_slice(
+    report: &mut NativeReport,
+    input: impl Into<Source>,
+    splits: &[super::xapk::Split],
+    spec: Option<&ListingSpec>,
+    options: &SliceOptions,
+) {
+    let Some(spec) = spec else {
+        return;
+    };
+    let reread = Reread::open(&report.elfs, input.into(), splits);
+    let named = spec.elf.as_deref();
+    let start = hex(spec.start);
+    self::disasm::silence_panics(|| {
+        let mut answered = false;
+        for elf in &report.elfs {
+            let wanted = match named {
+                Some(path) => path == elf.path,
+                None => elf.machine == "aarch64",
+            };
+            if !wanted {
+                continue;
+            }
+            let outcome = match reread.bytes(elf) {
+                Ok(bytes) => self::slice::run(&bytes, elf, spec.start, options),
+                Err(why) => Err(why),
+            };
+            let error = match outcome {
+                Ok(Some(found)) => {
+                    report.slices.push(found);
+                    None
+                }
+                Ok(None) if named.is_none() => continue,
+                Ok(None) => Some(format!("{start} hors segment LOAD exécutable")),
+                Err(why) => Some(why),
+            };
+            if let Some(why) = error {
+                report
+                    .errors
+                    .push(format!("slice {spec} ({}) : {why}", elf.path));
+            }
+            answered = true;
+        }
+        if !answered {
+            let why = match named {
+                Some(_) => "aucun ELF de ce chemin".to_string(),
+                None => format!("aucun ELF AArch64 n'a de code exécutable en {start}"),
+            };
+            report.errors.push(format!("slice {spec} : {why}"));
+        }
+    });
+}
+
+/// `--native-async-graph` : graphe d'appels et de fabrication de tables de
+/// chaque ELF retenu, octets relus comme pour [`add_listings`]. `*` retient
+/// les ELF AArch64 ; aucun = erreur.
+pub fn add_async_graph(
+    report: &mut NativeReport,
+    input: impl Into<Source>,
+    splits: &[super::xapk::Split],
+    options: Option<&AsyncGraphOptions>,
+) {
+    let Some(options) = options else {
+        return;
+    };
+    let reread = Reread::open(&report.elfs, input.into(), splits);
+    let named = options.elf.as_deref();
+    let label = named.unwrap_or("*");
+    self::disasm::silence_panics(|| {
+        let mut matched = false;
+        for elf in &report.elfs {
+            let wanted = match named {
+                Some(path) => path == elf.path,
+                None => elf.machine == "aarch64",
+            };
+            if !wanted {
+                continue;
+            }
+            matched = true;
+            let outcome = match reread.bytes(elf) {
+                Ok(bytes) => self::async_graph::run(&bytes, elf, options),
+                Err(why) => Err(why),
+            };
+            match outcome {
+                Ok(found) => report.async_graph.push(found),
+                Err(why) => {
+                    let message = format!("async_graph {label} ({}) : {why}", elf.path);
+                    report.errors.push(message);
+                }
+            }
+        }
+        if !matched {
+            let why = match named {
+                Some(_) => "aucun ELF de ce chemin",
+                None => "aucun ELF AArch64",
+            };
+            report.errors.push(format!("async_graph {label} : {why}"));
+        }
+    });
+}
+
+/// `--native-fields` : noms de champs référencés par les désérialiseurs de
+/// chaque ELF retenu, octets relus comme pour [`add_listings`]. `*` retient
+/// les ELF AArch64 ; aucun = erreur.
+pub fn add_fields(
+    report: &mut NativeReport,
+    input: impl Into<Source>,
+    splits: &[super::xapk::Split],
+    options: Option<&FieldsOptions>,
+) {
+    let Some(options) = options else {
+        return;
+    };
+    let reread = Reread::open(&report.elfs, input.into(), splits);
+    let named = options.elf.as_deref();
+    let label = named.unwrap_or("*");
+    self::disasm::silence_panics(|| {
+        let mut matched = false;
+        for elf in &report.elfs {
+            let wanted = match named {
+                Some(path) => path == elf.path,
+                None => elf.machine == "aarch64",
+            };
+            if !wanted {
+                continue;
+            }
+            matched = true;
+            let outcome = match reread.bytes(elf) {
+                Ok(bytes) => self::fields::run(&bytes, elf, options),
+                Err(why) => Err(why),
+            };
+            match outcome {
+                Ok(found) => report.fields.push(found),
+                Err(why) => {
+                    let message = format!("fields {label} ({}) : {why}", elf.path);
+                    report.errors.push(message);
+                }
+            }
+        }
+        if !matched {
+            let why = match named {
+                Some(_) => "aucun ELF de ce chemin",
+                None => "aucun ELF AArch64",
+            };
+            report.errors.push(format!("fields {label} : {why}"));
         }
     });
 }
@@ -2415,7 +2594,10 @@ avec --native-symex (section SYMEX), références vers des adresses seulement av
 (section WORDS), tables de méthodes Rust seulement avec --native-vtables (section
 VTABLES), chaînes référencées et étiquette par fonction seulement avec
 --native-labels (section LABELS), accès du code à des décalages de structure
-seulement avec --native-find (section FIND).
+seulement avec --native-find (section FIND), remontée de l'origine d'une valeur
+seulement avec --native-slice (section SLICE), graphe d'appels et de fabrication
+de tables de méthodes seulement avec --native-async-graph (section ASYNC_GRAPH),
+noms de champs des désérialiseurs seulement avec --native-fields (section FIELDS).
 Mode ELF brut : une entrée dont les 4 premiers octets valent 7F 45 4C 46 est
 analysée seule, quelle que soit son extension ; --native-dex <APK|DEX>, répétable,
 fournit les méthodes natives à lier, sans quoi binding est vide.
@@ -2441,11 +2623,14 @@ RAPPORT
   vtables[]       --native-vtables seulement, absent sinon (section VTABLES).
   labels[]        --native-labels seulement, absent sinon (section LABELS).
   find[]          --native-find seulement, absent sinon (section FIND).
+  slices[]        --native-slice seulement, absent sinon (section SLICE).
+  async_graph[]   --native-async-graph seulement, absent sinon (section ASYNC_GRAPH).
+  fields[]        --native-fields seulement, absent sinon (section FIELDS).
   errors          Une entrée de longueur nulle (empty : stored vide ou flux deflate vide)
                   est lue, vide, et n'y figure jamais.
                   Ce qui n'a pas pu être lu : entrée d'archive illisible (on ignore alors
                   si c'était un ELF), DEX illisible, classes sautées, panique du parseur
-                  DEX, listing, symex, xrefs, words, vtables, labels ou find impossible. Une méthode native manquante peut faire
+                  DEX, listing, symex, xrefs, words, vtables, labels, find, slice, async_graph ou fields impossible. Une méthode native manquante peut faire
                   apparaître à tort son export en native_unclaimed. Une source illisible
                   est ignorée, les autres sont liées ; si aucune n'a pu être lue,
                   binding est vide et native_methods_declared vaut 0.
@@ -2895,7 +3080,7 @@ SYMEX (symex[]) — --native-symex <elf|*>@<début>, répétable, avec --native-
   watch             Instruction observée (--native-symex-watch, adresses hexadécimales séparées par des virgules), relevée à chaque passage d'un chemin.
   chemin            Suite d'instructions depuis entry ; b.cond, cbz, cbnz, tbz, tbnz et les cibles d'une table de saut ouvrent des chemins frères, sans aucun test de faisabilité ; csel, csinc, csinv, csneg et leurs alias n'en ouvrent pas (voir ite). Dans la fonction analysée, tous, sauf ceux arrêtés en off_target ; dans les appelés suivis, plafonnés par callee_forks.
   ordre d'exploration Le chemin courant continue après un branchement, le frère attend. Les frères ouverts dans la fonction analysée passent tous avant ceux ouverts dans des appelés. Parmi les premiers : avec directed vrai, celui dont le point de reprise a la plus petite distance aux watches, le plus récent à égalité ; avec directed faux, du plus récent au plus ancien. Parmi les seconds, du plus récent au plus ancien. max_paths compte les deux groupes.
-  directed          Vrai : exploration dirigée vers les watches. Avant d'explorer, graphe de flot de la fonction analysée dans sa plage (bound), par désassemblage linéaire, sans exécution : blocs ; arêtes des branchements directs ; cibles d'un br reconnues comme table de saut (même lecture que table de saut, état pris au début du bloc du br) ; arête de retour après chaque bl et blr. Distance d'un bloc = nombre minimal de blocs jusqu'à un bloc qui contient un watch, par parcours arrière ; infinie sans chemin vers un watch ; un br non résolu est supposé pouvoir mener à un watch (distance finie, la plus grande). Sert à l'ordre d'exploration et au statut off_target, jamais dans un appelé. Faux avec --native-symex-undirected, avec bound = none, ou dès qu'un watch est hors de la plage de la fonction analysée : ni élagage ni ordre par distance pour toute l'analyse.
+  directed          Vrai : exploration dirigée vers les watches. Avant d'explorer, graphe de flot de la fonction analysée dans sa plage (bound), par désassemblage linéaire, sans exécution : blocs ; arêtes des branchements directs ; cibles d'un br reconnues comme table de saut (même lecture que table de saut, état pris au début du bloc du br), ou, à défaut, table dont la base est posée hors du bloc : adr xB ; ldrb wE, [xT, xI] ou ldrh wE, [xT, xI, lsl #1] ; add xB, xB, xE, lsl #2 ; br xB, quand dans la plage xT n'est écrit que par une paire adrp + add ou par un seul adr (un bl ou un blr n'écrit que x0..x18), entrées non signées d'1 ou 2 octets, n + 1 entrées pour le cmp wI (ou xI), #n et le b.hi qui précèdent juste le bloc ; sans ce cmp et ce b.hi, plus de 64 entrées ou une cible hors de la plage, br non résolu ; arête de retour après chaque bl et blr. Distance d'un bloc = nombre minimal de blocs jusqu'à un bloc qui contient un watch, par parcours arrière ; infinie sans chemin vers un watch ; un br non résolu est supposé pouvoir mener à un watch (distance finie, la plus grande). Sert à l'ordre d'exploration et au statut off_target, jamais dans un appelé. Faux avec --native-symex-undirected, avec bound = none, ou dès qu'un watch est hors de la plage de la fonction analysée : ni élagage ni ordre par distance pour toute l'analyse.
   drapeaux          NZCV opaques : cmp, tst, ccmp ne sont jamais évalués ; c'est pourquoi les deux issues d'un branchement sont explorées et les deux valeurs d'une sélection gardées (ite).
   elf               elfs[].path de l'ELF analysé ; avec *, chaque ELF AArch64 dont un segment LOAD exécutable contient l'adresse demandée.
   fn_start          Début de la plage qui borne la fonction (symbol ou eh_frame), même quand l'adresse demandée tombe au milieu ; l'adresse demandée elle-même si bound vaut none. L'état initial est pris à entry.
@@ -3103,6 +3288,123 @@ FIND (find[]) — --native-find <elf|*>
   adresses          Chaînes hexadécimales préfixées 0x.
   limites           Un décalage identifie un champ seulement dans une structure donnée : le même décalage sert à d'autres structures, le résultat est une liste de candidats. Un accès fait par un pointeur calculé d'abord (add puis chargement à décalage nul) apparaît comme addr, pas comme load ni store. Un accès fait dans un fragment externalisé est rendu dans le fragment, pas dans ses appelants. Un accès à décalage dans un registre ([base, xN]), ou par memcpy, échappe au mode. Les limites du parcours du code s'appliquent : seules les sections exécutables que décrivent les section headers sont lues, un ELF sans section headers ne donne rien, et un mot de données placé dans le code est lu comme une instruction.
   Sortie texte : une ligne par ELF (matches_total, functions_total, tronqué), une ligne par fonction (bornes, bound, puis pour chaque décalage offset:loads/stores/addrs), puis une ligne par match : insn_addr, access, size (« - » pour addr), base, offset, mnemonic et operands, fonction ou « hors fonction ».
+SLICE (slices[]) — --native-slice <elf|*>@<fonction> --native-slice-at=<adresse>:<emplacement>[,...]
+  D'où vient une valeur : depuis un registre ou une zone mémoire lus juste avant une instruction, remontée du graphe de flot d'une fonction AArch64 sur tous ses chemins à la fois, sans les énumérer : à chaque point, l'ensemble des emplacements encore recherchés ; chaque instruction remontée les transforme ; jonction = union ; boucle = point fixe. Rien n'est exécuté ; indépendant de --native-disasm et de --native-symex. Exemple : « d'où vient l'octet lu en 0x2f3c0 à x0+0x5a9 » : --native --native-slice='lib/arm64-v8a/libapp.so@0x2f000' --native-slice-at=0x2f3c0:x0+0x5a9:1.
+  elf               elfs[].path ; une entrée par ELF retenu. Avec *, chaque ELF AArch64 dont un segment LOAD exécutable contient la fonction.
+  fn_start, fn_end, bound Plage de la fonction, comme SYMEX : bound = symbol (st_size non nul du symbole qui commence à l'adresse demandée) ou eh_frame (FDE qui contient l'adresse demandée, il peut commencer avant). Une fonction sans l'un ni l'autre est une erreur.
+  graphe de flot    Celui de SYMEX (désassemblage linéaire de la plage, cibles des tables de saut lues comme SYMEX, y compris une table dont la base est posée hors du bloc du br : voir directed), par instruction : b.cond, cbz, cbnz, tbz, tbnz mènent à leurs deux issues ; ret, et b ou b.cond hors de la plage, sont les sorties.
+  valeur de base    Avant chaque instruction, chaque registre x0..x30 et sp vaut une base plus un décalage constant, calculés vers l'avant jusqu'au point fixe : le registre à l'entrée de la fonction, une adresse absolue (constante ou adresse formée), la valeur écrite par une instruction, ou la valeur d'une jonction où deux chemins en apportent deux différentes. Le code sans prédécesseur connu ne contribue pas aux jonctions ; chacune de ses instructions a ses propres valeurs de jonction. add et sub d'une constante gardent la base et ajustent le décalage ; un appel écrit x0..x18 et x30, sauf un fragment sans appel ni br qui ne sort que par ret : seulement les registres que ses instructions écrivent, et x30.
+  emplacement       Registre (x0..x30, sp ; q0..q31 suivis en interne et rendus dans les sources) ou zone mémoire : base + décalage sur n octets. Une zone est rattachée à la base du registre qui la désigne : une addition de constante au registre ajuste le décalage. Deux bases différentes sont supposées disjointes, comme dans SYMEX.
+  base              Dans location : x0..x30 ou sp = valeur du registre à l'entrée de la fonction qui contient insn_addr ; sans base = adresse absolue ; <registre>@<adresse> = valeur écrite dans ce registre par l'instruction à cette adresse ; <registre>@join:<adresse> = valeur de ce registre à la jonction qui commence à cette adresse.
+  location          Emplacement rendu : registre (x8) ; partie d'un registre, [premier octet:longueur] (x2[6:2]) ; zone, <base>+<décalage>:<longueur> (x0+0x5a9:1, sp-0x30:8), ou <adresse>:<longueur> pour une adresse absolue.
+  règles            Sémantique de chaque instruction : celle de SYMEX, appliquée à l'instruction seule. Copie et calcul entre registres : l'emplacement devient chacun des registres opérandes. Chargement : le registre devient la zone lue ; ses octets au-delà de la largeur lue viennent de l'extension (const 0, ou dernier octet lu pour une extension de signe). Rangement : la partie de la zone recherchée que l'écriture recouvre devient le registre rangé, le reste continue de remonter. Constante ou adresse formée : source const ou global. Instruction qui n'écrit pas l'emplacement : traversée.
+  appels            memcpy, memmove, __memcpy_chk, __memmove_chk (reconnus comme dans SYMEX) : la partie de la zone couverte par la destination x0 sur x2 octets devient la partie correspondante de la source x1 ; x0 après l'appel devient x0 avant ; x2 non constant : source call, et la zone continue aussi de remonter. Pour un memcpy atteint dans un fragment ou une appelée suivie, x0, x1 ou x2 dont la valeur vient d'un registre à l'entrée de cette fonction est lu chez l'appelant juste avant l'appel, d'appelant en appelant : une longueur posée par l'appelant est donc constante. Fragment externalisé (fonction de 64 octets au plus appelée par bl ou b) : toujours traversé, quelle que soit la profondeur ; il voit tous les registres et la mémoire de l'appelant. Autre appel direct : si l'emplacement est un registre non préservé par AAPCS64 (x0..x18, x30, registres vectoriels) ou une zone dont la base est dans x0..x8 au moment de l'appel, l'appel est suivi dans la limite de --native-slice-depth ou de --native-slice-follow : la recherche reprend depuis chaque sortie de l'appelée et revient dans l'appelante juste avant l'appel ; sinon source call. Registres préservés (x19..x29, sp), zones dont la base n'est pas transmise et zones absolues traversent l'appel. Appel indirect (blr) : mêmes conditions, source indirect_call. Un import PLT n'est jamais suivi.
+  queries[]         Une entrée par requête, dans l'ordre de --native-slice-at.
+  at                Adresse de l'instruction de la requête ; l'emplacement est lu juste avant elle.
+  complete          Faux si le budget --native-slice-max-steps ou le plafond --native-slice-max-sources a été atteint : résultat partiel.
+  steps             Itérations du point fixe : couples (point, emplacement) traités.
+  sources_total     Sources distinctes trouvées, exact au-delà de --native-slice-max-sources.
+  sources_truncated Vrai si sources en rend moins que sources_total.
+  sources[]         Triées par insn_addr, puis kind, puis bytes ; coupées à --native-slice-max-sources (défaut 200). Une source par (kind, location ou value, insn_addr, call_target, reason, bytes) ; jonction = union.
+  kind              arg, init_mem, const, global, call, indirect_call ou unknown.
+  arg               kind : registre à l'entrée de la fonction analysée ; location ; insn_addr = fn_start.
+  init_mem          kind : zone mémoire à l'entrée de la fonction analysée, jamais écrite en remontant ; location ; insn_addr = fn_start.
+  const             kind : constante écrite par l'instruction insn_addr (mov, movz, movn, movk, ldr littéral lu dans l'ELF, octets d'une extension par zéros) ; value.
+  global            kind : adresse formée par l'instruction insn_addr (adr, adrp, add sur une page) ; value.
+  call              kind : appel en insn_addr, non suivi, qui peut écrire location (emplacement juste après l'appel) ; call_target.
+  indirect_call     kind : appel indirect en insn_addr qui peut écrire location ; call_target = expression de la cible si connue.
+  unknown           kind : remontée coupée en insn_addr sur ce chemin ; location ; reason.
+  indirect_branch   reason : instruction sans prédécesseur connu dans une fonction qui contient un br non résolu ; ou sortie par un br non résolu d'une fonction suivie (appelée ou fragment) : une source par br, insn_addr = le br, location = l'emplacement recherché à cette sortie, les autres sorties remontées comme d'habitude.
+  no_predecessor    reason : instruction sans prédécesseur connu dans une fonction sans br non résolu (atteinte seulement depuis l'extérieur, ou jamais) ; ou fonction suivie sans sortie ni br non résolu : insn_addr = son début.
+  computed_address  reason : adresse lue calculée à partir de plusieurs registres ([xN, xM]), ou zone dont la base n'existe pas à l'entrée d'une appelée.
+  unmodeled         reason : instruction illisible, ou que la sémantique de SYMEX ne modélise pas (registre écrit inconnu, zone écrite perdue).
+  value             const et global : valeur, hexadécimal 0x.
+  insn_addr         Instruction de la définition ; fn_start pour arg et init_mem ; l'appel pour call et indirect_call.
+  call_target       call : adresse de l'appelé ; indirect_call : expression de la cible, base et décalage du registre comme dans base, [e] = valeur de 8 octets lue à l'adresse e, trois niveaux au plus ; absent sinon.
+  reason            unknown seulement.
+  bytes             [début, fin) : octets de l'emplacement demandé que la source couvre ; un registre demandé en a 8, petit-boutiste.
+  chain[]           Chaîne de définitions témoin, la première trouvée (parcours en largeur) : instructions qui ont transformé l'emplacement, de la source vers la requête, celle de la source exclue ; insn_addr, mnemonic, operands comme LISTING ; au plus 64.
+  chain_truncated   Vrai si chain a été coupée à 64.
+  --native-slice-at Obligatoire. <adresse>:<emplacement>, séparés par des virgules, de 1 à 16, doublons retirés ; adresse hexadécimale, préfixe 0x facultatif, dans la plage de la fonction et alignée sur 4 ; emplacement = registre (x0..x30, sp) ou <registre>+<décalage>:<longueur> (décalage décimal ou 0x, signe + ou -, longueur de 1 à 64), lu avec la valeur du registre juste avant l'instruction : 0x2f3c0:x8, 0x2f3c0:x0+0x5a9:1, 0x2f3c0:sp+0x1c61:1.
+  --native-slice-depth Niveaux de fonctions appelées suivies, défaut 1, maximum 4 ; un fragment n'en consomme pas.
+  --native-slice-follow Adresses hexadécimales de bl (ou de b) suivis quelle que soit la profondeur, séparées par des virgules.
+  --native-slice-max-steps Budget d'itérations du point fixe par requête, défaut 200000.
+  --native-slice-max-sources Plafond de sources rendues par requête, défaut 200 ; sources_total reste exact.
+  erreurs           Requête mal formée : refus de la ligne de commande qui cite l'élément. Adresse hors de la fonction, fonction sans fin connue : entrée de errors qui cite l'élément.
+  limites           Tous les chemins du graphe de flot sont couverts, y compris impossibles : des sources en trop, jamais en moins dans la limite du modèle et du budget ; complete dit si le budget a coupé. Bases mémoire différentes supposées disjointes : une écriture par un pointeur calculé autrement n'est pas vue. Une écriture faite par une fonction appelée non suivie sort comme source call, pas comme valeur. Un saut indirect non résolu coupe la remontée sur ce chemin, avec une source unknown ; une sortie par br non résolu d'une fonction suivie donne une source unknown à l'adresse du br. Une zone absolue traverse un appel qui n'est pas un fragment. chain est un témoin, pas l'ensemble des chaînes.
+  Sortie texte : une ligne par fonction (elf, bornes, bound), une par requête (at, location, sources_total, tronqué, steps, incomplet), puis une par source : kind, location ou value, insn_addr, call_target, reason, bytes, et les adresses de chain.
+
+ASYNC_GRAPH (async_graph[]) — --native-async-graph <elf|*> avec --native-async-from, --native-async-to ou --native-async-path
+  En Rust, une tâche asynchrone ou une fermeture passée par objet trait est une table de méthodes, et le code qui crée l'objet forme l'adresse de sa table : « quelle fonction fabrique quelle table » prolonge le graphe d'appels à travers les appels indirects. Sert à savoir par où l'on passe d'une fonction A à une fonction B. Rien n'est exécuté ; indépendant de --native-disasm. Exemple : --native --native-async-graph='lib/arm64-v8a/libapp.so' --native-async-path=0x2f3c0:0x41a00.
+  elf               elfs[].path ; une entrée par ELF retenu. Avec *, chaque ELF AArch64, les autres ignorés ; aucun ELF AArch64 est une erreur. Nommé explicitement : un ELF non AArch64 est une erreur.
+  fonction bornée   Règle de LABELS : symbole STT_FUNC défini de .symtab ou .dynsym, sinon FDE de .eh_frame. Les nœuds sont les fonctions bornées, désignées par leur début.
+  tables_total      Tables de méthodes de l'ELF, détectées comme VTABLES, avant toute requête.
+  call              Arête : F contient un bl ou un b dont la destination est exactement le début de G. Preuve : insn_addr. Un branchement vers l'intérieur d'une fonction n'est pas une arête.
+  makes             Arête : F contient une instruction qui forme l'adresse de début d'une table T (adrp et add, adr, comme les références de chaînes), et G est le destructeur ou une méthode de T. Preuve : insn_addr, adrp_addr, table, offset. Une valeur de T qui n'est pas le début d'une fonction bornée ne donne pas d'arête.
+  fragment          Fonction bornée de 64 octets au plus. Une arête qui part d'un fragment F est remplacée par une arête partant de chaque fonction qui appelle F par bl ou b (F exclu), avec via_fragment = début de F ; un fragment sans appelant ne garde aucune arête sortante. Les arêtes qui mènent à F restent.
+  queries[]         Dans cet ordre : une requête from si --native-async-from, une requête to si --native-async-to, puis une requête path par couple de --native-async-path.
+  kind              from, to ou path.
+  from              kind : descendants des fonctions qui contiennent les adresses demandées, en suivant les arêtes dans leur sens, jusqu'à --native-async-depth arêtes.
+  to                kind : ascendants des fonctions qui contiennent les adresses demandées, en remontant les arêtes, jusqu'à --native-async-depth arêtes.
+  path              kind : plus courts chemins, en nombre d'arêtes, de la fonction qui contient a à celle qui contient b, de --native-async-depth arêtes au plus (défaut 12) ; au plus 16 chemins rendus par couple, tous de longueur minimale.
+  requested         Adresses demandées, en hexadécimal : celles de la liste pour from et to, [a, b] pour path.
+  resolved          Débuts des fonctions bornées qui les contiennent, doublons retirés pour from et to, [début de a, début de b] pour path.
+  nodes_total       from et to : fonctions atteintes, racines comprises ; path : fonctions sur l'un des plus courts chemins, tous comptés ; 0 sans chemin.
+  edges_total       from et to : arêtes qui partent (from) ou arrivent (to) à une fonction atteinte à moins de --native-async-depth ; path : arêtes de tous les plus courts chemins.
+  paths_total       path seulement : nombre de plus courts chemins, exact (plafonné au plus grand entier), 0 sans chemin.
+  truncated         Vrai si nodes, edges ou paths en rendent moins que nodes_total, edges_total ou paths_total.
+  nodes[]           Triés par depth puis fn_start ; coupés à --native-async-max (défaut 500). fn_start, fn_end, bound comme LABELS.
+  depth             Nombre d'arêtes depuis la racine (from, to) ou depuis la fonction de a (path).
+  edges[]           Arêtes dont les deux bouts sont dans nodes, triées par from, to, kind, insn_addr. from, to : débuts des fonctions ; kind : call ou makes.
+  insn_addr         call : l'instruction de branchement ; makes : l'instruction qui forme l'adresse de la table.
+  adrp_addr         makes : l'ADRP qui a posé la page, absent sinon ou s'il n'y en a pas.
+  table             makes : début de la table T.
+  offset            makes : décalage de G dans T, 0x0 pour le destructeur, 0x18 et au-delà pour les méthodes.
+  via_fragment      Début du fragment d'où part l'arête d'origine ; absent pour une arête directe.
+  paths[]           path seulement : chaque chemin rendu, suite d'arêtes de a vers b, mêmes champs que edges ; vide sans chemin ; [] (chemin vide) si a et b sont dans la même fonction.
+  stores[]          Mots de données de 8 octets égaux à l'adresse d'une table, lus comme les data_refs de XREFS, pour les tables d'une arête makes rendue ou dont le destructeur ou une méthode est un nœud rendu : table, vaddr du mot. Rendus à part, jamais comme arêtes. Triés par table puis vaddr.
+  --native-async-from Adresses hexadécimales, préfixe 0x facultatif, séparées par des virgules, de 1 à 64, doublons retirés.
+  --native-async-to Même forme que --native-async-from.
+  --native-async-path Couples <a>:<b> d'adresses hexadécimales, séparés par des virgules, de 1 à 64, doublons retirés.
+  --native-async-depth Profondeur maximale pour from et to, défaut 4 ; longueur maximale d'un chemin pour path, défaut 12 ; au plus 12.
+  --native-async-max Plafond de nœuds rendus par requête, défaut 500 ; nodes_total, edges_total et paths_total restent exacts.
+  --native-async-kinds Sous-ensemble de call, makes, séparés par des virgules ; défaut les deux. Appliqué après le remplacement des arêtes de fragment.
+  requêtes          Au moins une de --native-async-from, --native-async-to, --native-async-path, sinon refus. Une adresse hors de toute fonction bornée est une erreur de l'ELF, qui la cite.
+  adresses          Chaînes hexadécimales préfixées 0x.
+  limites           makes dit que F crée un objet dont G est une méthode, pas que G est appelée, ni quand. Une table transmise par un champ de structure ou par un argument échappe au graphe : seule sa création est vue. Les limites de la détection de tables (VTABLES) et de la recherche de références (XREFS) s'appliquent. Un chemin est un chemin possible, pas un chemin exécuté.
+  Sortie texte : une ligne par ELF (tables_total), une par requête (kind, requested, resolved, nodes_total, edges_total, paths_total, tronqué), puis une ligne par nœud (depth, bornes), une par arête (from, to, kind, insn_addr, preuve, via), une par chemin (suite des fonctions), une par mot de stores.
+
+FIELDS (fields[]) — --native-fields <elf|*>
+  Un désérialiseur généré par serde ou par prost référence le nom de chaque champ dans la même fonction, souvent plusieurs fois : recenser par fonction les noms de champs référencés donne la liste des structures que le binaire lit depuis du JSON ou du protobuf. Le mode ne calcule pas où chaque champ est rangé : sites donne les instructions à partir desquelles le faire avec --native-slice ou --native-symex. Rien n'est exécuté ; indépendant de --native-disasm. Exemple : --native --native-fields='lib/arm64-v8a/libapp.so' --native-fields-name=access_token.
+  chaînes           Celles de --native-strings --xrefs, sans motif, à partir de 2 caractères, qui ont au moins une référence dans le code ; leurs références comme LABELS.
+  nom de champ candidat Chaîne de 2 à 64 caractères aux bornes prouvées (boundary rust_fatptr ou rust_code), en forme d'identifiant : lettre ASCII ou « _ », puis lettres ASCII, chiffres ou « _ ».
+  rattachement      Règle de LABELS : chaque référence à la fonction bornée qui contient l'instruction ; une chaîne référencée dans un fragment (fonction bornée de 64 octets au plus) est aussi rattachée à chacune des fonctions qui l'appellent par bl ou b, via_fragment = début du fragment. Quand le fragment a plus de --native-fields-fragment-fanout appelants, ce rattachement est partagé : ni compté ni rendu.
+  désérialiseur candidat Fonction bornée qui référence au moins --native-fields-min noms de champ candidats distincts, rattachements partagés exclus.
+  elf               elfs[].path ; une entrée par ELF retenu. Avec *, chaque ELF AArch64, les autres ignorés ; aucun ELF AArch64 est une erreur. Nommé explicitement : un ELF non AArch64 est une erreur.
+  functions_total   Désérialiseurs candidats de l'ELF, avant filtres.
+  functions_matched Fonctions retenues : les désérialiseurs candidats, ou avec --native-fields-fn les fonctions bornées qui contiennent l'une des adresses, candidates ou non ; puis --native-fields-name.
+  truncated         Vrai si functions en rend moins que functions_matched (--native-fields-max).
+  functions[]       Triées par fn_start croissant, coupées à --native-fields-max (défaut 1000).
+  fn_start, fn_end, bound Bornes de la fonction, comme LABELS.
+  struct_names      Chaînes rattachées à la fonction, rattachements partagés exclus, quelle que soit leur borne, en forme de nom de type : 2 à 64 caractères, majuscule ASCII puis lettres ASCII et chiffres (BabaAccountPb) ; dans l'ordre des instructions, doublons retirés.
+  fields_count      Nombre d'éléments de fields.
+  fields[]          Un élément par couple (chaîne, fragment) de nom de champ candidat non partagé, trié par première adresse d'instruction puis par vaddr ; jamais coupé.
+  name              Le nom, tel que la chaîne l'écrit.
+  vaddr             Adresse de la chaîne.
+  boundary          rust_fatptr ou rust_code, comme --native-strings.
+  sites[]           Instructions qui forment l'adresse de la chaîne, dans la fonction ou dans le fragment, triées, doublons retirés.
+  sites_count       Nombre d'éléments de sites.
+  via_fragment      Début du fragment par lequel le nom est rattaché ; absent pour un rattachement direct.
+  callers[]         Appelants directs du début de la fonction : bl et b dont la destination est fn_start, triés par insn_addr ; insn_addr, et function = fn_start, fn_end, bound de la fonction bornée qui les contient, null hors de toute fonction bornée.
+  --native-fields-fn Adresses hexadécimales, préfixe 0x facultatif, séparées par des virgules, de 1 à 64, doublons retirés : seulement les fonctions bornées qui contiennent l'une d'elles ; pour elles la condition de candidature ne s'applique pas. Une adresse hors de toute fonction bornée est une erreur de l'ELF, qui la cite.
+  --native-fields-name Noms exacts non vides, séparés par des virgules, sensibles à la casse : seulement les fonctions qui référencent l'un d'eux comme nom de champ candidat non partagé.
+  --native-fields-min Nombre minimal de noms candidats distincts d'un désérialiseur candidat, défaut 3.
+  --native-fields-fragment-fanout Nombre d'appelants au-delà duquel un rattachement par fragment est partagé, défaut 8.
+  --native-fields-max Plafond du nombre de fonctions rendues par ELF, défaut 1000 ; functions_total et functions_matched restent exacts.
+  filtres           Optionnels, combinés par ET. Un élément mal formé est cité dans l'erreur.
+  adresses          Chaînes hexadécimales préfixées 0x.
+  limites           Un identifiant référencé n'est pas forcément un champ : nom de colonne, clé de configuration, variante d'énumération ont la même forme. Une fonction qui lit ses noms par une table de données et non par des adresses formées dans le code échappe au mode. Le mode ne dit pas où un champ est rangé ni son type. Les limites des références de chaînes (LABELS) et du rattachement par fragment s'appliquent.
+  Sortie texte : une ligne par ELF (functions_total, functions_matched, tronqué), une ligne par fonction (bornes, bound, fields_count, struct_names, appelants), puis une ligne par champ : name, vaddr, boundary, sites, « via » et le fragment s'il y a lieu.
 ";
 
 /// Légende autonome : chaque champ, statut, catégorie et anomalie de `--native`.
