@@ -41,6 +41,7 @@ use super::source::Source;
 mod decode;
 mod disasm;
 mod jni_table;
+mod labels;
 pub mod native_strings;
 mod symex;
 mod vtables;
@@ -51,6 +52,10 @@ pub use self::disasm::{
     parse_listing_spec, parse_root_spec, DisasmCall, DisasmFunction, DisasmInsn, DisasmOptions,
     ElfDisasm, IndexedString, InvalidPath, JavaMember, JniCall, Listing, ListingInsn, ListingSpec,
     RootSpec, StringIndexRef, StringRef, Syscall, TruncatedAt,
+};
+pub use self::labels::{
+    parse_labels_patterns, LabeledFunction, LabeledString, LabelsOptions, LabelsReport,
+    DEFAULT_LABELS_FRAGMENT_FANOUT, DEFAULT_LABELS_MAX, DEFAULT_LABELS_STRINGS_MAX,
 };
 pub use self::symex::{
     parse_symex_address, parse_symex_peek, parse_symex_spec, Shown, SymexBranch, SymexBudgets,
@@ -164,6 +169,8 @@ pub struct NativeReport {
     pub words: Vec<WordsReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub vtables: Vec<VtablesReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<LabelsReport>,
     pub errors: Vec<String>,
 }
 
@@ -594,6 +601,7 @@ fn finish(
         xrefs: Vec::new(),
         words: Vec::new(),
         vtables: Vec::new(),
+        labels: Vec::new(),
         errors,
     }
 }
@@ -861,6 +869,54 @@ pub fn add_vtables(
                 None => "aucun ELF AArch64",
             };
             report.errors.push(format!("vtables {label} : {why}"));
+        }
+    });
+}
+
+/// `--native-labels` : chaînes et étiquette par fonction de chaque ELF retenu,
+/// octets relus comme pour [`add_listings`]. `*` retient les ELF AArch64 ;
+/// aucun = erreur.
+pub fn add_labels(
+    report: &mut NativeReport,
+    input: impl Into<Source>,
+    splits: &[super::xapk::Split],
+    options: Option<&LabelsOptions>,
+) {
+    let Some(options) = options else {
+        return;
+    };
+    let reread = Reread::open(&report.elfs, input.into(), splits);
+    let named = options.elf.as_deref();
+    let label = named.unwrap_or("*");
+    self::disasm::silence_panics(|| {
+        let mut matched = false;
+        for elf in &report.elfs {
+            let wanted = match named {
+                Some(path) => path == elf.path,
+                None => elf.machine == "aarch64",
+            };
+            if !wanted {
+                continue;
+            }
+            matched = true;
+            let outcome = match reread.bytes(elf) {
+                Ok(bytes) => self::labels::run(&bytes, elf, options),
+                Err(why) => Err(why),
+            };
+            match outcome {
+                Ok(found) => report.labels.push(found),
+                Err(why) => {
+                    let message = format!("labels {label} ({}) : {why}", elf.path);
+                    report.errors.push(message);
+                }
+            }
+        }
+        if !matched {
+            let why = match named {
+                Some(_) => "aucun ELF de ce chemin",
+                None => "aucun ELF AArch64",
+            };
+            report.errors.push(format!("labels {label} : {why}"));
         }
     });
 }
