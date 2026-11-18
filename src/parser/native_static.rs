@@ -2301,7 +2301,8 @@ const LEGEND: &str = "\
 avec --native-symex (section SYMEX), références vers des adresses seulement avec
 --native-xrefs (section XREFS), mots lus à des adresses seulement avec --native-words
 (section WORDS), tables de méthodes Rust seulement avec --native-vtables (section
-VTABLES).
+VTABLES), chaînes référencées et étiquette par fonction seulement avec
+--native-labels (section LABELS).
 Mode ELF brut : une entrée dont les 4 premiers octets valent 7F 45 4C 46 est
 analysée seule, quelle que soit son extension ; --native-dex <APK|DEX>, répétable,
 fournit les méthodes natives à lier, sans quoi binding est vide.
@@ -2325,11 +2326,12 @@ RAPPORT
   xrefs[]         --native-xrefs seulement, absent sinon (section XREFS).
   words[]         --native-words seulement, absent sinon (section WORDS).
   vtables[]       --native-vtables seulement, absent sinon (section VTABLES).
+  labels[]        --native-labels seulement, absent sinon (section LABELS).
   errors          Une entrée de longueur nulle (empty : stored vide ou flux deflate vide)
                   est lue, vide, et n'y figure jamais.
                   Ce qui n'a pas pu être lu : entrée d'archive illisible (on ignore alors
                   si c'était un ELF), DEX illisible, classes sautées, panique du parseur
-                  DEX, listing, symex, xrefs, words ou vtables impossible. Une méthode native manquante peut faire
+                  DEX, listing, symex, xrefs, words, vtables ou labels impossible. Une méthode native manquante peut faire
                   apparaître à tort son export en native_unclaimed. Une source illisible
                   est ignorée, les autres sont liées ; si aucune n'a pu être lue,
                   binding est vide et native_methods_declared vaut 0.
@@ -2912,6 +2914,47 @@ VTABLES (vtables[]) — --native-vtables <elf|*>
   filtres           Optionnels, combinés par ET. Un élément mal formé est cité dans l'erreur.
   limites           La détection structurelle ne prouve rien : un bloc de données qui a par hasard cette forme est rendu comme une table, et une table sans méthode n'est pas détectée. La fin d'une table n'est pas marquée dans le binaire : deux tables collées dont la seconde n'a pas de destructeur valide peuvent être fusionnées, et un pointeur de fonction étranger placé juste après la dernière méthode peut être compté en trop. Une fonction présente dans une table n'est pas la preuve qu'un appel indirect donné la vise : le mode rend des candidats. Une absence de référence à une table n'est pas une preuve : adresse calculée, ADRP et ADD éloignés. Seules les relocations relatives sont lues : un ELF ET_EXEC sans relocation relative, ou une table relogée par R_AARCH64_ABS64 ou par un format packé APS2, n'est pas détectée.
   Sortie texte : une ligne par ELF (tables_total, tables_matched, tronqué), puis une ligne par table (adresse, section, destructeur, taille, alignement, nombre de méthodes, décalages trouvés), les méthodes indentées avec leur décalage et leur fonction, puis les références s'il y en a.
+
+LABELS (labels[]) — --native-labels <elf|*>
+  Pour chaque fonction d'un ELF AArch64, les chaînes qu'elle référence et une étiquette de lecture tirée d'elles : l'index inverse des xrefs de --native-strings, par fonction au lieu de par chaîne. Rien n'est exécuté ; indépendant de --native-disasm. Exemple : --native --native-labels='lib/arm64-v8a/libapp.so' --native-labels-match=connect.
+  chaînes           Celles de --native-strings --xrefs sur l'ELF, sans motif et au --min-length par défaut (4) : même extraction, mêmes boundary (nul, rust_fatptr, rust_code, heuristic), mêmes références (adrp_add, adr, ldr_literal, fatptr, et fatptr_array depuis un tableau de morceaux de format propagé, d'au plus max_propagated_array couples). Chaque instruction de ces références est rattachée à la fonction bornée qui la contient.
+  fonction bornée   Règle de fn_start de --native-strings (functions) : symbole STT_FUNC défini de .symtab ou .dynsym (fin = début + st_size ; st_size nul : pas de fin, la fonction court jusqu'au début suivant), sinon FDE de .eh_frame. Une instruction qu'aucune fonction bornée ne contient n'est rattachée à rien.
+  fragment          Fonction bornée à fin connue d'au plus 64 octets (fn_end - fn_start). Ses chaînes lui restent rattachées, et chacune l'est aussi à chaque fonction bornée qui contient un bl ou un b dont la destination est exactement le début du fragment (call et jump de code_refs, section XREFS, une seule passe sur le code), le fragment lui-même excepté. Seules les chaînes directes du fragment passent ainsi, sans transitivité.
+  partagée          Chaîne rattachée par un fragment qu'appellent plus de --native-labels-fragment-fanout fonctions bornées distinctes (défaut 8) : code commun (panique, formatage, runtime async) qui ne décrit aucun de ses appelants. Elle n'entre ni dans names, ni dans all_tags, ni dans label, ni dans module, ni dans --native-labels-match ; elle reste dans strings[], après toutes les chaînes non partagées. Les chaînes directes du fragment lui-même ne sont jamais partagées.
+  elf               elfs[].path de l'ELF ; une entrée par ELF retenu. Avec *, chaque ELF AArch64, les autres ignorés ; aucun ELF AArch64 est une erreur. Nommé explicitement : un ELF non AArch64 est une erreur.
+  functions_total   Fonctions bornées auxquelles au moins une chaîne non partagée est rattachée, avant filtres.
+  functions_shared_only Fonctions bornées dont toutes les chaînes sont partagées ; hors de functions_total, rendues seulement avec --native-labels-fn.
+  functions_matched Fonctions qui passent tous les filtres.
+  truncated         Vrai si functions en rend moins que functions_matched (--native-labels-max).
+  functions[]       Triées par fn_start croissant, coupées à --native-labels-max (défaut 2000).
+  fn_start, fn_end, bound Bornes de la fonction ; fn_end null sans fin connue ; bound = symtab ou eh_frame, comme functions de --native-strings.
+  crochets          Contenus entre crochets d'une chaîne : groupes qui se suivent sans séparateur en tête de chaîne (« [Messenger][E2EE] y » en donne deux) ; pour chacun, les « [ » consécutifs sont sautés (« [[LogUtil] x » donne LogUtil), le contenu va jusqu'au premier « ] », qui doit tomber dans les 80 premiers caractères de la chaîne ; un contenu vide ou qui contient encore « [ » est ignoré.
+  identifiant       Lettre ASCII ou « _ », puis lettres ASCII, chiffres ou « _ », au moins 3 caractères.
+  names             Noms de fonction tirés des chaînes non partagées, dans l'ordre des adresses d'instruction, doublons retirés : l'identifiant qui suit « ] » et une espace en tête de chaîne (« ] should_create_e2ee_channel for ») ; un contenu entre crochets qui est lui-même un identifiant commençant par une minuscule et contenant au moins un « _ » (« [internal_find_user_profile] … »).
+  all_tags          Contenus entre crochets des chaînes non partagées, dans l'ordre des adresses d'instruction, doublons retirés.
+  module            Premier élément de all_tags qui n'est pas dans names ; absent s'il n'y en a pas.
+  label             Étiquette de la fonction, null avec none. Tirée des chaînes non partagées, rendues ou non.
+  label_kind        Règle qui a donné label, dans cet ordre de priorité : fn_name, log_tag, source_path, none.
+  fn_name           label_kind : label = premier élément de names.
+  log_tag           label_kind : sans nom, label = premier élément de all_tags.
+  source_path       label_kind : sans nom ni tag, label = la première chaîne non partagée qui se termine par « .rs », entière.
+  none              label_kind : aucune des trois ; label null.
+  strings_total     Rattachements de la fonction, un par triplet (instruction, chaîne, fragment), via_fragment et chaînes partagées compris.
+  strings_shared    Rattachements partagés, comptés dans strings_total.
+  strings_truncated Vrai si strings en rend moins que strings_total (--native-labels-strings-max).
+  strings[]         Les non partagées, triées par insn_addr croissante, puis par vaddr, le rattachement direct avant via_fragment ; puis les partagées, dans le même ordre ; coupées à --native-labels-strings-max (défaut 50), donc d'abord sur les non partagées. vaddr = adresse de la chaîne ; value = son texte, coupé à 200 caractères ; value_truncated = vrai s'il l'a été ; boundary comme --native-strings ; insn_addr = instruction qui achève l'adresse, comme les xrefs de --native-strings, dans le fragment pour un rattachement via_fragment.
+  via_fragment      Début du fragment par lequel la chaîne est rattachée ; absent pour un rattachement direct.
+  shared            Vrai pour une chaîne partagée, faux sinon.
+  fragment_callers  Chaîne partagée seulement : nombre de fonctions bornées distinctes qui appellent son fragment.
+  --native-labels-fn Adresses hexadécimales, préfixe 0x facultatif, séparées par des virgules, de 1 à 64, doublons retirés : ne garder que les fonctions bornées qui contiennent l'une d'elles, y compris celles dont toutes les chaînes sont partagées.
+  --native-labels-match Motifs non vides, séparés par des virgules : ne garder que les fonctions dont une chaîne non partagée, rendue ou non, via_fragment comprise, contient l'un d'eux, casse ignorée.
+  --native-labels-max Plafond du nombre de fonctions rendues par ELF, défaut 2000 ; functions_total, functions_shared_only et functions_matched restent exacts.
+  --native-labels-strings-max Plafond des chaînes rendues par fonction, défaut 50, appliqué d'abord aux non partagées ; strings_total, strings_shared, names, all_tags, module et label restent calculés sur toutes.
+  --native-labels-fragment-fanout Nombre de fonctions appelantes au-delà duquel les chaînes d'un fragment sont partagées, défaut 8.
+  filtres           Optionnels, combinés par ET. Un élément mal formé est cité dans l'erreur.
+  adresses          Chaînes hexadécimales préfixées 0x.
+  limites           Une fonction sans chaîne référencée n'apparaît pas. Les limites des références de chaînes s'appliquent : une adresse calculée, un ADRP et son ADD éloignés échappent au balayage, et la chaîne n'est alors rattachée à aucune fonction. Une chaîne rattachée par fragment appartient à l'un des appelants du fragment, pas forcément à tous : via_fragment le signale. Un appel au fragment par branchement indirect (br, blr), conditionnel ou vers son intérieur n'est pas vu, et n'entre pas dans fragment_callers. Le seuil de partage est un paramètre de l'outil, pas une mesure. L'étiquette est une aide de lecture, pas un nom de fonction prouvé : un nom de names est celui qu'écrit un message de journal.
+  Sortie texte : une ligne par ELF (functions_total, functions_shared_only, functions_matched, tronqué), puis une ligne par fonction (bornes, bound, label_kind et label, module, names, tags, nombre de chaînes dont partagées), et une ligne par chaîne : insn_addr, vaddr, boundary, value, « via » suivi du fragment s'il y a lieu, et « partagée » avec fragment_callers.
 ";
 
 /// Légende autonome : chaque champ, statut, catégorie et anomalie de `--native`.
