@@ -2958,7 +2958,11 @@ fn print_labels(l: &drakkar::parser::native_static::LabelsReport) {
         if !f.all_tags.is_empty() {
             line.push_str(&format!("  tags {}", f.all_tags.join(",")));
         }
-        let more = if f.strings_truncated { " (tronqué)" } else { "" };
+        let more = if f.strings_truncated {
+            " (tronqué)"
+        } else {
+            ""
+        };
         let (count, shared) = (f.strings_total, f.strings_shared);
         line.push_str(&format!("  chaînes {count} dont partagées {shared}{more}"));
         println!("{line}");

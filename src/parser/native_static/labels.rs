@@ -540,7 +540,11 @@ mod tests {
     }
 
     fn starts(report: &LabelsReport) -> Vec<&str> {
-        report.functions.iter().map(|f| f.fn_start.as_str()).collect()
+        report
+            .functions
+            .iter()
+            .map(|f| f.fn_start.as_str())
+            .collect()
     }
 
     #[test]
