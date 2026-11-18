@@ -83,7 +83,7 @@ const CALL_INDIRECT_TAIL: &str = "indirect_tail";
 const CALL_ABANDONED: &str = "abandoned";
 
 /// Registres que l'appelé rend intacts (AAPCS64) : x19..x29 et sp.
-const PRESERVED: [usize; 12] = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 31];
+pub(super) const PRESERVED: [usize; 12] = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 31];
 
 const BOUND_SYMBOL: &str = "symbol";
 const BOUND_EH_FRAME: &str = "eh_frame";
@@ -185,7 +185,7 @@ pub fn parse_symex_peek(item: &str, watches: &[u64]) -> Result<SymexPeek, String
 }
 
 /// `x0..x30` ou `sp`, puis `+` ou `-` et un décalage décimal ou `0x`.
-fn parse_peek_place(text: &str) -> Result<(u8, i64), String> {
+pub(super) fn parse_peek_place(text: &str) -> Result<(u8, i64), String> {
     let text = text.trim();
     let missing = || format!("{text:?} : attendu <registre>+<décalage>");
     let at = text.find(['+', '-']).ok_or_else(missing)?;
@@ -788,7 +788,7 @@ fn sign_extend(value: u64, bits: u8) -> u64 {
     (((value << shift) as i64) >> shift) as u64
 }
 
-fn reg_name(reg: u8) -> String {
+pub(super) fn reg_name(reg: u8) -> String {
     match reg {
         SP => "sp".to_string(),
         r if r >= V0 => format!("q{}", r - V0),
@@ -2825,7 +2825,7 @@ fn observe(inst: &Instruction, done: &Done, args: &[Expr], sp: &Expr, state: &St
 
 /// memcpy ou memmove, par PLT ou par symbole, à `target` ou au bout d'une
 /// suite de `b`.
-fn copy_import(ctx: &Ctx, mut target: u64) -> Option<String> {
+pub(super) fn copy_import(ctx: &Ctx, mut target: u64) -> Option<String> {
     for _ in 0..=MAX_COPY_HOPS {
         if let Some(name) = plt_import(ctx, target, false) {
             return COPY_IMPORTS.contains(&name.as_str()).then_some(name);
@@ -2890,14 +2890,9 @@ fn jump_table(ctx: &Ctx, bound: &Bound, target: &Expr) -> Option<Vec<u64>> {
     let mut targets = Vec::new();
     for index in 0..entries {
         let at = table.off.wrapping_add(index * width);
-        let bytes = ctx
-            .image
-            .offset_of(at)
-            .and_then(|offset| ctx.image.bytes_at(offset, width));
-        let Some(bytes) = bytes else {
+        let Some(raw) = table_entry(ctx, at, width) else {
             break;
         };
-        let raw = read_le(bytes);
         let value = match extend {
             Some((bits, true)) => sign_extend(raw, bits),
             Some((bits, false)) => raw & mask(bits),
@@ -2913,6 +2908,12 @@ fn jump_table(ctx: &Ctx, bound: &Bound, target: &Expr) -> Option<Vec<u64>> {
         }
     }
     (!targets.is_empty()).then_some(targets)
+}
+
+/// Entrée de `width` octets, petit-boutiste, lue dans l'ELF en `at`.
+fn table_entry(ctx: &Ctx, at: u64, width: u64) -> Option<u64> {
+    let offset = ctx.image.offset_of(at)?;
+    ctx.image.bytes_at(offset, width).map(read_le)
 }
 
 fn describe(ctx: &Ctx, at: u64) -> Option<String> {
@@ -2938,23 +2939,22 @@ fn fresh_loads(e: &Expr, out: &mut Vec<(Expr, i64)>) {
     }
 }
 
-type Decoded = Option<(Instruction, Insn)>;
+pub(super) type Decoded = Option<(Instruction, Insn)>;
 
-/// Graphe de flot de la fonction analysée : blocs de sa plage désassemblée
-/// linéairement, et distance de chacun, en blocs, au watch le plus proche.
-struct Cfg {
-    starts: Vec<u64>,
-    ends: Vec<u64>,
-    distances: Vec<u32>,
+/// Plage `[start, end)` d'une fonction bornée désassemblée linéairement : ses
+/// instructions, ses blocs, et les cibles des br résolus, par adresse du br.
+/// Partagé avec `--native-slice`.
+pub(super) struct FlowGraph {
+    pub(super) start: u64,
+    pub(super) insns: Vec<(u64, Decoded)>,
+    pub(super) blocks: Vec<(u64, u64)>,
+    pub(super) tables: HashMap<u64, Vec<u64>>,
 }
 
-impl Cfg {
-    /// `None` : plage inconnue, aucun watch, ou un watch hors de la plage.
-    fn build(ctx: &Ctx, bound: &Bound, watches: &[u64]) -> Option<Cfg> {
+impl FlowGraph {
+    /// `None` : plage inconnue.
+    pub(super) fn build(ctx: &Ctx, bound: &Bound) -> Option<FlowGraph> {
         let (start, end) = (bound.start, bound.end?);
-        if watches.is_empty() || !watches.iter().all(|at| (start..end).contains(at)) {
-            return None;
-        }
         let mut insns: Vec<(u64, Decoded)> = Vec::new();
         let mut at = start;
         while at < end {
@@ -2986,12 +2986,46 @@ impl Cfg {
             if !matches!(insn.flow, Flow::JumpVia(_)) {
                 continue;
             }
-            if let Some(targets) = br_targets(ctx, bound, block) {
+            let first = index(from);
+            let found = br_targets(ctx, bound, block)
+                .or_else(|| far_table(ctx, bound, &insns, first, block));
+            if let Some(targets) = found {
                 leaders.extend(targets.iter().copied());
                 tables.insert(*at, targets);
             }
         }
         let blocks = spans(&leaders, start, end);
+        Some(FlowGraph {
+            start,
+            insns,
+            blocks,
+            tables,
+        })
+    }
+
+    pub(super) fn index(&self, at: u64) -> usize {
+        ((at - self.start) / 4) as usize
+    }
+}
+
+/// Graphe de flot de la fonction analysée : blocs de sa plage désassemblée
+/// linéairement, et distance de chacun, en blocs, au watch le plus proche.
+struct Cfg {
+    starts: Vec<u64>,
+    ends: Vec<u64>,
+    distances: Vec<u32>,
+}
+
+impl Cfg {
+    /// `None` : plage inconnue, aucun watch, ou un watch hors de la plage.
+    fn build(ctx: &Ctx, bound: &Bound, watches: &[u64]) -> Option<Cfg> {
+        let (start, end) = (bound.start, bound.end?);
+        if watches.is_empty() || !watches.iter().all(|at| (start..end).contains(at)) {
+            return None;
+        }
+        let graph = FlowGraph::build(ctx, bound)?;
+        let (insns, blocks, tables) = (&graph.insns, &graph.blocks, &graph.tables);
+        let index = |at: u64| graph.index(at);
         let mut cfg = Cfg {
             starts: blocks.iter().map(|&(from, _)| from).collect(),
             ends: blocks.iter().map(|&(_, to)| to).collect(),
@@ -3070,18 +3104,154 @@ fn spans(leaders: &BTreeSet<u64>, start: u64, end: u64) -> Vec<(u64, u64)> {
 /// Cibles du `br` qui termine `block`, lues comme pendant l'exploration, depuis
 /// un état initial pris au début du bloc.
 fn br_targets(ctx: &Ctx, bound: &Bound, block: &[(u64, Decoded)]) -> Option<Vec<u64>> {
+    let target = br_target(ctx, block)?;
+    match target.kind() {
+        Kind::Const(to) | Kind::Global(to) => Some(vec![*to]),
+        _ => jump_table(ctx, bound, &target),
+    }
+}
+
+/// Cible du br qui termine `block`, état pris au début du bloc.
+fn br_target(ctx: &Ctx, block: &[(u64, Decoded)]) -> Option<Expr> {
     let mut state = State::initial();
     for &(addr, ref decoded) in block {
         let (inst, insn) = decoded.as_ref()?;
         let at = At { addr, step: 0 };
         if let Next::JumpVia(target) = state.exec(ctx, inst, &insn.mnemonic, at).next {
-            return match target.expr.kind() {
-                Kind::Const(to) | Kind::Global(to) => Some(vec![*to]),
-                _ => jump_table(ctx, bound, &target.expr),
-            };
+            return Some(target.expr);
         }
     }
     None
+}
+
+/// br vers global(B) + (entrée << 2), l'entrée non signée d'1 octet lue en
+/// xT + xI, ou de 2 octets en xT + (xI << 1), xT posé hors du bloc `first` :
+/// dans `insns`, xT n'est écrit que par une paire adrp + add ou par un seul
+/// adr (bl et blr n'écrivent que x0..x18). n + 1 entrées pour le cmp xI, #n
+/// suivi du b.hi juste avant le bloc. Une cible hors de la plage : rien.
+fn far_table(
+    ctx: &Ctx,
+    bound: &Bound,
+    insns: &[(u64, Decoded)],
+    first: usize,
+    block: &[(u64, Decoded)],
+) -> Option<Vec<u64>> {
+    let target = br_target(ctx, block)?;
+    let sum = Sum::of(&target);
+    let ([term], [], true) = (sum.pos.as_slice(), sum.neg.as_slice(), sum.global) else {
+        return None;
+    };
+    let Kind::Bin(Op::Lsl, entry, shift) = term.kind() else {
+        return None;
+    };
+    if shift.as_const() != Some(2) {
+        return None;
+    }
+    let read = match entry.kind() {
+        Kind::Zext(_, x) => x,
+        _ => entry,
+    };
+    let Kind::Load(width @ (1 | 2), slot) = read.kind() else {
+        return None;
+    };
+    let width = u64::from(*width);
+    let slot = Sum::of(slot);
+    let ([a, b], [], false, 0) = (
+        slot.pos.as_slice(),
+        slot.neg.as_slice(),
+        slot.global,
+        slot.off,
+    ) else {
+        return None;
+    };
+    let resolve = |base: &Expr, index: &Expr| -> Option<(u64, u64)> {
+        let Kind::Init(base) = base.kind() else {
+            return None;
+        };
+        let index = match (index.kind(), width) {
+            (Kind::Init(i), 1) => *i,
+            (Kind::Bin(Op::Lsl, x, k), 2) if k.as_const() == Some(1) => match x.kind() {
+                Kind::Init(i) => *i,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some((
+            far_base(ctx, insns, *base)?,
+            far_count(insns, first, index)?,
+        ))
+    };
+    let (table, entries) = resolve(a, b).or_else(|| resolve(b, a))?;
+    if entries > MAX_TABLE_ENTRIES {
+        return None;
+    }
+    let mut targets = Vec::new();
+    for index in 0..entries {
+        let raw = table_entry(ctx, table.wrapping_add(index * width), width)?;
+        let to = sum.off.wrapping_add(raw << 2);
+        let inside = ctx.image.is_exec(to) && bound.contains(ctx, to);
+        if !inside {
+            return None;
+        }
+        if !targets.contains(&to) {
+            targets.push(to);
+        }
+    }
+    Some(targets)
+}
+
+/// Valeur de `reg` si, dans `insns`, il n'est écrit que par une paire adrp +
+/// add, ou par un seul adr ; un bl ou un blr écrit x0..x18.
+fn far_base(ctx: &Ctx, insns: &[(u64, Decoded)], reg: u8) -> Option<u64> {
+    if reg >= SP {
+        return None;
+    }
+    let mut writers = Vec::new();
+    for (at, decoded) in insns {
+        let Some((inst, insn)) = decoded else {
+            continue;
+        };
+        if matches!(insn.flow, Flow::Call(..) | Flow::CallVia(_)) {
+            if reg <= 18 {
+                return None;
+            }
+            continue;
+        }
+        let made = effect(ctx, inst, &insn.mnemonic, *at);
+        if let Some(&(_, linear)) = made.linear.iter().find(|(r, _)| *r == reg) {
+            writers.push((insn.mnemonic.as_str(), linear));
+        }
+    }
+    match writers.as_slice() {
+        [("adr", Some((EffectBase::Absolute, at)))] => Some(*at as u64),
+        [("adrp", Some((EffectBase::Absolute, page))), ("add", Some((EffectBase::Reg(r), k)))]
+            if *r == reg =>
+        {
+            Some(page.wrapping_add(*k) as u64)
+        }
+        _ => None,
+    }
+}
+
+/// n + 1 pour cmp wI ou xI, #n suivi de b.hi, juste avant l'instruction `first`.
+fn far_count(insns: &[(u64, Decoded)], first: usize, index: u8) -> Option<u64> {
+    let [.., (_, Some((_, cmp))), (_, Some((_, hi)))] = insns.get(..first)? else {
+        return None;
+    };
+    if cmp.mnemonic != "cmp" || hi.mnemonic != "b.hi" {
+        return None;
+    }
+    let (reg, imm) = cmp.operands.trim().split_once(", ")?;
+    let reg = reg.strip_prefix('w').or_else(|| reg.strip_prefix('x'))?;
+    if reg.parse::<u8>().ok()? != index {
+        return None;
+    }
+    let imm = imm.strip_prefix('#')?;
+    let n = match imm.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).ok()?,
+        None => imm.parse::<u64>().ok()?,
+    };
+    n.checked_add(1)
 }
 
 struct Explorer<'c, 'a> {
@@ -3544,6 +3714,171 @@ fn peeked(p: &Peeked) -> SymexPeeked {
 }
 
 /// Étiquettes à définir dans la légende : statuts, raisons, formes, kinds.
+/// Base d'une adresse lue ou écrite par une instruction exécutée seule :
+/// valeur d'un registre x ou sp avant l'instruction, adresse absolue, ou
+/// autre calcul.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum EffectBase {
+    Reg(u8),
+    Absolute,
+    Other,
+}
+
+/// Origine possible d'un octet écrit par une instruction exécutée seule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum ByteFrom {
+    /// Octet d'un registre avant l'instruction : x0..x30, sp (31), q0..q31 (32..63).
+    Reg(u8, u8),
+    /// Octet lu à base + décalage.
+    Mem(EffectBase, i64),
+    Const(u64),
+    Global(u64),
+    Unknown,
+}
+
+/// Effet d'une instruction exécutée seule par [`State::exec`], chaque
+/// registre valant sa valeur d'avant. Partagé avec `--native-slice`.
+pub(super) struct Effect {
+    /// Registres écrits, x0..x30, sp, q0..q31 : origines de chaque octet.
+    pub(super) regs: Vec<(u8, Vec<Vec<ByteFrom>>)>,
+    /// Registres x et sp écrits : base + constante, ou `None`.
+    pub(super) linear: Vec<(u8, Option<(EffectBase, i64)>)>,
+    /// Octets rangés : base, décalage, origines.
+    pub(super) stores: Vec<(EffectBase, i64, Vec<ByteFrom>)>,
+    /// Zones au contenu perdu : base, début, fin.
+    pub(super) lost: Vec<(EffectBase, i64, Option<i64>)>,
+}
+
+pub(super) fn effect(ctx: &Ctx, inst: &Instruction, mnemonic: &str, at: u64) -> Effect {
+    let mut state = State::initial();
+    state.exec(ctx, inst, mnemonic, At { addr: at, step: 0 });
+    let mut regs = Vec::new();
+    let mut linear = Vec::new();
+    for r in 0..=SP {
+        let expr = &state.x[usize::from(r)].expr;
+        if *expr == Expr::init(r) {
+            continue;
+        }
+        regs.push((r, (0..8).map(|i| byte_origins(expr, i)).collect()));
+        linear.push((r, linear_of(expr)));
+    }
+    for r in 0..32u8 {
+        let reg = V0 + r;
+        let cells = &state.v[usize::from(r)];
+        let kept = |i: usize, c: &Cell| usize::from(c.byte) == i && c.value == Expr::init(reg);
+        if cells.iter().enumerate().all(|(i, c)| kept(i, c)) {
+            continue;
+        }
+        let byte = |(i, c): (usize, &Cell)| {
+            if kept(i, c) {
+                vec![ByteFrom::Reg(reg, i as u8)]
+            } else {
+                byte_origins(&c.value, c.byte)
+            }
+        };
+        regs.push((reg, cells.iter().enumerate().map(byte).collect()));
+    }
+    let mut stores = Vec::new();
+    for (base, cells) in &state.mem.bases {
+        for (&off, cell) in cells.iter() {
+            stores.push((effect_base(base), off, byte_origins(&cell.value, cell.byte)));
+        }
+    }
+    stores.sort_by_key(|&(_, off, _)| off);
+    let lost = state.mem.zones.iter();
+    let lost = lost.map(|z| (effect_base(&z.base), z.from, z.to)).collect();
+    Effect {
+        regs,
+        linear,
+        stores,
+        lost,
+    }
+}
+
+fn effect_base(base: &Expr) -> EffectBase {
+    match base.kind() {
+        Kind::Init(r) if *r <= SP => EffectBase::Reg(*r),
+        Kind::Global(0) => EffectBase::Absolute,
+        _ => EffectBase::Other,
+    }
+}
+
+fn linear_of(e: &Expr) -> Option<(EffectBase, i64)> {
+    let sum = Sum::of(e);
+    match (sum.pos.as_slice(), sum.neg.as_slice()) {
+        ([], []) => Some((EffectBase::Absolute, sum.off as i64)),
+        ([term], []) if !sum.global => match term.kind() {
+            Kind::Init(r) if *r <= SP => Some((EffectBase::Reg(*r), sum.off as i64)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Origines de l'octet `byte` (petit-boutiste) de `e` : opérandes d'un
+/// calcul, octet lu, constante.
+fn byte_origins(e: &Expr, byte: u8) -> Vec<ByteFrom> {
+    match e.kind() {
+        Kind::Const(value) => vec![ByteFrom::Const(*value)],
+        Kind::Global(at) => vec![ByteFrom::Global(*at)],
+        Kind::Init(reg) => vec![ByteFrom::Reg(*reg, byte)],
+        Kind::Zext(bits, x) | Kind::Trunc(bits, x) if u32::from(byte) * 8 < u32::from(*bits) => {
+            byte_origins(x, byte)
+        }
+        Kind::Zext(..) | Kind::Trunc(..) => vec![ByteFrom::Const(0)],
+        Kind::Sext(bits, x) => byte_origins(x, byte.min((bits / 8).saturating_sub(1))),
+        Kind::Load(size, _) if byte >= *size => vec![ByteFrom::Const(0)],
+        Kind::Load(_, addr) => {
+            let (base, off) = split(addr);
+            vec![ByteFrom::Mem(
+                effect_base(&base),
+                off.wrapping_add(i64::from(byte)),
+            )]
+        }
+        Kind::Unknown(..) => vec![ByteFrom::Unknown],
+        Kind::Bin(..) | Kind::Ite(..) => {
+            let mut found = Vec::new();
+            operands(e, byte, &mut found);
+            if found.is_empty() {
+                constants(e, &mut found);
+            }
+            if found.is_empty() {
+                found.push(ByteFrom::Unknown);
+            }
+            found
+        }
+    }
+}
+
+fn operands(e: &Expr, byte: u8, out: &mut Vec<ByteFrom>) {
+    match e.kind() {
+        Kind::Bin(_, a, b) | Kind::Ite(_, a, b) => {
+            operands(a, byte, out);
+            operands(b, byte, out);
+        }
+        Kind::Const(_) | Kind::Global(_) => {}
+        _ => {
+            for found in byte_origins(e, byte) {
+                if !out.contains(&found) {
+                    out.push(found);
+                }
+            }
+        }
+    }
+}
+
+fn constants(e: &Expr, out: &mut Vec<ByteFrom>) {
+    match e.kind() {
+        Kind::Bin(_, a, b) | Kind::Ite(_, a, b) => {
+            constants(a, out);
+            constants(b, out);
+        }
+        Kind::Const(value) => out.push(ByteFrom::Const(*value)),
+        Kind::Global(at) => out.push(ByteFrom::Global(*at)),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 fn labels() -> Vec<&'static str> {
     let mut labels = vec![
@@ -3915,6 +4250,51 @@ mod tests {
         assert_eq!(loose.bound, BOUND_NONE);
         assert_eq!(loose.fn_end, None);
         assert_eq!(loose.paths_explored, 5);
+    }
+
+    /// Table dont la base x25 est posée 8 instructions avant le br ; 3 cas.
+    const FAR_SWITCH: &[(u32, &str)] = &[
+        (0x90000019, "1000  adrp  x25, 0x1000"),
+        (0x91040339, "1004  add   x25, x25, #0x100"),
+        (0xd503201f, "1008  nop"),
+        (0xd503201f, "100c  nop"),
+        (0x7100091f, "1010  cmp   w8, #0x2"),
+        (0x54000148, "1014  b.hi  0x103c"),
+        (0x10000089, "1018  adr   x9, 0x1028"),
+        (0x38686b2a, "101c  ldrb  w10, [x25, x8]"),
+        (0x8b0a0929, "1020  add   x9, x9, x10, lsl #2"),
+        (0xd61f0120, "1024  br    x9"),
+        (0xd2800020, "1028  mov   x0, #1"),
+        (0xd65f03c0, "102c  ret"),
+        (0xd2800040, "1030  mov   x0, #2"),
+        (0xd65f03c0, "1034  ret"),
+        (0xd2800060, "1038  mov   x0, #3"),
+        (0xd65f03c0, "103c  ret"),
+    ];
+
+    /// Tables du graphe de flot de la fonction CODE de 0x40 octets ; la
+    /// quatrième entrée, dans la fonction, est au-delà de la borne du cmp.
+    fn far_tables(code: &[(u32, &str)]) -> HashMap<u64, Vec<u64>> {
+        let mut data = vec![0u8; 0x2000];
+        assemble_at(&mut data, CODE, code);
+        put(&mut data, 0x1100, &[0, 2, 4, 1]);
+        let mut ctx = plain(&data);
+        function(&mut ctx, CODE, 0x40);
+        let bound = Bound::of(&ctx, &[], CODE);
+        FlowGraph::build(&ctx, &bound).unwrap().tables
+    }
+
+    #[test]
+    fn a_table_whose_base_is_set_far_from_the_br_is_resolved() {
+        let tables = far_tables(FAR_SWITCH);
+        assert_eq!(tables.get(&0x1024), Some(&vec![0x1028, 0x1030, 0x1038]));
+    }
+
+    #[test]
+    fn a_far_table_base_written_twice_is_not_resolved() {
+        let mut code = FAR_SWITCH.to_vec();
+        code[3] = (0xaa0103f9, "100c  mov   x25, x1");
+        assert!(!far_tables(&code).contains_key(&0x1024));
     }
 
     #[test]

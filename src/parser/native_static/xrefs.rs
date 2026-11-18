@@ -29,7 +29,7 @@ const KIND_LOAD: &str = "load";
 const KIND_STORE: &str = "store";
 
 /// Par cible, dans l'ordre des cibles : (adresse, détail), avant tri et coupe.
-type Found<T> = Vec<Vec<(u64, T)>>;
+pub(super) type Found<T> = Vec<Vec<(u64, T)>>;
 
 /// `--native-xrefs <elf|*>@<adresse>[,<adresse>...]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,8 +270,8 @@ fn access_kind(access: Access) -> &'static str {
 /// Mots de 8 octets alignés sur 8 des zones de données, égaux à une cible tels
 /// quels dans le fichier, ou après relocation relative : (section, relogé).
 /// Sont exclues les sections de [`is_link_metadata`] et les plages de fichier
-/// `tables`.
-fn data_words(
+/// `tables`. Partagé avec `--native-async-graph`.
+pub(super) fn data_words(
     ctx: &Ctx,
     tables: &[(u64, u64)],
     index: &HashMap<u64, usize>,

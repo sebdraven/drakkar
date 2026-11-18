@@ -31,8 +31,8 @@ pub const SECTIONS_NOT_SCANNED: &str =
     ".eh_frame .eh_frame_hdr .gcc_except_table .got .got.plt .data.rel.ro";
 
 const BOUNDARY_NUL: &str = "nul";
-const BOUNDARY_FATPTR: &str = "rust_fatptr";
-const BOUNDARY_CODE: &str = "rust_code";
+pub(super) const BOUNDARY_FATPTR: &str = "rust_fatptr";
+pub(super) const BOUNDARY_CODE: &str = "rust_code";
 const BOUNDARY_HEURISTIC: &str = "heuristic";
 
 const ENCODING_ASCII: &str = "ascii";
@@ -908,9 +908,18 @@ pub(super) struct Referenced {
 /// par défaut, qui ont au moins une référence, triées par adresse ; et les
 /// bornes qui donnent leur fn_start.
 pub(super) fn referenced(bytes: &[u8]) -> Result<(Vec<Referenced>, Bounds), String> {
+    referenced_from(bytes, DEFAULT_MIN_LENGTH)
+}
+
+/// [`referenced`] à la longueur minimale `min_length`. Partagé avec
+/// `--native-fields`.
+pub(super) fn referenced_from(
+    bytes: &[u8],
+    min_length: usize,
+) -> Result<(Vec<Referenced>, Bounds), String> {
     let options = Options {
         patterns: Vec::new(),
-        min_length: DEFAULT_MIN_LENGTH,
+        min_length,
         elf: None,
         xrefs: true,
         crates: false,

@@ -122,6 +122,9 @@ published empirical values.
 | `--native --native-vtables <elf\|*>` | the Rust method tables (vtables) of an AArch64 ELF, found by their shape in read-only and RELRO data, without executing anything: destructor, size, alignment and methods of each, filtered by function, slot offset, size or start address, and on request the instructions and data words that carry each table's address. |
 | `--native --native-labels <elf\|*>` | per function of an AArch64 ELF, the strings it references and a reading label drawn from them (function name from a log message, else bracketed log tag, else Rust source path), without executing anything: the inverse index of `--native-strings --xrefs`, with strings of small outlined fragments also given to their callers, and those of widely shared fragments set apart. |
 | `--native --native-find <elf\|*> --native-find-off=<off>[,<off>…]` | over the whole code of an AArch64 ELF, the instructions that read or write a structure field at a given offset from a base register (`ldr`/`str` families, pairs included) or form its address (`add`/`sub` immediate), without executing anything: per-function counts by offset, to find the functions that copy a field from one structure to another. |
+| `--native --native-slice <elf\|*>@<fn> --native-slice-at=<addr>:<loc>[,…]` | where a value comes from: from a register or a memory zone read just before an instruction, the data flow graph of an AArch64 function walked backwards on all paths at once until a fixed point, without executing anything: arguments, initial memory, constants, addresses, calls that may write it, each with a witness chain of defining instructions. |
+| `--native --native-async-graph <elf\|*> --native-async-from=… \| --native-async-to=… \| --native-async-path=<a>:<b>` | a graph of the functions of an AArch64 ELF whose edges are direct calls and the creation of Rust method tables (async tasks, trait objects), each with its proof, without executing anything: descendants, ancestors, or shortest paths from one function to another across indirect calls. |
+| `--native --native-fields <elf\|*>` | per function of an AArch64 ELF, the field names a generated deserializer (serde, prost) references, without executing anything: the structures the binary reads from JSON or protobuf, with the instructions that form each name's address and the callers of each function. |
 | `--native-strings [PATTERN…]` | the strings of every ELF (APK, XAPK splits, raw ELF), each with how its bound was found: NUL byte, Rust `{ptr, len}` pair rebuilt through relative relocations, AArch64 immediate length next to the address, or an unsplit heuristic block. `--xrefs`: the instructions that form each address, over the whole code, with the enclosing function from symbols or `.eh_frame`. `--crates`: Rust crates named by source paths, banners of statically linked C libraries. Cryptographic constants recognised by content. JSON streamed to `--json-out`. |
 
 `--native-disasm` follows paths, not bytes: a function stops at a return, a
@@ -363,6 +366,121 @@ offset in a register, or a copy through `memcpy`, escapes the mode; the
 limits of the code walk apply (only executable sections described by
 section headers are read, data words inside code are read as
 instructions).
+
+`--native-slice=<elf|*>@<fn>` answers "where does this value come from?"
+by walking backwards from the value, on every path of the function at once,
+without enumerating paths: at each point of the data flow graph, the set of
+locations still sought; each instruction walked back transforms it, a join is
+a union, a loop runs to a fixed point. `--native-slice-at=<addr>:<loc>[,…]`
+is required: 1 to 16 queries, `<loc>` being a register (`x8`, `sp`) or
+`<reg>+<off>:<len>` (`x0+0x5a9:1`, `sp+0x1c61:1`, length 1 to 64) read with
+the register's value just before the instruction at `<addr>`. A memory
+location is a base plus an offset over n bytes, the base being the stack
+pointer or a register at function entry, an absolute address, or a value
+written by an instruction; two different bases are assumed disjoint, as in
+`--native-symex`. Rules: a copy or an arithmetic operation between registers
+turns the location into its register operands (adding a constant to a base
+register adjusts the offset); a load turns the register into the zone read; a
+store over the zone turns the covered part into the stored register, the rest
+keeps going up; a constant or a formed address is a `const` or `global`
+source; `memcpy` and its variants map the part covered by the destination to
+the matching part of the source; an outlined fragment (a function of 64 bytes
+at most) is always walked through; another call is followed, up to
+`--native-slice-depth` levels (default 1, max 4) or for the call addresses in
+`--native-slice-follow`, when the location is a register AAPCS64 does not
+preserve or a zone whose base is passed in x0–x8, else it is a `call`
+source; preserved registers and zones whose base is not passed cross the
+call; an indirect call is an `indirect_call` source with its target
+expression when known; the function entry gives `arg` or `init_mem`.
+`--native-slice-max-steps` bounds the fixed point per query (default 200000),
+`--native-slice-max-sources` caps the sources rendered per query (default
+200, `sources_total` stays exact). Example: `--native
+--native-slice='lib/arm64-v8a/libapp.so@0x2f000'
+--native-slice-at=0x2f3c0:x0+0x5a9:1,0x2f3d4:x8`. Each `slices[]` entry
+carries `elf`, `fn_start`, `fn_end`, `bound` and `queries[]`: `at`,
+`location`, `complete` (false when the budget or the cap was reached),
+`steps`, `sources_total`, `sources_truncated`, `sources[]` with `kind`
+(`arg`, `init_mem`, `const`, `global`, `call`, `indirect_call`, `unknown`),
+`location` or `value`, `insn_addr`, `call_target`, `reason` (for `unknown`),
+`bytes` (the part of the requested location covered) and `chain[]` (a witness
+chain of defining instructions from the source to the query, at most 64,
+`chain_truncated`). Limits: every path of the flow graph is covered,
+impossible ones included, so sources may be too many, never too few within
+the model and the budget, and `complete` says whether the budget cut; memory
+bases are assumed disjoint, so a write through a pointer computed otherwise is
+not seen; a write made by a callee that is not followed comes out as a `call`
+source, not as a value; an unresolved indirect jump cuts the walk on that
+path with an `unknown` source. The `--native --legend` section SLICE defines
+every field.
+
+`--native-async-graph=<elf|*>` builds, for an AArch64 ELF, a graph whose
+nodes are the bounded functions (by their start) and whose edges carry their
+proof: `call` when F holds a `bl` or `b` whose destination is exactly the
+start of G (`insn_addr`), `makes` when F forms the start address of a Rust
+method table T (detected as in `--native-vtables`) and G is T's destructor or
+one of its methods (`insn_addr`, `adrp_addr`, `table`, `offset` of G in T).
+In Rust an async task or a closure passed as a trait object is such a table,
+and the code that creates the object forms its address: "who makes which
+table" extends the call graph across indirect calls, to answer "how do we get
+from function A to function B". An edge leaving an outlined fragment (64
+bytes at most) is replaced by one edge from each of its callers, with
+`via_fragment`. Data words equal to a table address are listed apart in
+`stores[]`, never as edges. At least one query is required:
+`--native-async-from=<a1>[,…]` (descendants of the functions containing these
+addresses), `--native-async-to=<a1>[,…]` (ancestors), and
+`--native-async-path=<a>:<b>[,…]` (shortest paths from the function containing
+a to the one containing b, at most 16 per pair, all of minimal length);
+`--native-async-depth` bounds from and to (default 4) and the path length
+(default 12), at most 12; `--native-async-max` caps the nodes rendered per
+query (default 500, totals exact); `--native-async-kinds` keeps a subset of
+`call,makes`. Example: `--native
+--native-async-graph='lib/arm64-v8a/libapp.so'
+--native-async-path=0x2f3c0:0x41a00`. Each `async_graph[]` entry carries
+`elf`, `tables_total` and `queries[]`: `kind` (`from`, `to`, `path`),
+`requested`, `resolved`, `nodes_total`, `edges_total`, `paths_total` (path),
+`truncated`, `nodes[]` (`fn_start`, `fn_end`, `bound`, `depth`), `edges[]`
+(`from`, `to`, `kind`, `insn_addr`, `adrp_addr`, `table`, `offset`,
+`via_fragment` as the kind requires), `paths[]` (path, each a sequence of
+edges) and `stores[]` (`table`, `vaddr` of the word). An address outside every
+bounded function is an error naming it. Limits: `makes` says that F creates an
+object of which G is a method, not that G is called, nor when; a table passed
+through a structure field or an argument escapes the graph, only its creation
+is seen; the limits of table detection and of reference search apply; a path
+is a possible path, not an executed one. The `--native --legend` section
+ASYNC_GRAPH defines every field.
+
+`--native-fields=<elf|*>` lists, per function of an AArch64 ELF, the field
+names it references: a deserializer generated by serde or prost references
+the name of each field in the same function, often several times, so the
+functions that reference many names are the structures the binary reads from
+JSON or protobuf. A candidate field name is a string of 2 to 64 characters
+with proven bounds (`rust_fatptr` or `rust_code`) shaped like an identifier
+(ASCII letter or `_`, then letters, digits or `_`); a string referenced in an
+outlined fragment is given to each of its callers (`via_fragment`), as in
+`--native-labels`, and set aside when the fragment has more than
+`--native-fields-fragment-fanout` callers (default 8); a candidate
+deserializer references at least `--native-fields-min` distinct candidate
+names (default 3). Filters, combined with AND: `--native-fields-fn=<a1>[,…]`
+(1 to 64 addresses, functions that contain one, the candidacy condition then
+does not apply) and `--native-fields-name=<n1>[,…]` (exact names, case
+sensitive); `--native-fields-max` caps the functions rendered (default 1000,
+totals exact). The mode does not compute where a field is stored: `sites`
+gives the instructions to start from with `--native-slice` or
+`--native-symex`. Example: `--native
+--native-fields='lib/arm64-v8a/libapp.so' --native-fields-name=access_token`.
+Each `fields[]` entry carries `elf`, `functions_total`, `functions_matched`,
+`truncated` and `functions[]` sorted by `fn_start`: `fn_start`, `fn_end`,
+`bound`, `struct_names[]` (referenced strings shaped like a type name, such
+as `BabaAccountPb`), `fields_count`, `fields[]` sorted by first instruction
+(`name`, `vaddr`, `boundary`, `sites[]`, `sites_count`, `via_fragment`) and
+`callers[]` (direct `bl`/`b` to the function start: `insn_addr` and the
+enclosing function). Limits: a referenced identifier is not necessarily a
+field (column names, configuration keys and enum variants have the same
+shape); a function that reads its names through a data table rather than
+through addresses formed in code escapes the mode; the mode says neither where
+a field is stored nor its type; the limits of string references and of
+fragment attachment apply. The `--native --legend` section FIELDS defines
+every field.
 
 It does not execute or emulate, and runs symbolically only under
 `--native-symex`, without a solver; it does not follow `JNIEnv`

@@ -309,6 +309,104 @@ struct Cli {
     #[arg(long, value_name = "N")]
     native_find_max: Option<usize>,
 
+    /// (--native) D'où vient une valeur : remontée du graphe de flot de la
+    /// fonction AArch64 `<elf|*>@<début>` (hexadécimal) depuis chaque
+    /// --native-slice-at, sur tous les chemins, sans exécution (--native
+    /// --legend, section SLICE).
+    #[arg(long, value_name = "SPEC")]
+    native_slice: Option<String>,
+
+    /// (--native-slice) Obligatoire. Requêtes `<adresse>:<emplacement>` (1 à
+    /// 16) : registre (x8) ou `<registre>+<décalage>:<longueur>` (x0+0x5a9:1),
+    /// lu juste avant l'instruction à cette adresse.
+    #[arg(long, value_name = "REQUÊTES", value_delimiter = ',')]
+    native_slice_at: Vec<String>,
+
+    /// (--native-slice) Niveaux de fonctions appelées suivies. Défaut 1, max 4.
+    #[arg(long, value_name = "N")]
+    native_slice_depth: Option<u8>,
+
+    /// (--native-slice) Appels suivis quelle que soit la profondeur, adresses
+    /// hexadécimales du bl (ou du b) séparées par des virgules.
+    #[arg(long, value_name = "ADRESSES", value_delimiter = ',')]
+    native_slice_follow: Vec<String>,
+
+    /// (--native-slice) Budget d'itérations du point fixe par requête. Défaut
+    /// 200000.
+    #[arg(long, value_name = "N")]
+    native_slice_max_steps: Option<usize>,
+
+    /// (--native-slice) Sources rendues au plus par requête ; sources_total
+    /// reste exact. Défaut 200.
+    #[arg(long, value_name = "N")]
+    native_slice_max_sources: Option<usize>,
+
+    /// (--native) Graphe des fonctions d'un ELF AArch64, arêtes d'appel direct
+    /// et de fabrication de tables de méthodes Rust, sans exécution : `<elf|*>`,
+    /// avec au moins une requête (--native --legend, section ASYNC_GRAPH).
+    #[arg(long, value_name = "ELF")]
+    native_async_graph: Option<String>,
+
+    /// (--native-async-graph) Descendants des fonctions qui contiennent ces
+    /// adresses hexadécimales (1 à 64).
+    #[arg(long, value_name = "ADRESSES", value_delimiter = ',')]
+    native_async_from: Vec<String>,
+
+    /// (--native-async-graph) Ascendants des fonctions qui contiennent ces
+    /// adresses hexadécimales (1 à 64).
+    #[arg(long, value_name = "ADRESSES", value_delimiter = ',')]
+    native_async_to: Vec<String>,
+
+    /// (--native-async-graph) Plus courts chemins `<a>:<b>` de la fonction qui
+    /// contient a à celle qui contient b, au plus 16 par couple.
+    #[arg(long, value_name = "COUPLES", value_delimiter = ',')]
+    native_async_path: Vec<String>,
+
+    /// (--native-async-graph) Profondeur maximale pour from et to (défaut 4),
+    /// longueur maximale d'un chemin pour path (défaut 12) ; max 12.
+    #[arg(long, value_name = "N")]
+    native_async_depth: Option<u8>,
+
+    /// (--native-async-graph) Nœuds rendus au plus par requête ; les totaux
+    /// restent exacts. Défaut 500.
+    #[arg(long, value_name = "N")]
+    native_async_max: Option<usize>,
+
+    /// (--native-async-graph) Sous-ensemble de call, makes. Défaut les deux.
+    #[arg(long, value_name = "SORTES", value_delimiter = ',')]
+    native_async_kinds: Vec<String>,
+
+    /// (--native) Par fonction d'un ELF AArch64, les noms de champs que
+    /// référence un désérialiseur (serde, prost), sans exécution : `<elf|*>`
+    /// (--native --legend, section FIELDS).
+    #[arg(long, value_name = "ELF")]
+    native_fields: Option<String>,
+
+    /// (--native-fields) Seulement les fonctions qui contiennent l'une de ces
+    /// adresses hexadécimales (1 à 64), candidates ou non.
+    #[arg(long, value_name = "ADRESSES", value_delimiter = ',')]
+    native_fields_fn: Vec<String>,
+
+    /// (--native-fields) Seulement les fonctions qui référencent l'un de ces
+    /// noms exacts, casse comprise.
+    #[arg(long, value_name = "NOMS", value_delimiter = ',')]
+    native_fields_name: Vec<String>,
+
+    /// (--native-fields) Noms candidats distincts au moins d'un désérialiseur
+    /// candidat. Défaut 3.
+    #[arg(long, value_name = "N")]
+    native_fields_min: Option<usize>,
+
+    /// (--native-fields) Un nom rattaché par un fragment appelé par plus de N
+    /// fonctions n'est ni compté ni rendu. Défaut 8.
+    #[arg(long, value_name = "N")]
+    native_fields_fragment_fanout: Option<usize>,
+
+    /// (--native-fields) Fonctions rendues au plus par ELF ; les totaux
+    /// restent exacts. Défaut 1000.
+    #[arg(long, value_name = "N")]
+    native_fields_max: Option<usize>,
+
     /// (--native-disasm) Racine de désassemblage en plus des points d'entrée
     /// JNI : nom d'un symbole défini, ou adresse `0x…` (ARM 32 bits : bit 0 =
     /// Thumb ; `t:` ou `a:` force le mode). Répétable. Introuvable : WARN.
@@ -992,6 +1090,61 @@ fn main() -> Result<()> {
              --native-find-in et --native-find-max n'ont d'effet qu'avec --native-find"
         );
     }
+    if cli.native_slice.is_some() && !cli.native {
+        bail!(
+            "--native-slice requiert --native : drakkar <APK|ELF> --native \
+             --native-slice <elf|*>@<début> --native-slice-at=<adresse>:<emplacement>[,...]"
+        );
+    }
+    let slice_tuning = !cli.native_slice_at.is_empty()
+        || cli.native_slice_depth.is_some()
+        || !cli.native_slice_follow.is_empty()
+        || cli.native_slice_max_steps.is_some()
+        || cli.native_slice_max_sources.is_some();
+    if slice_tuning && cli.native_slice.is_none() {
+        bail!(
+            "--native-slice-at, --native-slice-depth, --native-slice-follow, \
+             --native-slice-max-steps et --native-slice-max-sources n'ont d'effet qu'avec \
+             --native-slice"
+        );
+    }
+    if cli.native_async_graph.is_some() && !cli.native {
+        bail!(
+            "--native-async-graph requiert --native : drakkar <APK|ELF> --native \
+             --native-async-graph <elf|*> --native-async-from=<adresse>[,...]"
+        );
+    }
+    let async_tuning = !cli.native_async_from.is_empty()
+        || !cli.native_async_to.is_empty()
+        || !cli.native_async_path.is_empty()
+        || cli.native_async_depth.is_some()
+        || cli.native_async_max.is_some()
+        || !cli.native_async_kinds.is_empty();
+    if async_tuning && cli.native_async_graph.is_none() {
+        bail!(
+            "--native-async-from, --native-async-to, --native-async-path, \
+             --native-async-depth, --native-async-max et --native-async-kinds n'ont d'effet \
+             qu'avec --native-async-graph"
+        );
+    }
+    if cli.native_fields.is_some() && !cli.native {
+        bail!(
+            "--native-fields requiert --native : drakkar <APK|ELF> --native \
+             --native-fields <elf|*>"
+        );
+    }
+    let fields_tuning = !cli.native_fields_fn.is_empty()
+        || !cli.native_fields_name.is_empty()
+        || cli.native_fields_min.is_some()
+        || cli.native_fields_fragment_fanout.is_some()
+        || cli.native_fields_max.is_some();
+    if fields_tuning && cli.native_fields.is_none() {
+        bail!(
+            "--native-fields-fn, --native-fields-name, --native-fields-min, \
+             --native-fields-fragment-fanout et --native-fields-max n'ont d'effet qu'avec \
+             --native-fields"
+        );
+    }
     let native_strings_tuning =
         cli.min_length.is_some() || cli.elf.is_some() || cli.xrefs || cli.crates;
     if native_strings_tuning && cli.native_strings.is_none() {
@@ -1104,6 +1257,9 @@ fn main() -> Result<()> {
         let vtables = vtables_options(&cli)?;
         let labels = labels_options(&cli)?;
         let find = find_options(&cli)?;
+        let (slice_spec, slice) = slice_options(&cli)?;
+        let async_graph = async_graph_options(&cli)?;
+        let fields = fields_options(&cli)?;
         let mut options = parser::native_static::DisasmOptions::default();
         if let Some(depth) = cli.disasm_depth {
             options.depth = depth;
@@ -1144,6 +1300,9 @@ fn main() -> Result<()> {
         parser::native_static::add_vtables(&mut report, input, splits, vtables.as_ref());
         parser::native_static::add_labels(&mut report, input, splits, labels.as_ref());
         parser::native_static::add_find(&mut report, input, splits, find.as_ref());
+        parser::native_static::add_slice(&mut report, input, splits, slice_spec.as_ref(), &slice);
+        parser::native_static::add_async_graph(&mut report, input, splits, async_graph.as_ref());
+        parser::native_static::add_fields(&mut report, input, splits, fields.as_ref());
         if cli.format.wants_text() {
             print_native(&report, cli.disasm_full);
         }
@@ -2596,6 +2755,18 @@ fn print_native(r: &drakkar::parser::native_static::NativeReport, full: bool) {
         print_find(f);
     }
 
+    for s in &r.slices {
+        print_slice(s);
+    }
+
+    for g in &r.async_graph {
+        print_async_graph(g);
+    }
+
+    for f in &r.fields {
+        print_fields(f);
+    }
+
     if !r.errors.is_empty() {
         println!("\nNon lu ({}) :", r.errors.len());
         for err in &r.errors {
@@ -3035,6 +3206,262 @@ fn find_options(cli: &Cli) -> Result<Option<parser::native_static::FindOptions>>
         options.max = max;
     }
     Ok(Some(options))
+}
+
+/// `--native-slice` : la fonction et ses réglages, `None` sans --native-slice.
+fn slice_options(
+    cli: &Cli,
+) -> Result<(
+    Option<parser::native_static::ListingSpec>,
+    parser::native_static::SliceOptions,
+)> {
+    use parser::native_static::{
+        parse_slice_at, parse_symex_address, parse_symex_spec, SliceOptions, MAX_SLICE_DEPTH,
+    };
+    let mut options = SliceOptions::default();
+    let Some(spec) = &cli.native_slice else {
+        return Ok((None, options));
+    };
+    let parsed = match parse_symex_spec(spec) {
+        Ok(parsed) => parsed,
+        Err(why) => bail!("--native-slice {spec:?} : {why}"),
+    };
+    match parse_slice_at(&cli.native_slice_at) {
+        Ok(queries) => options.queries = queries,
+        Err(why) => bail!("--native-slice-at (obligatoire) : {why}"),
+    }
+    if let Some(depth) = cli.native_slice_depth {
+        if depth > MAX_SLICE_DEPTH {
+            bail!("--native-slice-depth vaut au plus {MAX_SLICE_DEPTH}");
+        }
+        options.depth = depth;
+    }
+    for text in &cli.native_slice_follow {
+        match parse_symex_address(text) {
+            Ok(at) if options.follow.contains(&at) => {}
+            Ok(at) => options.follow.push(at),
+            Err(why) => bail!("--native-slice-follow : {why}"),
+        }
+    }
+    if let Some(max_steps) = cli.native_slice_max_steps {
+        if max_steps == 0 {
+            bail!("--native-slice-max-steps doit valoir au moins 1");
+        }
+        options.max_steps = max_steps;
+    }
+    if let Some(max_sources) = cli.native_slice_max_sources {
+        options.max_sources = max_sources;
+    }
+    Ok((Some(parsed), options))
+}
+
+fn async_graph_options(cli: &Cli) -> Result<Option<parser::native_static::AsyncGraphOptions>> {
+    use parser::native_static::{
+        check_async_queries, parse_async_kinds, parse_async_paths, parse_vtables_addresses,
+        parse_vtables_elf, AsyncGraphOptions, MAX_ASYNC_DEPTH,
+    };
+    let Some(spec) = &cli.native_async_graph else {
+        return Ok(None);
+    };
+    let mut options = AsyncGraphOptions::default();
+    match parse_vtables_elf(spec) {
+        Ok(elf) => options.elf = elf,
+        Err(why) => bail!("--native-async-graph {spec:?} : {why}"),
+    }
+    match parse_vtables_addresses(&cli.native_async_from) {
+        Ok(from) => options.from = from,
+        Err(why) => bail!("--native-async-from : {why}"),
+    }
+    match parse_vtables_addresses(&cli.native_async_to) {
+        Ok(to) => options.to = to,
+        Err(why) => bail!("--native-async-to : {why}"),
+    }
+    if !cli.native_async_path.is_empty() {
+        match parse_async_paths(&cli.native_async_path) {
+            Ok(paths) => options.paths = paths,
+            Err(why) => bail!("--native-async-path : {why}"),
+        }
+    }
+    if let Err(why) = check_async_queries(&options) {
+        bail!("--native-async-graph {spec:?} : {why}");
+    }
+    if let Some(depth) = cli.native_async_depth {
+        if depth > MAX_ASYNC_DEPTH {
+            bail!("--native-async-depth vaut au plus {MAX_ASYNC_DEPTH}");
+        }
+        options.depth = Some(depth);
+    }
+    if let Some(max) = cli.native_async_max {
+        options.max = max;
+    }
+    if !cli.native_async_kinds.is_empty() {
+        match parse_async_kinds(&cli.native_async_kinds) {
+            Ok(kinds) => options.kinds = kinds,
+            Err(why) => bail!("--native-async-kinds : {why}"),
+        }
+    }
+    Ok(Some(options))
+}
+
+fn fields_options(cli: &Cli) -> Result<Option<parser::native_static::FieldsOptions>> {
+    use parser::native_static::{
+        parse_fields_names, parse_vtables_addresses, parse_vtables_elf, FieldsOptions,
+    };
+    let Some(spec) = &cli.native_fields else {
+        return Ok(None);
+    };
+    let mut options = FieldsOptions::default();
+    match parse_vtables_elf(spec) {
+        Ok(elf) => options.elf = elf,
+        Err(why) => bail!("--native-fields {spec:?} : {why}"),
+    }
+    match parse_vtables_addresses(&cli.native_fields_fn) {
+        Ok(functions) => options.functions = functions,
+        Err(why) => bail!("--native-fields-fn : {why}"),
+    }
+    match parse_fields_names(&cli.native_fields_name) {
+        Ok(names) => options.names = names,
+        Err(why) => bail!("--native-fields-name : {why}"),
+    }
+    if let Some(min) = cli.native_fields_min {
+        options.min = min;
+    }
+    if let Some(fanout) = cli.native_fields_fragment_fanout {
+        options.fragment_fanout = fanout;
+    }
+    if let Some(max) = cli.native_fields_max {
+        options.max = max;
+    }
+    Ok(Some(options))
+}
+
+/// Une ligne par ELF de `--native-fields`, une par fonction, une par champ.
+fn print_fields(f: &drakkar::parser::native_static::FieldsReport) {
+    let suffix = if f.truncated { " (tronqué)" } else { "" };
+    println!(
+        "\nFields {}  candidates {}  retenues {}{suffix} :",
+        f.elf, f.functions_total, f.functions_matched
+    );
+    for function in &f.functions {
+        let end = function.fn_end.as_deref().unwrap_or("?");
+        let callers: Vec<&str> = function
+            .callers
+            .iter()
+            .map(|c| c.insn_addr.as_str())
+            .collect();
+        println!(
+            "  {}-{end} ({})  champs {}  types [{}]  appelants [{}]",
+            function.fn_start,
+            function.bound,
+            function.fields_count,
+            function.struct_names.join(", "),
+            callers.join(" ")
+        );
+        for field in &function.fields {
+            let via = field
+                .via_fragment
+                .as_deref()
+                .map_or_else(String::new, |v| format!("  via {v}"));
+            println!(
+                "    {:<24} {}  {}  {}{via}",
+                field.name,
+                field.vaddr,
+                field.boundary,
+                field.sites.join(" ")
+            );
+        }
+    }
+}
+
+/// Une ligne par ELF de `--native-async-graph`, une par requête, puis ses
+/// nœuds, arêtes, chemins et mots de données.
+fn print_async_graph(g: &drakkar::parser::native_static::AsyncGraphReport) {
+    use drakkar::parser::native_static::AsyncEdge;
+    let edge = |e: &AsyncEdge| {
+        let mut line = format!("{} -> {}  {} @{}", e.from, e.to, e.kind, e.insn_addr);
+        if let (Some(table), Some(offset)) = (&e.table, &e.offset) {
+            line.push_str(&format!("  table {table}+{offset}"));
+        }
+        if let Some(adrp) = &e.adrp_addr {
+            line.push_str(&format!("  adrp {adrp}"));
+        }
+        if let Some(via) = &e.via_fragment {
+            line.push_str(&format!("  via {via}"));
+        }
+        line
+    };
+    println!("\nAsync graph {}  tables {} :", g.elf, g.tables_total);
+    for q in &g.queries {
+        let truncated = if q.truncated { " (tronqué)" } else { "" };
+        let paths = q
+            .paths_total
+            .map_or_else(String::new, |n| format!("  chemins {n}"));
+        println!(
+            "  {} {} -> {}  nœuds {}  arêtes {}{paths}{truncated}",
+            q.kind,
+            q.requested.join(","),
+            q.resolved.join(","),
+            q.nodes_total,
+            q.edges_total
+        );
+        for n in &q.nodes {
+            let end = n.fn_end.as_deref().unwrap_or("?");
+            println!("    {:>2}  {}-{end} ({})", n.depth, n.fn_start, n.bound);
+        }
+        for e in &q.edges {
+            println!("    {}", edge(e));
+        }
+        for path in q.paths.iter().flatten() {
+            let mut steps: Vec<&str> = path.iter().map(|e| e.from.as_str()).collect();
+            steps.extend(path.last().map(|e| e.to.as_str()));
+            println!("    chemin {}", steps.join(" -> "));
+        }
+        for s in &q.stores {
+            println!("    stockée {} @{}", s.table, s.vaddr);
+        }
+    }
+}
+
+/// Une ligne par fonction de `--native-slice`, une par requête, une par
+/// source avec sa chaîne.
+fn print_slice(s: &drakkar::parser::native_static::SliceReport) {
+    let end = s.fn_end.as_deref().unwrap_or("?");
+    println!("\nSlice {}  {}-{end} ({}) :", s.elf, s.fn_start, s.bound);
+    for q in &s.queries {
+        let truncated = if q.sources_truncated {
+            " (tronqué)"
+        } else {
+            ""
+        };
+        let partial = if q.complete { "" } else { "  incomplet" };
+        println!(
+            "  {} {}  sources {}{truncated}  pas {}{partial}",
+            q.at, q.location, q.sources_total, q.steps
+        );
+        for source in &q.sources {
+            let what = source.location.as_deref().or(source.value.as_deref());
+            let mut line = format!(
+                "    {:<13} {}  @{}",
+                source.kind,
+                what.unwrap_or("-"),
+                source.insn_addr
+            );
+            if let Some(target) = &source.call_target {
+                line.push_str(&format!("  -> {target}"));
+            }
+            if let Some(reason) = source.reason {
+                line.push_str(&format!("  {reason}"));
+            }
+            let [from, to] = source.bytes;
+            line.push_str(&format!("  octets {from}..{to}"));
+            if !source.chain.is_empty() {
+                let steps: Vec<&str> = source.chain.iter().map(|c| c.insn_addr.as_str()).collect();
+                let more = if source.chain_truncated { " …" } else { "" };
+                line.push_str(&format!("  chaîne {}{more}", steps.join(" ")));
+            }
+            println!("{line}");
+        }
+    }
 }
 
 /// Une ligne par ELF de `--native-find`, puis une par fonction avec ses
