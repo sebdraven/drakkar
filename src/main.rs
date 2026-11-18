@@ -239,6 +239,37 @@ struct Cli {
     #[arg(long)]
     native_vtables_refs: bool,
 
+    /// (--native) Par fonction d'un ELF AArch64, les chaînes qu'elle
+    /// référence et une étiquette tirée d'elles, sans exécution : `<elf|*>`
+    /// (--native --legend, section LABELS).
+    #[arg(long, value_name = "ELF")]
+    native_labels: Option<String>,
+
+    /// (--native-labels) Ne garder que les fonctions qui contiennent l'une de
+    /// ces adresses hexadécimales (1 à 64).
+    #[arg(long, value_name = "ADRESSES", value_delimiter = ',')]
+    native_labels_fn: Vec<String>,
+
+    /// (--native-labels) Ne garder que les fonctions dont une chaîne contient
+    /// l'un de ces motifs, casse ignorée.
+    #[arg(long, value_name = "MOTIFS", value_delimiter = ',')]
+    native_labels_match: Vec<String>,
+
+    /// (--native-labels) Fonctions rendues au plus par ELF ; les totaux
+    /// restent exacts. Défaut 2000.
+    #[arg(long, value_name = "N")]
+    native_labels_max: Option<usize>,
+
+    /// (--native-labels) Chaînes rendues au plus par fonction ; les totaux
+    /// restent exacts. Défaut 50.
+    #[arg(long, value_name = "N")]
+    native_labels_strings_max: Option<usize>,
+
+    /// (--native-labels) Les chaînes d'un fragment appelé par plus de N
+    /// fonctions sont partagées : hors étiquette et hors filtre. Défaut 8.
+    #[arg(long, value_name = "N")]
+    native_labels_fragment_fanout: Option<usize>,
+
     /// (--native-disasm) Racine de désassemblage en plus des points d'entrée
     /// JNI : nom d'un symbole défini, ou adresse `0x…` (ARM 32 bits : bit 0 =
     /// Thumb ; `t:` ou `a:` force le mode). Répétable. Introuvable : WARN.
@@ -886,6 +917,24 @@ fn main() -> Result<()> {
              qu'avec --native-vtables"
         );
     }
+    if cli.native_labels.is_some() && !cli.native {
+        bail!(
+            "--native-labels requiert --native : drakkar <APK|ELF> --native \
+             --native-labels <elf|*>"
+        );
+    }
+    let labels_tuning = !cli.native_labels_fn.is_empty()
+        || !cli.native_labels_match.is_empty()
+        || cli.native_labels_max.is_some()
+        || cli.native_labels_strings_max.is_some()
+        || cli.native_labels_fragment_fanout.is_some();
+    if labels_tuning && cli.native_labels.is_none() {
+        bail!(
+            "--native-labels-fn, --native-labels-match, --native-labels-max, \
+             --native-labels-strings-max et --native-labels-fragment-fanout n'ont d'effet \
+             qu'avec --native-labels"
+        );
+    }
     let native_strings_tuning =
         cli.min_length.is_some() || cli.elf.is_some() || cli.xrefs || cli.crates;
     if native_strings_tuning && cli.native_strings.is_none() {
@@ -996,6 +1045,7 @@ fn main() -> Result<()> {
             }
         }
         let vtables = vtables_options(&cli)?;
+        let labels = labels_options(&cli)?;
         let mut options = parser::native_static::DisasmOptions::default();
         if let Some(depth) = cli.disasm_depth {
             options.depth = depth;
@@ -1034,6 +1084,7 @@ fn main() -> Result<()> {
         parser::native_static::add_xrefs(&mut report, input, splits, &xrefs_specs, xrefs_max);
         parser::native_static::add_words(&mut report, input, splits, &words_specs);
         parser::native_static::add_vtables(&mut report, input, splits, vtables.as_ref());
+        parser::native_static::add_labels(&mut report, input, splits, labels.as_ref());
         if cli.format.wants_text() {
             print_native(&report, cli.disasm_full);
         }
@@ -2478,6 +2529,10 @@ fn print_native(r: &drakkar::parser::native_static::NativeReport, full: bool) {
         print_vtables(v);
     }
 
+    for l in &r.labels {
+        print_labels(l);
+    }
+
     if !r.errors.is_empty() {
         println!("\nNon lu ({}) :", r.errors.len());
         for err in &r.errors {
@@ -2842,6 +2897,84 @@ fn vtables_options(cli: &Cli) -> Result<Option<parser::native_static::VtablesOpt
     }
     options.refs = cli.native_vtables_refs;
     Ok(Some(options))
+}
+
+fn labels_options(cli: &Cli) -> Result<Option<parser::native_static::LabelsOptions>> {
+    use parser::native_static::{
+        parse_labels_patterns, parse_vtables_addresses, parse_vtables_elf, LabelsOptions,
+    };
+    let Some(spec) = &cli.native_labels else {
+        return Ok(None);
+    };
+    let mut options = LabelsOptions::default();
+    match parse_vtables_elf(spec) {
+        Ok(elf) => options.elf = elf,
+        Err(why) => bail!("--native-labels {spec:?} : {why}"),
+    }
+    match parse_vtables_addresses(&cli.native_labels_fn) {
+        Ok(functions) => options.functions = functions,
+        Err(why) => bail!("--native-labels-fn : {why}"),
+    }
+    match parse_labels_patterns(&cli.native_labels_match) {
+        Ok(patterns) => options.patterns = patterns,
+        Err(why) => bail!("--native-labels-match : {why}"),
+    }
+    if let Some(max) = cli.native_labels_max {
+        options.max = max;
+    }
+    if let Some(max) = cli.native_labels_strings_max {
+        options.strings_max = max;
+    }
+    if let Some(fanout) = cli.native_labels_fragment_fanout {
+        options.fragment_fanout = fanout;
+    }
+    Ok(Some(options))
+}
+
+/// Une ligne par ELF de `--native-labels`, puis une par fonction, ses chaînes
+/// indentées.
+fn print_labels(l: &drakkar::parser::native_static::LabelsReport) {
+    let (total, matched) = (l.functions_total, l.functions_matched);
+    let shared_only = l.functions_shared_only;
+    let suffix = if l.truncated { " (tronqué)" } else { "" };
+    println!(
+        "\nLabels {}  fonctions {total}  seulement partagées {shared_only}  \
+         retenues {matched}{suffix} :",
+        l.elf
+    );
+    for f in &l.functions {
+        let end = f.fn_end.as_deref().unwrap_or("?");
+        let (start, bound, kind) = (&f.fn_start, f.bound, f.label_kind);
+        let mut line = format!("  {start}-{end} ({bound})  {kind}");
+        if let Some(label) = &f.label {
+            line.push_str(&format!(" {label:?}"));
+        }
+        if let Some(module) = &f.module {
+            line.push_str(&format!("  module {module:?}"));
+        }
+        if !f.names.is_empty() {
+            line.push_str(&format!("  noms {}", f.names.join(",")));
+        }
+        if !f.all_tags.is_empty() {
+            line.push_str(&format!("  tags {}", f.all_tags.join(",")));
+        }
+        let more = if f.strings_truncated { " (tronqué)" } else { "" };
+        let (count, shared) = (f.strings_total, f.strings_shared);
+        line.push_str(&format!("  chaînes {count} dont partagées {shared}{more}"));
+        println!("{line}");
+        for s in &f.strings {
+            let more = if s.value_truncated { "…" } else { "" };
+            let (insn, vaddr, boundary) = (&s.insn_addr, &s.vaddr, s.boundary);
+            let mut line = format!("    {insn}  {vaddr}  {boundary}  {:?}{more}", s.value);
+            if let Some(via) = &s.via_fragment {
+                line.push_str(&format!("  via {via}"));
+            }
+            if let Some(callers) = s.fragment_callers {
+                line.push_str(&format!("  partagée ({callers} appelants)"));
+            }
+            println!("{line}");
+        }
+    }
 }
 
 /// Une ligne par ELF de `--native-vtables`, puis une par table, ses méthodes
