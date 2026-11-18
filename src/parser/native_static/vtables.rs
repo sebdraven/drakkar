@@ -23,7 +23,7 @@ pub const DEFAULT_VTABLES_MAX: usize = 500;
 pub const MAX_VTABLES_ADDRESSES: usize = 64;
 const MAX_SIZE: u64 = 0x100_0000;
 const MAX_ALIGN: u64 = 4096;
-const FIRST_METHOD: u64 = 0x18;
+pub(super) const FIRST_METHOD: u64 = 0x18;
 
 /// `--native-vtables <elf|*>` et ses filtres.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,15 +131,15 @@ pub struct VtableMethod {
     pub function: XrefFunction,
 }
 
-/// Table détectée, avant filtres.
-struct Found {
-    vaddr: u64,
+/// Table détectée, avant filtres. Partagée avec `--native-async-graph`.
+pub(super) struct Found {
+    pub(super) vaddr: u64,
     section: Option<String>,
-    dtor: Option<u64>,
+    pub(super) dtor: Option<u64>,
     size: u64,
     align: u64,
     /// Valeurs des méthodes, à partir de +0x18.
-    methods: Vec<u64>,
+    pub(super) methods: Vec<u64>,
 }
 
 /// Ce que [`header`] lit d'un mot classé par [`read_word`].
@@ -194,7 +194,7 @@ pub(super) fn run(
 }
 
 /// Tables de toutes les zones de [`scanned`], triées par adresse.
-fn detect(ctx: &Ctx, fdes: &[(u64, u64)], pie: bool) -> Vec<Found> {
+pub(super) fn detect(ctx: &Ctx, fdes: &[(u64, u64)], pie: bool) -> Vec<Found> {
     let mut found = Vec::new();
     for (section, first, count) in scanned(&ctx.image) {
         let cell = |index| Cell::of(&read_word(ctx, fdes, pie, first, index));
