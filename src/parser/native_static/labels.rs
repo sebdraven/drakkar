@@ -109,18 +109,18 @@ pub struct LabeledString {
 
 /// Chaîne `string` (index dans les chaînes référencées) rattachée par
 /// l'instruction `insn`, directement ou par le fragment `via`, qu'appellent
-/// `callers` fonctions distinctes.
+/// `callers` fonctions distinctes. Partagé avec `--native-fields`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Hit {
-    insn: u64,
-    string: usize,
-    via: Option<u64>,
-    callers: usize,
+pub(super) struct Hit {
+    pub(super) insn: u64,
+    pub(super) string: usize,
+    pub(super) via: Option<u64>,
+    pub(super) callers: usize,
 }
 
-struct Attached {
-    bound: FnBound,
-    hits: Vec<Hit>,
+pub(super) struct Attached {
+    pub(super) bound: FnBound,
+    pub(super) hits: Vec<Hit>,
 }
 
 /// Les fonctions de l'ELF `bytes` que décrit `elf` qui référencent une chaîne,
@@ -210,7 +210,8 @@ fn labels(
 /// Chaque instruction à sa fonction bornée, puis les chaînes de chaque
 /// fonction d'au plus FRAGMENT_MAX octets à chacun de ses appelants. Triées par
 /// début ; dans chaque fonction, par instruction puis par adresse de chaîne.
-fn attach(
+/// Partagé avec `--native-fields`.
+pub(super) fn attach(
     strings: &[Referenced],
     span: impl Fn(u64) -> Option<FnBound>,
     callers: impl FnOnce(&HashSet<u64>) -> HashMap<u64, Vec<u64>>,
@@ -280,7 +281,7 @@ fn add(attached: &mut BTreeMap<u64, Attached>, bound: FnBound, hit: Hit) {
 }
 
 /// Rattachée par un fragment qu'appellent plus de `fanout` fonctions.
-fn is_shared(hit: &Hit, fanout: usize) -> bool {
+pub(super) fn is_shared(hit: &Hit, fanout: usize) -> bool {
     hit.via.is_some() && hit.callers > fanout
 }
 
