@@ -121,6 +121,7 @@ published empirical values.
 | `--native --native-words <elf\|*>@<addr>:<n>[,<addr>:<n>…]` | 8-byte words read at addresses of an AArch64 ELF, relative relocations applied, without executing anything: what each word designates (code with its enclosing function, data with its section and text, plain integer), and whether a range starts like a Rust vtable header. |
 | `--native --native-vtables <elf\|*>` | the Rust method tables (vtables) of an AArch64 ELF, found by their shape in read-only and RELRO data, without executing anything: destructor, size, alignment and methods of each, filtered by function, slot offset, size or start address, and on request the instructions and data words that carry each table's address. |
 | `--native --native-labels <elf\|*>` | per function of an AArch64 ELF, the strings it references and a reading label drawn from them (function name from a log message, else bracketed log tag, else Rust source path), without executing anything: the inverse index of `--native-strings --xrefs`, with strings of small outlined fragments also given to their callers, and those of widely shared fragments set apart. |
+| `--native --native-find <elf\|*> --native-find-off=<off>[,<off>…]` | over the whole code of an AArch64 ELF, the instructions that read or write a structure field at a given offset from a base register (`ldr`/`str` families, pairs included) or form its address (`add`/`sub` immediate), without executing anything: per-function counts by offset, to find the functions that copy a field from one structure to another. |
 | `--native-strings [PATTERN…]` | the strings of every ELF (APK, XAPK splits, raw ELF), each with how its bound was found: NUL byte, Rust `{ptr, len}` pair rebuilt through relative relocations, AArch64 immediate length next to the address, or an unsplit heuristic block. `--xrefs`: the instructions that form each address, over the whole code, with the enclosing function from symbols or `.eh_frame`. `--crates`: Rust crates named by source paths, banners of statically linked C libraries. Cryptographic constants recognised by content. JSON streamed to `--json-out`. |
 
 `--native-disasm` follows paths, not bytes: a function stops at a return, a
@@ -316,6 +317,52 @@ to one of the fragment's callers, not necessarily to all of them, which
 `via_fragment` flags; a call to the fragment through `br`/`blr`, a
 conditional branch or into its middle is not seen; the label is a reading
 aid, not a proven function name.
+
+`--native-find=<elf|*>` lists, over the whole code of an AArch64 ELF, the
+instructions that touch a structure field by its offset from a base
+register, in one pass of the code walk shared with `--native-xrefs`.
+`--native-find-off=<o1>[,<o2>…]` is required: 1 to 16 hexadecimal offsets,
+`0x` optional, `-` allowed (write `--native-find-off=-0x8`). Three accesses
+are recognised: `load`, a load whose memory operand is `[base, #offset]`
+with an immediate offset (`ldr`, `ldrb`, `ldrh`, `ldrsb`, `ldrsh`, `ldrsw`,
+`ldur` and its variants, `ldtr`, pre-indexed `[base, #offset]!`, integer
+or SIMD registers, `ldp`, `ldnp`, `ldpsw`); `store`, a store of the same
+shape (`str`, `strb`, `strh`, `stur` and variants, `sttr`, `stp`, `stnp`);
+`addr`, an `add xN, xM, #offset` or `sub` (negative offset) that forms the
+field's address. A post-indexed access `[base], #n` touches `base + 0`, so
+its offset is 0. A pair has two slots, at the offset and at the offset plus
+one register's width, each compared with the requested offsets. An offset
+held in a register (`[base, xN]`) is not recognised. Filters, combined with
+AND: `--native-find-access=` a subset of `load,store,addr` (default all
+three), `--native-find-size=` widths in bytes among `1,2,4,8,16` (default
+all, no effect on `addr`), `--native-find-base=any|sp|nosp` (default
+`nosp`: every base but the stack pointer; the frame pointer `x29` is not
+`sp`), `--native-find-in=<a1>[,…]` (1 to 64 hex addresses, functions that
+contain one); `--native-find-max` caps the matches rendered per ELF
+(default 2000), totals and `functions[]` staying exact. Who reads the byte
+at +0x16a: `--native --native-find='lib/arm64-v8a/libapp.so'
+--native-find-off=0x16a --native-find-access=load --native-find-size=1`.
+Which functions read +0x16a and write +0x1bc: `--native --native-find='*'
+--native-find-off=0x16a,0x1bc --native-find-access=load,store`, then keep
+the `functions[]` entries whose `counts` have `loads` for `0x16a` and
+`stores` for `0x1bc`. Each `find[]` entry, one per ELF, carries `elf`,
+`matches_total`, `functions_total` (bounded functions with at least one
+match), `truncated`, `functions[]` sorted by `fn_start` (`fn_start`,
+`fn_end`, `bound` as in `--native-labels`, and `counts[]`: one element per
+requested offset present in the function, in request order, with `offset`,
+`loads`, `stores`, `addrs`), never capped, and `matches[]` sorted by
+address: `insn_addr`, `mnemonic`, `operands`, `access`, `size` (absent for
+`addr`), `base` (`x0`…`x30` or `sp`), `offset` (signed hex), `function`
+(`fn_start`, `fn_end`, `bound`, or null outside every bounded function).
+Limits: an offset names a field only within one given structure, so the
+same offset serves other structures and the result is a list of
+candidates; an access through a pointer computed first (`add`, then a load
+at offset 0) shows as `addr`, not as `load` or `store`; an access inside an
+outlined fragment is reported in the fragment, not in its callers; an
+offset in a register, or a copy through `memcpy`, escapes the mode; the
+limits of the code walk apply (only executable sections described by
+section headers are read, data words inside code are read as
+instructions).
 
 It does not execute or emulate, and runs symbolically only under
 `--native-symex`, without a solver; it does not follow `JNIEnv`

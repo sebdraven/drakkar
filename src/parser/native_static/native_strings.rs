@@ -2039,6 +2039,16 @@ fn scan_code(
     (sweep.formed, sweep.lengths)
 }
 
+/// Les bornes de [`function_bounds`] seules. Partagé avec `--native-find`.
+pub(super) fn code_bounds(
+    image: &Image,
+    symbols: &[DynSymbol],
+    local_symbols: &[DynSymbol],
+) -> Bounds {
+    let (areas, _) = data_areas(image);
+    function_bounds(image, &areas, symbols, local_symbols).0
+}
+
 /// Le balayage de [`scan_code`] sur tout le code AArch64, sans couple : chaque
 /// adresse formée, ou lue et écrite à travers une page ADRP ou un ldr
 /// littéral. `each` reçoit chaque mot d'instruction. Partagé avec

@@ -270,6 +270,45 @@ struct Cli {
     #[arg(long, value_name = "N")]
     native_labels_fragment_fanout: Option<usize>,
 
+    /// (--native) Instructions qui accèdent à un champ de structure par son
+    /// décalage, ou en forment l'adresse, dans tout le code d'un ELF AArch64,
+    /// sans exécution : `<elf|*>` (--native --legend, section FIND).
+    #[arg(long, value_name = "ELF")]
+    native_find: Option<String>,
+
+    /// (--native-find) Obligatoire. Décalages hexadécimaux, préfixe 0x
+    /// facultatif, signe - admis (1 à 16) ; un négatif s'écrit avec `=`.
+    #[arg(
+        long,
+        value_name = "DÉCALAGES",
+        value_delimiter = ',',
+        allow_hyphen_values = true
+    )]
+    native_find_off: Vec<String>,
+
+    /// (--native-find) Sous-ensemble de load, store, addr. Défaut les trois.
+    #[arg(long, value_name = "ACCÈS", value_delimiter = ',')]
+    native_find_access: Vec<String>,
+
+    /// (--native-find) Largeurs d'accès en octets parmi 1, 2, 4, 8, 16 ; sans
+    /// effet sur addr. Défaut toutes.
+    #[arg(long, value_name = "OCTETS", value_delimiter = ',')]
+    native_find_size: Vec<String>,
+
+    /// (--native-find) Registre de base : any, sp ou nosp. Défaut nosp.
+    #[arg(long, value_name = "BASE")]
+    native_find_base: Option<String>,
+
+    /// (--native-find) Ne garder que les fonctions qui contiennent l'une de
+    /// ces adresses hexadécimales (1 à 64).
+    #[arg(long, value_name = "ADRESSES", value_delimiter = ',')]
+    native_find_in: Vec<String>,
+
+    /// (--native-find) Instructions rendues au plus par ELF ; les totaux
+    /// restent exacts. Défaut 2000.
+    #[arg(long, value_name = "N")]
+    native_find_max: Option<usize>,
+
     /// (--native-disasm) Racine de désassemblage en plus des points d'entrée
     /// JNI : nom d'un symbole défini, ou adresse `0x…` (ARM 32 bits : bit 0 =
     /// Thumb ; `t:` ou `a:` force le mode). Répétable. Introuvable : WARN.
@@ -935,6 +974,24 @@ fn main() -> Result<()> {
              qu'avec --native-labels"
         );
     }
+    if cli.native_find.is_some() && !cli.native {
+        bail!(
+            "--native-find requiert --native : drakkar <APK|ELF> --native \
+             --native-find <elf|*> --native-find-off=<décalage>[,<décalage>...]"
+        );
+    }
+    let find_tuning = !cli.native_find_off.is_empty()
+        || !cli.native_find_access.is_empty()
+        || !cli.native_find_size.is_empty()
+        || cli.native_find_base.is_some()
+        || !cli.native_find_in.is_empty()
+        || cli.native_find_max.is_some();
+    if find_tuning && cli.native_find.is_none() {
+        bail!(
+            "--native-find-off, --native-find-access, --native-find-size, --native-find-base, \
+             --native-find-in et --native-find-max n'ont d'effet qu'avec --native-find"
+        );
+    }
     let native_strings_tuning =
         cli.min_length.is_some() || cli.elf.is_some() || cli.xrefs || cli.crates;
     if native_strings_tuning && cli.native_strings.is_none() {
@@ -1046,6 +1103,7 @@ fn main() -> Result<()> {
         }
         let vtables = vtables_options(&cli)?;
         let labels = labels_options(&cli)?;
+        let find = find_options(&cli)?;
         let mut options = parser::native_static::DisasmOptions::default();
         if let Some(depth) = cli.disasm_depth {
             options.depth = depth;
@@ -1085,6 +1143,7 @@ fn main() -> Result<()> {
         parser::native_static::add_words(&mut report, input, splits, &words_specs);
         parser::native_static::add_vtables(&mut report, input, splits, vtables.as_ref());
         parser::native_static::add_labels(&mut report, input, splits, labels.as_ref());
+        parser::native_static::add_find(&mut report, input, splits, find.as_ref());
         if cli.format.wants_text() {
             print_native(&report, cli.disasm_full);
         }
@@ -2533,6 +2592,10 @@ fn print_native(r: &drakkar::parser::native_static::NativeReport, full: bool) {
         print_labels(l);
     }
 
+    for f in &r.find {
+        print_find(f);
+    }
+
     if !r.errors.is_empty() {
         println!("\nNon lu ({}) :", r.errors.len());
         for err in &r.errors {
@@ -2929,6 +2992,86 @@ fn labels_options(cli: &Cli) -> Result<Option<parser::native_static::LabelsOptio
         options.fragment_fanout = fanout;
     }
     Ok(Some(options))
+}
+
+fn find_options(cli: &Cli) -> Result<Option<parser::native_static::FindOptions>> {
+    use parser::native_static::{
+        parse_find_access, parse_find_base, parse_find_offsets, parse_find_sizes,
+        parse_vtables_addresses, parse_vtables_elf, FindOptions,
+    };
+    let Some(spec) = &cli.native_find else {
+        return Ok(None);
+    };
+    let mut options = FindOptions::default();
+    match parse_vtables_elf(spec) {
+        Ok(elf) => options.elf = elf,
+        Err(why) => bail!("--native-find {spec:?} : {why}"),
+    }
+    match parse_find_offsets(&cli.native_find_off) {
+        Ok(offsets) => options.offsets = offsets,
+        Err(why) => bail!("--native-find-off (obligatoire) : {why}"),
+    }
+    if !cli.native_find_access.is_empty() {
+        match parse_find_access(&cli.native_find_access) {
+            Ok(access) => options.access = access,
+            Err(why) => bail!("--native-find-access : {why}"),
+        }
+    }
+    match parse_find_sizes(&cli.native_find_size) {
+        Ok(sizes) => options.sizes = sizes,
+        Err(why) => bail!("--native-find-size : {why}"),
+    }
+    if let Some(text) = &cli.native_find_base {
+        match parse_find_base(text) {
+            Ok(base) => options.base = base,
+            Err(why) => bail!("--native-find-base : {why}"),
+        }
+    }
+    match parse_vtables_addresses(&cli.native_find_in) {
+        Ok(functions) => options.functions = functions,
+        Err(why) => bail!("--native-find-in : {why}"),
+    }
+    if let Some(max) = cli.native_find_max {
+        options.max = max;
+    }
+    Ok(Some(options))
+}
+
+/// Une ligne par ELF de `--native-find`, puis une par fonction avec ses
+/// comptes, puis une par instruction.
+fn print_find(f: &drakkar::parser::native_static::FindReport) {
+    let (total, functions) = (f.matches_total, f.functions_total);
+    let suffix = if f.truncated { " (tronqué)" } else { "" };
+    println!(
+        "\nFind {}  accès {total}  fonctions {functions}{suffix} :",
+        f.elf
+    );
+    for function in &f.functions {
+        let end = function.fn_end.as_deref().unwrap_or("?");
+        let (start, bound) = (&function.fn_start, function.bound);
+        let mut line = format!("  {start}-{end} ({bound})");
+        for c in &function.counts {
+            let (offset, loads, stores, addrs) = (&c.offset, c.loads, c.stores, c.addrs);
+            line.push_str(&format!("  {offset}:{loads}/{stores}/{addrs}"));
+        }
+        println!("{line}");
+    }
+    for m in &f.matches {
+        let size = m.size.map_or_else(|| "-".to_string(), |s| s.to_string());
+        let (insn, access, base, offset) = (&m.insn_addr, m.access, &m.base, &m.offset);
+        let text = format!("{} {}", m.mnemonic, m.operands);
+        let place = match &m.function {
+            Some(p) => {
+                let end = p.fn_end.as_deref().unwrap_or("?");
+                format!("{}-{end} ({})", p.fn_start, p.bound)
+            }
+            None => "hors fonction".to_string(),
+        };
+        println!(
+            "    {insn}  {access:<5} {size:>2}  {base} {offset}  {}  {place}",
+            text.trim_end()
+        );
+    }
 }
 
 /// Une ligne par ELF de `--native-labels`, puis une par fonction, ses chaînes
