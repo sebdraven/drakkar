@@ -40,6 +40,7 @@ use super::source::Source;
 
 mod decode;
 mod disasm;
+mod find;
 mod jni_table;
 mod labels;
 pub mod native_strings;
@@ -52,6 +53,10 @@ pub use self::disasm::{
     parse_listing_spec, parse_root_spec, DisasmCall, DisasmFunction, DisasmInsn, DisasmOptions,
     ElfDisasm, IndexedString, InvalidPath, JavaMember, JniCall, Listing, ListingInsn, ListingSpec,
     RootSpec, StringIndexRef, StringRef, Syscall, TruncatedAt,
+};
+pub use self::find::{
+    parse_find_access, parse_find_base, parse_find_offsets, parse_find_sizes, FindBase, FindCount,
+    FindFunction, FindMatch, FindOptions, FindReport, DEFAULT_FIND_MAX, MAX_FIND_OFFSETS,
 };
 pub use self::labels::{
     parse_labels_patterns, LabeledFunction, LabeledString, LabelsOptions, LabelsReport,
@@ -171,6 +176,8 @@ pub struct NativeReport {
     pub vtables: Vec<VtablesReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<LabelsReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub find: Vec<FindReport>,
     pub errors: Vec<String>,
 }
 
@@ -602,6 +609,7 @@ fn finish(
         words: Vec::new(),
         vtables: Vec::new(),
         labels: Vec::new(),
+        find: Vec::new(),
         errors,
     }
 }
@@ -917,6 +925,54 @@ pub fn add_labels(
                 None => "aucun ELF AArch64",
             };
             report.errors.push(format!("labels {label} : {why}"));
+        }
+    });
+}
+
+/// `--native-find` : accès à des décalages de structure dans le code de chaque
+/// ELF retenu, octets relus comme pour [`add_listings`]. `*` retient les ELF
+/// AArch64 ; aucun = erreur.
+pub fn add_find(
+    report: &mut NativeReport,
+    input: impl Into<Source>,
+    splits: &[super::xapk::Split],
+    options: Option<&FindOptions>,
+) {
+    let Some(options) = options else {
+        return;
+    };
+    let reread = Reread::open(&report.elfs, input.into(), splits);
+    let named = options.elf.as_deref();
+    let label = named.unwrap_or("*");
+    self::disasm::silence_panics(|| {
+        let mut matched = false;
+        for elf in &report.elfs {
+            let wanted = match named {
+                Some(path) => path == elf.path,
+                None => elf.machine == "aarch64",
+            };
+            if !wanted {
+                continue;
+            }
+            matched = true;
+            let outcome = match reread.bytes(elf) {
+                Ok(bytes) => self::find::run(&bytes, elf, options),
+                Err(why) => Err(why),
+            };
+            match outcome {
+                Ok(found) => report.find.push(found),
+                Err(why) => {
+                    let message = format!("find {label} ({}) : {why}", elf.path);
+                    report.errors.push(message);
+                }
+            }
+        }
+        if !matched {
+            let why = match named {
+                Some(_) => "aucun ELF de ce chemin",
+                None => "aucun ELF AArch64",
+            };
+            report.errors.push(format!("find {label} : {why}"));
         }
     });
 }
@@ -2358,7 +2414,8 @@ avec --native-symex (section SYMEX), références vers des adresses seulement av
 --native-xrefs (section XREFS), mots lus à des adresses seulement avec --native-words
 (section WORDS), tables de méthodes Rust seulement avec --native-vtables (section
 VTABLES), chaînes référencées et étiquette par fonction seulement avec
---native-labels (section LABELS).
+--native-labels (section LABELS), accès du code à des décalages de structure
+seulement avec --native-find (section FIND).
 Mode ELF brut : une entrée dont les 4 premiers octets valent 7F 45 4C 46 est
 analysée seule, quelle que soit son extension ; --native-dex <APK|DEX>, répétable,
 fournit les méthodes natives à lier, sans quoi binding est vide.
@@ -2383,11 +2440,12 @@ RAPPORT
   words[]         --native-words seulement, absent sinon (section WORDS).
   vtables[]       --native-vtables seulement, absent sinon (section VTABLES).
   labels[]        --native-labels seulement, absent sinon (section LABELS).
+  find[]          --native-find seulement, absent sinon (section FIND).
   errors          Une entrée de longueur nulle (empty : stored vide ou flux deflate vide)
                   est lue, vide, et n'y figure jamais.
                   Ce qui n'a pas pu être lu : entrée d'archive illisible (on ignore alors
                   si c'était un ELF), DEX illisible, classes sautées, panique du parseur
-                  DEX, listing, symex, xrefs, words, vtables ou labels impossible. Une méthode native manquante peut faire
+                  DEX, listing, symex, xrefs, words, vtables, labels ou find impossible. Une méthode native manquante peut faire
                   apparaître à tort son export en native_unclaimed. Une source illisible
                   est ignorée, les autres sont liées ; si aucune n'a pu être lue,
                   binding est vide et native_methods_declared vaut 0.
@@ -3011,6 +3069,40 @@ LABELS (labels[]) — --native-labels <elf|*>
   adresses          Chaînes hexadécimales préfixées 0x.
   limites           Une fonction sans chaîne référencée n'apparaît pas. Les limites des références de chaînes s'appliquent : une adresse calculée, un ADRP et son ADD éloignés échappent au balayage, et la chaîne n'est alors rattachée à aucune fonction. Une chaîne rattachée par fragment appartient à l'un des appelants du fragment, pas forcément à tous : via_fragment le signale. Un appel au fragment par branchement indirect (br, blr), conditionnel ou vers son intérieur n'est pas vu, et n'entre pas dans fragment_callers. Le seuil de partage est un paramètre de l'outil, pas une mesure. L'étiquette est une aide de lecture, pas un nom de fonction prouvé : un nom de names est celui qu'écrit un message de journal.
   Sortie texte : une ligne par ELF (functions_total, functions_shared_only, functions_matched, tronqué), puis une ligne par fonction (bornes, bound, label_kind et label, module, names, tags, nombre de chaînes dont partagées), et une ligne par chaîne : insn_addr, vaddr, boundary, value, « via » suivi du fragment s'il y a lieu, et « partagée » avec fragment_callers.
+
+FIND (find[]) — --native-find <elf|*>
+  Dans tout le code d'un ELF AArch64, les instructions qui accèdent à un champ de structure par son décalage depuis un registre de base, ou qui forment l'adresse de ce champ ; sert à trouver les fonctions qui copient un champ d'une structure vers une autre. Rien n'est exécuté ; indépendant de --native-disasm. Exemples : « qui lit l'octet +0x16a » : --native --native-find='lib/arm64-v8a/libapp.so' --native-find-off=0x16a --native-find-access=load --native-find-size=1 ; « quelles fonctions lisent +0x16a et écrivent +0x1bc » : --native --native-find='*' --native-find-off=0x16a,0x1bc --native-find-access=load,store, puis garder dans functions[] celles dont counts porte loads non nul pour 0x16a et stores non nul pour 0x1bc.
+  parcours          Celui des xrefs de --native-strings et de --native-xrefs : chaque mot de 4 octets aligné des sections exécutables, une seule passe pour tous les décalages. Une instruction que le décodeur refuse n'est pas rendue.
+  load              Chargement dont l'opérande mémoire est [base, #décalage] à décalage immédiat, registre entier ou SIMD : ldr, ldrb, ldrh, ldrsb, ldrsh, ldrsw (décalage non signé mis à l'échelle), ldur et variantes (immédiat signé de 9 bits), ldtr et variantes, forme pré-indexée [base, #décalage]!, forme post-indexée ; ldp, ldnp, ldpsw.
+  store             Rangement de même forme : str, strb, strh, stur et variantes, sttr et variantes, formes pré et post-indexées ; stp, stnp.
+  post-indexé       [base], #n : l'accès se fait à base + 0, puis base avance de n ; le décalage de l'accès est 0.
+  addr              add xN, xM, #décalage, ou sub xN, xM, #décalage pour un décalage négatif : registres 64 bits, sans drapeaux (ni adds, ni subs, ni cmp, ni cmn), immédiat éventuellement décalé de 12 bits. mov xN, sp (add #0) est un addr de décalage 0.
+  emplacement       Accès d'une instruction à un décalage. ldp, stp et leurs variantes en ont deux : décalage et décalage + largeur d'un registre ; chacun est comparé aux décalages demandés, et une instruction dont les deux correspondent donne deux éléments de matches.
+  elf               elfs[].path ; une entrée par ELF retenu. Avec *, chaque ELF AArch64, les autres ignorés ; aucun ELF AArch64 est une erreur. Nommé explicitement : un ELF non AArch64 est une erreur.
+  fonction bornée   Règle de LABELS : symbole STT_FUNC défini de .symtab ou .dynsym, sinon FDE de .eh_frame.
+  matches_total     Emplacements qui passent tous les filtres, avant --native-find-max.
+  functions_total   Fonctions bornées qui contiennent au moins l'un de ces emplacements.
+  truncated         Vrai si matches en rend moins que matches_total (--native-find-max).
+  functions[]       Triées par fn_start croissant, jamais coupées par --native-find-max. fn_start, fn_end, bound comme LABELS.
+  counts[]          Un élément par décalage demandé qui a au moins un emplacement dans la fonction, dans l'ordre de --native-find-off : offset ; loads, stores, addrs = nombre d'emplacements load, store et addr à ce décalage.
+  matches[]         Triées par insn_addr croissante, puis par offset ; coupées à --native-find-max (défaut 2000).
+  insn_addr         Adresse de l'instruction.
+  mnemonic, operands Texte de l'instruction, tel que l'écrit le décodeur de LISTING.
+  access            load, store ou addr.
+  size              Largeur de l'emplacement en octets : 1, 2, 4, 8 ou 16 ; pour ldp et stp, celle d'un registre ; absent pour addr.
+  base              Registre de base : x0 à x30, ou sp.
+  offset            Décalage de l'emplacement depuis base, donc l'un des décalages demandés : 0x hexadécimal, précédé de « - » s'il est négatif.
+  function          Fonction bornée qui contient l'instruction : fn_start, fn_end, bound comme LABELS ; null hors de toute fonction bornée.
+  --native-find-off Obligatoire. Décalages hexadécimaux, préfixe 0x facultatif, signe - admis, séparés par des virgules, de 1 à 16, doublons retirés. Un négatif s'écrit avec « = » : --native-find-off=-0x8.
+  --native-find-access Sous-ensemble de load, store, addr, séparés par des virgules ; défaut les trois.
+  --native-find-size Largeurs en octets parmi 1, 2, 4, 8, 16, séparées par des virgules ; défaut toutes ; sans effet sur addr.
+  --native-find-base any (tout registre de base), sp (pointeur de pile seulement) ou nosp (tout sauf le pointeur de pile) ; défaut nosp. Le pointeur de cadre x29 n'est pas sp : nosp garde les accès qui passent par lui.
+  --native-find-in  Adresses hexadécimales, préfixe 0x facultatif, séparées par des virgules, de 1 à 64, doublons retirés : ne garder que les fonctions bornées qui contiennent l'une d'elles ; une instruction hors de toute fonction bornée est alors écartée.
+  --native-find-max Plafond du nombre de matches rendus par ELF, défaut 2000 ; matches_total, functions_total et functions[] restent exacts.
+  filtres           Combinés par ET ; matches_total, functions_total et counts comptent après filtres. Un élément mal formé est cité dans l'erreur.
+  adresses          Chaînes hexadécimales préfixées 0x.
+  limites           Un décalage identifie un champ seulement dans une structure donnée : le même décalage sert à d'autres structures, le résultat est une liste de candidats. Un accès fait par un pointeur calculé d'abord (add puis chargement à décalage nul) apparaît comme addr, pas comme load ni store. Un accès fait dans un fragment externalisé est rendu dans le fragment, pas dans ses appelants. Un accès à décalage dans un registre ([base, xN]), ou par memcpy, échappe au mode. Les limites du parcours du code s'appliquent : seules les sections exécutables que décrivent les section headers sont lues, un ELF sans section headers ne donne rien, et un mot de données placé dans le code est lu comme une instruction.
+  Sortie texte : une ligne par ELF (matches_total, functions_total, tronqué), une ligne par fonction (bornes, bound, puis pour chaque décalage offset:loads/stores/addrs), puis une ligne par match : insn_addr, access, size (« - » pour addr), base, offset, mnemonic et operands, fonction ou « hors fonction ».
 ";
 
 /// Légende autonome : chaque champ, statut, catégorie et anomalie de `--native`.
