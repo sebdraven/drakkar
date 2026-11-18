@@ -532,27 +532,32 @@ struct Constant {
 }
 
 #[derive(Default)]
-struct Bounds {
+pub(super) struct Bounds {
     /// Triées par début, un début au plus une fois.
     entries: Vec<FnBound>,
 }
 
 impl Bounds {
     fn owner(&self, at: u64) -> Option<u64> {
+        self.bound(at).map(|e| e.start)
+    }
+
+    /// Fonction bornée qui contient `at`.
+    pub(super) fn bound(&self, at: u64) -> Option<FnBound> {
         let index = self.entries.partition_point(|e| e.start <= at);
         let entry = self.entries.get(index.checked_sub(1)?)?;
         match entry.end {
             Some(end) if at >= end => None,
-            _ => Some(entry.start),
+            _ => Some(*entry),
         }
     }
 }
 
-#[derive(Clone, Copy)]
-struct FnBound {
-    start: u64,
-    end: Option<u64>,
-    source: &'static str,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FnBound {
+    pub(super) start: u64,
+    pub(super) end: Option<u64>,
+    pub(super) source: &'static str,
 }
 
 struct ElfStrings {
@@ -888,6 +893,41 @@ fn analyze(path: &str, split: Option<&str>, bytes: &[u8], options: &Options) -> 
         note(&mut elf.summary.anomalies, UNREADABLE, e);
     }
     elf
+}
+
+/// Chaîne que le code désigne, pour `--native-labels`.
+pub(super) struct Referenced {
+    pub(super) vaddr: u64,
+    pub(super) value: String,
+    pub(super) boundary: &'static str,
+    /// Instructions de ses xrefs, tableaux propagés compris.
+    pub(super) insns: Vec<u64>,
+}
+
+/// Les chaînes de `--native-strings --xrefs`, sans motif et au `--min-length`
+/// par défaut, qui ont au moins une référence, triées par adresse ; et les
+/// bornes qui donnent leur fn_start.
+pub(super) fn referenced(bytes: &[u8]) -> Result<(Vec<Referenced>, Bounds), String> {
+    let options = Options {
+        patterns: Vec::new(),
+        min_length: DEFAULT_MIN_LENGTH,
+        elf: None,
+        xrefs: true,
+        crates: false,
+    };
+    let mut elf = ElfStrings::new("", None, bytes, &options);
+    let unreadable = |e: object::read::Error| format!("ELF illisible ({e})");
+    elf.fill(bytes, &options).map_err(unreadable)?;
+    let mut found = Vec::new();
+    for f in elf.strings.into_iter().filter(|f| !f.refs.is_empty()) {
+        found.push(Referenced {
+            vaddr: f.vaddr,
+            insns: f.refs.iter().map(|r| r.insn).collect(),
+            value: f.value,
+            boundary: f.boundary,
+        });
+    }
+    Ok((found, elf.bounds))
 }
 
 impl ElfStrings {
@@ -3750,5 +3790,32 @@ mod tests {
         let s = &report.summary;
         assert_eq!(s.arrays_not_propagated, 1);
         assert_eq!(s.xrefs.as_ref().unwrap().fatptr_array, 0);
+    }
+
+    #[test]
+    fn referenced_strings_carry_propagated_array_instructions_and_bounds() {
+        let code = [adrp(0, TEXT, RELRO), add_imm(0, 0, 0), RET];
+        let [relro, rela] = fat_pointers(&[
+            (RODATA, 5),
+            (RODATA + 5, 5),
+            (RODATA + 10, 7),
+            (RODATA + 17, 5),
+        ]);
+        let sections = [text(&code), rodata(PIECES), relro, rela, eh_frame(TEXT, 12)];
+        let (strings, bounds) = referenced(&elf_with(&sections)).unwrap();
+        let values: Vec<&str> = strings.iter().map(|s| s.value.as_str()).collect();
+        assert_eq!(values, ["alpha", "bravo", "charlie", "delta"]);
+        for s in &strings {
+            assert_eq!(s.insns, [TEXT + 4], "{}", s.value);
+            assert_eq!(s.boundary, BOUNDARY_FATPTR);
+        }
+        assert_eq!(strings[2].vaddr, RODATA + 10);
+        let expected = FnBound {
+            start: TEXT,
+            end: Some(TEXT + 12),
+            source: SOURCE_EH_FRAME,
+        };
+        assert_eq!(bounds.bound(TEXT + 4), Some(expected));
+        assert_eq!(bounds.bound(TEXT + 12), None);
     }
 }

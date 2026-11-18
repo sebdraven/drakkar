@@ -21,8 +21,8 @@ use super::{
 pub const DEFAULT_XREFS_MAX: usize = 2000;
 pub const MAX_XREFS_TARGETS: usize = 64;
 
-const KIND_CALL: &str = "call";
-const KIND_JUMP: &str = "jump";
+pub(super) const KIND_CALL: &str = "call";
+pub(super) const KIND_JUMP: &str = "jump";
 const KIND_COND_JUMP: &str = "cond_jump";
 const KIND_ADDRESS: &str = "address";
 const KIND_LOAD: &str = "load";
@@ -245,7 +245,7 @@ pub(super) fn search(
 }
 
 /// bl, b, b.cond, bc.cond, cbz, cbnz, tbz, tbnz : (destination, kind, mnémonique).
-fn branch(pc: u64, w: u32) -> Option<(u64, &'static str, String)> {
+pub(super) fn branch(pc: u64, w: u32) -> Option<(u64, &'static str, String)> {
     if w & 0x1c00_0000 != 0x1400_0000 {
         return None;
     }

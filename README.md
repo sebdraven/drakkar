@@ -120,6 +120,7 @@ published empirical values.
 | `--native --native-xrefs <elf\|*>@<addr>[,<addr>…]` | cross-references to up to 64 addresses of an AArch64 ELF, without executing anything: the enclosing function, the direct branches that land exactly on each address, the instructions that form or access it, and the data words that hold it. One pass over the code for all addresses. |
 | `--native --native-words <elf\|*>@<addr>:<n>[,<addr>:<n>…]` | 8-byte words read at addresses of an AArch64 ELF, relative relocations applied, without executing anything: what each word designates (code with its enclosing function, data with its section and text, plain integer), and whether a range starts like a Rust vtable header. |
 | `--native --native-vtables <elf\|*>` | the Rust method tables (vtables) of an AArch64 ELF, found by their shape in read-only and RELRO data, without executing anything: destructor, size, alignment and methods of each, filtered by function, slot offset, size or start address, and on request the instructions and data words that carry each table's address. |
+| `--native --native-labels <elf\|*>` | per function of an AArch64 ELF, the strings it references and a reading label drawn from them (function name from a log message, else bracketed log tag, else Rust source path), without executing anything: the inverse index of `--native-strings --xrefs`, with strings of small outlined fragments also given to their callers, and those of widely shared fragments set apart. |
 | `--native-strings [PATTERN…]` | the strings of every ELF (APK, XAPK splits, raw ELF), each with how its bound was found: NUL byte, Rust `{ptr, len}` pair rebuilt through relative relocations, AArch64 immediate length next to the address, or an unsplit heuristic block. `--xrefs`: the instructions that form each address, over the whole code, with the enclosing function from symbols or `.eh_frame`. `--crates`: Rust crates named by source paths, banners of statically linked C libraries. Cryptographic constants recognised by content. JSON streamed to `--json-out`. |
 
 `--native-disasm` follows paths, not bytes: a function stops at a return, a
@@ -259,6 +260,62 @@ method can be counted; a function in a table does not prove that a given
 indirect call targets it — the mode returns candidates; no reference to a
 table is no proof either (computed address, distant `adrp`/`add`); only
 relative relocations are read.
+
+`--native-labels=<elf|*>` indexes the strings of an AArch64 ELF by function
+rather than by string: in a stripped Rust library nearly every useful
+function references a log message or a source path, and that is enough to
+read it. Strings and references are those of `--native-strings --xrefs`
+(default `--min-length`, no pattern), including the references a propagated
+format-piece array gives to each of its pieces; each referencing instruction
+is attached to its bounded function, by symbol or `.eh_frame` as `fn_start`
+in `--native-strings`. When that function is a fragment of at most 64 bytes
+with a known end, its strings stay on it and are also attached to every
+function that holds a `bl` or `b` to its exact start, with `via_fragment` set
+to the fragment. A fragment called by more than
+`--native-labels-fragment-fanout` distinct functions (default 8) is shared
+code (panic, formatting, async runtime): its strings are `shared` in its
+callers, carry `fragment_callers`, are listed after every unshared string,
+and take no part in `names`, `all_tags`, `module`, the label or
+`--native-labels-match`. Bracket texts are the groups that follow one
+another at the start of a string (`[Messenger][E2EE] y` gives two), each
+skipping repeated `[` (`[[LogUtil] x` gives `LogUtil`) and closing at the
+first `]` within the first 80 characters; an empty text or one still holding
+`[` is dropped. `names` collects, in instruction order and deduplicated, the
+identifier after a leading `] ` (`] should_create_e2ee_channel for`) and
+any bracket text that is a lowercase-initial identifier with an `_`
+(`[internal_find_user_profile] …`); an identifier is an ASCII letter or `_`
+then letters, digits or `_`, at least 3 characters. The label follows a
+fixed priority: `fn_name` (first of `names`), else `log_tag` (first of
+`all_tags`, the deduplicated bracket texts), else `source_path` (first
+string ending in `.rs`), else `none` (null label); `module` is the first
+tag that is not a name. Filters, optional and combined with AND:
+`--native-labels-fn=<a1>[,<a2>…]` (1 to 64 hex addresses, functions that
+contain one, even when all their strings are shared),
+`--native-labels-match=<m1>[,<m2>…]` (case-insensitive substring of any
+unshared string of the function); `--native-labels-max` caps the functions
+rendered per ELF (default 2000) and `--native-labels-strings-max` the
+strings per function (default 50, unshared ones first), totals, names, tags
+and labels staying computed on everything. Examples:
+`--native --native-labels='lib/arm64-v8a/libapp.so' --native-labels-match=connect`
+and `--native --native-labels='*' --native-labels-fn=0x36ffbd0`. Each
+`labels[]` entry, one per ELF, carries `elf`, `functions_total` (functions
+with at least one unshared string), `functions_shared_only` (functions whose
+strings are all shared, rendered only with `--native-labels-fn`),
+`functions_matched` (after filters), `truncated`, and `functions[]` sorted
+by `fn_start`: `fn_start`, `fn_end`, `bound` (`symtab` or `eh_frame`),
+`label`, `label_kind`, `names`, `module` (absent when none), `all_tags`,
+`strings_total`, `strings_shared`, `strings_truncated`, and `strings[]`,
+unshared then shared, each sorted by instruction: `vaddr`, `value` (cut at
+200 characters, with `value_truncated`), `boundary`, `insn_addr`,
+`via_fragment` (absent for a direct reference), `shared`, and
+`fragment_callers` (shared strings only). Addresses are `0x` hexadecimal strings. A non-AArch64 ELF named
+explicitly is an error, `*` skips it. Limits: a function that references no
+string does not appear; the limits of string references apply (computed
+address, distant `adrp`/`add`); a string attached through a fragment belongs
+to one of the fragment's callers, not necessarily to all of them, which
+`via_fragment` flags; a call to the fragment through `br`/`blr`, a
+conditional branch or into its middle is not seen; the label is a reading
+aid, not a proven function name.
 
 It does not execute or emulate, and runs symbolically only under
 `--native-symex`, without a solver; it does not follow `JNIEnv`
