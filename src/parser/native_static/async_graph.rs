@@ -335,6 +335,8 @@ fn analyze(
 
 /// Arêtes call et makes ; celles qui partent d'un fragment remontées à
 /// chacun de ses appelants ; filtrées par `kinds`, triées, sans doublon.
+/// Fragment : fonction bornée de FRAGMENT_MAX octets au plus, entrée d'aucune
+/// table, appelée par bl ou b depuis une autre fonction.
 fn edges<S: Fn(u64) -> Option<FnBound>>(
     span: &S,
     calls: &[(u64, u64)],
@@ -375,23 +377,29 @@ fn edges<S: Fn(u64) -> Option<FnBound>>(
             }
         }
     }
-    let fragment = |start: u64| {
+    let entries: HashSet<u64> = tables
+        .iter()
+        .flat_map(|t| t.slots())
+        .map(|(_, value)| value)
+        .collect();
+    let small = |start: u64| {
         let end = span(start).and_then(|b| b.end);
         end.is_some_and(|end| end.saturating_sub(start) <= FRAGMENT_MAX)
     };
+    // Clés : les fragments, et eux seuls.
     let mut callers: HashMap<u64, BTreeSet<u64>> = HashMap::new();
     for e in &raw {
-        if e.kind == KIND_CALL && e.from != e.to && fragment(e.to) {
+        if e.kind == KIND_CALL && e.from != e.to && small(e.to) && !entries.contains(&e.to) {
             callers.entry(e.to).or_default().insert(e.from);
         }
     }
     let mut kept = Vec::new();
     for e in raw {
-        if !fragment(e.from) {
+        let Some(list) = callers.get(&e.from) else {
             kept.push(e);
             continue;
-        }
-        for &caller in callers.get(&e.from).into_iter().flatten() {
+        };
+        for &caller in list {
             kept.push(Edge {
                 from: caller,
                 via: Some(e.from),
