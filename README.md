@@ -422,9 +422,12 @@ one of its methods (`insn_addr`, `adrp_addr`, `table`, `offset` of G in T).
 In Rust an async task or a closure passed as a trait object is such a table,
 and the code that creates the object forms its address: "who makes which
 table" extends the call graph across indirect calls, to answer "how do we get
-from function A to function B". An edge leaving an outlined fragment (64
-bytes at most) is replaced by one edge from each of its callers, with
-`via_fragment`. Data words equal to a table address are listed apart in
+from function A to function B". An edge leaving an outlined fragment (a
+bounded function of 64 bytes at most that is neither the destructor nor a
+method of any detected table, and that another function calls by `bl` or `b`)
+is replaced by one edge from each of its callers, with `via_fragment`; a small
+function that is a table entry, or that no other function calls directly,
+keeps its own edges. Data words equal to a table address are listed apart in
 `stores[]`, never as edges. At least one query is required:
 `--native-async-from=<a1>[,…]` (descendants of the functions containing these
 addresses), `--native-async-to=<a1>[,…]` (ancestors), and
