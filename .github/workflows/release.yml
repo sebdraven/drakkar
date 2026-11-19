@@ -101,6 +101,12 @@ jobs:
           git config --global core.eol lf
 
       - uses: actions/checkout@v7
+      - name: dependances Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes liblzma-dev
+
       - uses: ./.github/actions/rust-setup
         with:
           toolchain: ${{ env.RUST_VERSION }}
