@@ -642,6 +642,18 @@ mod tests {
     const T: u64 = 0x9000;
     const U: u64 = 0x9100;
 
+    const K: u64 = 0x2000;
+    const M: u64 = 0x2100;
+    const Y: u64 = 0x2140;
+    const N: u64 = 0x2200;
+    const R: u64 = 0x2300;
+    const S: u64 = 0x2340;
+    const Z: u64 = 0x2380;
+    const Q: u64 = 0x2400;
+    const P: u64 = 0x2500;
+    const V: u64 = 0x9200;
+    const W: u64 = 0x9300;
+
     /// F est un fragment de 0x20 octets ; les autres fonctions font 0x100.
     fn span(at: u64) -> Option<FnBound> {
         let starts = [A, B, C, D, E, F, G, H];
@@ -717,6 +729,73 @@ mod tests {
             .iter()
             .map(|n| (n.fn_start.as_str(), n.depth))
             .collect()
+    }
+
+    /// Second graphe : M fait 64 octets, Y, R et S 0x20, Z 68, les autres 0x100.
+    fn small_span(at: u64) -> Option<FnBound> {
+        let sizes = [
+            (K, 0x100),
+            (M, 0x40),
+            (Y, 0x20),
+            (N, 0x100),
+            (R, 0x20),
+            (S, 0x20),
+            (Z, 0x44),
+            (Q, 0x100),
+            (P, 0x100),
+        ];
+        let &(start, size) = sizes.iter().rev().find(|&&(s, _)| s <= at)?;
+        let end = start + size;
+        (at < end).then_some(FnBound {
+            start,
+            end: Some(end),
+            source: "eh_frame",
+        })
+    }
+
+    /// K fabrique V (méthodes M, Y) et appelle Z ; M fabrique W (méthode P) ;
+    /// N appelle R ; R, S, Y et Z appellent Q. `extra` : appels ajoutés.
+    fn small_query(
+        extra: &[(u64, u64)],
+        tune: impl FnOnce(&mut AsyncGraphOptions),
+    ) -> AsyncQuery {
+        let mut calls = vec![
+            (0x2010, Z),
+            (0x2144, Q),
+            (0x2210, R),
+            (0x2304, Q),
+            (0x2344, Q),
+            (0x2384, Q),
+        ];
+        calls.extend_from_slice(extra);
+        let formed = [
+            Formed {
+                insn: 0x2020,
+                adrp: Some(0x201c),
+                table: 0,
+            },
+            Formed {
+                insn: 0x2120,
+                adrp: Some(0x211c),
+                table: 1,
+            },
+        ];
+        let tables = [
+            Table {
+                vaddr: V,
+                dtor: None,
+                methods: vec![M, Y],
+            },
+            Table {
+                vaddr: W,
+                dtor: None,
+                methods: vec![P],
+            },
+        ];
+        let mut options = AsyncGraphOptions::default();
+        tune(&mut options);
+        let report = analyze("libs.so", small_span, &calls, &formed, &tables, &[], &options);
+        report.unwrap().queries.remove(0)
     }
 
     #[test]
@@ -899,6 +978,103 @@ mod tests {
         assert!(parse_async_kinds(&texts(&["jump"]))
             .unwrap_err()
             .contains("\"jump\""));
+    }
+
+    #[test]
+    fn a_small_table_method_without_caller_keeps_its_edges() {
+        let q = small_query(&[], |o| {
+            o.from = vec![M];
+            o.depth = Some(1);
+        });
+        assert_eq!(rows(&q.edges), [row(M, P, KIND_MAKES, 0x2120, None)]);
+        let e = &q.edges[0];
+        let proof = (e.table.as_deref(), e.offset.as_deref(), e.adrp_addr.as_deref());
+        assert_eq!(proof, (Some("0x9300"), Some("0x18"), Some("0x211c")));
+        let json = serde_json::to_value(e).unwrap();
+        assert!(json.get("via_fragment").is_none());
+        let q = small_query(&[], |o| o.paths = vec![(K, P)]);
+        assert_eq!(q.paths_total, Some(1));
+        let expected = [
+            row(K, M, KIND_MAKES, 0x2020, None),
+            row(M, P, KIND_MAKES, 0x2120, None),
+        ];
+        assert_eq!(rows(&q.paths.as_ref().unwrap()[0]), expected);
+    }
+
+    #[test]
+    fn a_small_table_method_with_a_caller_is_not_a_fragment() {
+        let q = small_query(&[(0x2214, M)], |o| {
+            o.from = vec![N];
+            o.depth = Some(2);
+        });
+        let expected = [
+            row(M, P, KIND_MAKES, 0x2120, None),
+            row(N, M, KIND_CALL, 0x2214, None),
+            row(N, R, KIND_CALL, 0x2210, None),
+            row(N, Q, KIND_CALL, 0x2304, Some(R)),
+        ];
+        assert_eq!(rows(&q.edges), expected);
+        assert!(q.edges.iter().all(|e| e.via_fragment != Some(hex(M))));
+    }
+
+    #[test]
+    fn a_small_function_without_caller_keeps_its_edges() {
+        let q = small_query(&[], |o| {
+            o.from = vec![S];
+            o.depth = Some(1);
+        });
+        assert_eq!(rows(&q.edges), [row(S, Q, KIND_CALL, 0x2344, None)]);
+    }
+
+    #[test]
+    fn a_small_called_function_outside_tables_is_still_a_fragment() {
+        let q = small_query(&[], |o| {
+            o.from = vec![N];
+            o.depth = Some(1);
+        });
+        let expected = [
+            row(N, R, KIND_CALL, 0x2210, None),
+            row(N, Q, KIND_CALL, 0x2304, Some(R)),
+        ];
+        assert_eq!(rows(&q.edges), expected);
+        let q = small_query(&[], |o| {
+            o.from = vec![R];
+            o.depth = Some(1);
+        });
+        assert_eq!(rows(&q.edges), Vec::<Row>::new());
+    }
+
+    #[test]
+    fn the_fragment_size_limit_is_64_bytes() {
+        let m = small_span(M).and_then(|b| b.end).unwrap();
+        assert_eq!(m - M, FRAGMENT_MAX);
+        let q = small_query(&[], |o| {
+            o.from = vec![M];
+            o.depth = Some(1);
+        });
+        assert_eq!(rows(&q.edges), [row(M, P, KIND_MAKES, 0x2120, None)]);
+        let q = small_query(&[], |o| {
+            o.from = vec![Y];
+            o.depth = Some(1);
+        });
+        assert_eq!(rows(&q.edges), [row(Y, Q, KIND_CALL, 0x2144, None)]);
+        let z = small_span(Z).and_then(|b| b.end).unwrap();
+        assert_eq!(z - Z, 68);
+        let q = small_query(&[], |o| {
+            o.from = vec![K];
+            o.depth = Some(1);
+        });
+        let expected = [
+            row(K, M, KIND_MAKES, 0x2020, None),
+            row(K, Y, KIND_MAKES, 0x2020, None),
+            row(K, Z, KIND_CALL, 0x2010, None),
+        ];
+        assert_eq!(rows(&q.edges), expected);
+        let q = small_query(&[], |o| {
+            o.from = vec![Z];
+            o.depth = Some(1);
+        });
+        assert_eq!(rows(&q.edges), [row(Z, Q, KIND_CALL, 0x2384, None)]);
     }
 
     #[test]
