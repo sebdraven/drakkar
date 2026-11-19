@@ -763,10 +763,7 @@ mod tests {
 
     /// K fabrique V (méthodes M, Y) et appelle Z ; M fabrique W (méthode P) ;
     /// N appelle R ; R, S, Y et Z appellent Q. `extra` : appels ajoutés.
-    fn small_query(
-        extra: &[(u64, u64)],
-        tune: impl FnOnce(&mut AsyncGraphOptions),
-    ) -> AsyncQuery {
+    fn small_query(extra: &[(u64, u64)], tune: impl FnOnce(&mut AsyncGraphOptions)) -> AsyncQuery {
         let mut calls = vec![
             (0x2010, Z),
             (0x2144, Q),
@@ -802,7 +799,15 @@ mod tests {
         ];
         let mut options = AsyncGraphOptions::default();
         tune(&mut options);
-        let report = analyze("libs.so", small_span, &calls, &formed, &tables, &[], &options);
+        let report = analyze(
+            "libs.so",
+            small_span,
+            &calls,
+            &formed,
+            &tables,
+            &[],
+            &options,
+        );
         report.unwrap().queries.remove(0)
     }
 
@@ -996,7 +1001,11 @@ mod tests {
         });
         assert_eq!(rows(&q.edges), [row(M, P, KIND_MAKES, 0x2120, None)]);
         let e = &q.edges[0];
-        let proof = (e.table.as_deref(), e.offset.as_deref(), e.adrp_addr.as_deref());
+        let proof = (
+            e.table.as_deref(),
+            e.offset.as_deref(),
+            e.adrp_addr.as_deref(),
+        );
         assert_eq!(proof, (Some("0x9300"), Some("0x18"), Some("0x211c")));
         let json = serde_json::to_value(e).unwrap();
         assert!(json.get("via_fragment").is_none());
