@@ -3454,6 +3454,9 @@ fn print_slice(s: &drakkar::parser::native_static::SliceReport) {
             }
             let [from, to] = source.bytes;
             line.push_str(&format!("  octets {from}..{to}"));
+            if !source.aliases.is_empty() {
+                line.push_str(&format!("  alias {}", source.aliases.join(" ")));
+            }
             if !source.chain.is_empty() {
                 let steps: Vec<&str> = source.chain.iter().map(|c| c.insn_addr.as_str()).collect();
                 let more = if source.chain_truncated { " …" } else { "" };
