@@ -368,7 +368,11 @@ fn reloads(
 ) -> Reloads {
     let direct = reaching(graph, effects, values, succs);
     let in_image = |at: i64| {
-        let mut loads = ctx.image.segments.iter().filter(|s| s.p_type == elf::PT_LOAD);
+        let mut loads = ctx
+            .image
+            .segments
+            .iter()
+            .filter(|s| s.p_type == elf::PT_LOAD);
         loads.any(|s| s.in_memory(at as u64))
     };
     let mut table = Reloads::new();
@@ -761,6 +765,8 @@ enum Target {
     Unknown(&'static str),
     Call(u64),
 }
+
+type AliasedTargets = BTreeMap<(u64, Vec<u64>), Vec<(Target, u8, bool)>>;
 
 impl Target {
     /// Classe et position : deux octets se suivent dans une même classe si
@@ -1184,7 +1190,7 @@ impl Search<'_, '_> {
         };
         let values = &func.values[p];
         let mut out = Vec::new();
-        let mut aliased: BTreeMap<(u64, Vec<u64>), Vec<(Target, u8, bool)>> = BTreeMap::new();
+        let mut aliased = AliasedTargets::new();
         match fact.loc {
             Loc::Reg { reg, lo, len } => {
                 let written = effect.regs.iter().find(|(r, _)| *r == reg);
@@ -2329,7 +2335,10 @@ mod tests {
     }
 
     fn no_alias(report: &SliceReport) -> bool {
-        report.queries[0].sources.iter().all(|s| s.aliases.is_empty())
+        report.queries[0]
+            .sources
+            .iter()
+            .all(|s| s.aliases.is_empty())
     }
 
     #[test]
