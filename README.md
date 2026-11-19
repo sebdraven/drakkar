@@ -378,7 +378,9 @@ the register's value just before the instruction at `<addr>`. A memory
 location is a base plus an offset over n bytes, the base being the stack
 pointer or a register at function entry, an absolute address, or a value
 written by an instruction; two different bases are assumed disjoint, as in
-`--native-symex`. Rules: a copy or an arithmetic operation between registers
+`--native-symex`, except a register reloaded from a stack slot where the
+function stored a register: it may hold the stored value (an alias, see
+below). Rules: a copy or an arithmetic operation between registers
 turns the location into its register operands (adding a constant to a base
 register adjusts the offset); a load turns the register into the zone read; a
 store over the zone turns the covered part into the stored register, the rest
@@ -392,6 +394,30 @@ preserve or a zone whose base is passed in x0–x8, else it is a `call`
 source; preserved registers and zones whose base is not passed cross the
 call; an indirect call is an `indirect_call` source with its target
 expression when known; the function entry gives `arg` or `init_mem`.
+Aliases: a stack slot is 8 bytes addressed from the stack pointer at function
+entry, whatever register names it (`sp`, `x29` or another register derived
+from `sp`); a spill writes bytes 0 to 7 of one register x0–x30 to a slot, in
+order (an `stp` makes two); a reload writes the 8 bytes of a register x0–x30
+from a slot (an `ldp` makes two). A reload may hold the values of the spills
+to the same slot that reach it (reaching definitions on the function's flow
+graph, union at joins, to a fixed point): the value the spilled register had
+just before each such spill. An 8-byte spill to the slot kills the previous
+ones and makes its own; any other write of the function addressed from the
+entry stack pointer that covers a byte of the slot (a partial or vector
+store, a constant, a shifted 8-byte slot, a lost zone of known end) kills
+them; calls and writes through another base kill nothing. A value itself
+written by a reload is replaced by that reload's values, 4 levels at most; an
+absolute value is kept only if it is an address of a LOAD segment (a spilled
+integer is not a pointer). At most 2 reloads are assumed on a path: a step
+that would assume a third is not taken and gives an `unknown` source with
+reason `alias_depth`, carrying the aliases assumed so far. This equality
+is possible, never certain: it only adds sources and search paths, on top of
+the exact rule. A store whose address may hit the zone gives its bytes and
+the zone keeps going up unchanged; the same holds for a `memcpy`
+destination; a call reached only through such a register is followed or
+gives its `call` (`indirect_call`) source, and the zone also keeps going up
+in the caller; a zone whose base is written by a reload is also sought, just
+before the reload, from each value it may hold.
 `--native-slice-max-steps` bounds the fixed point per query (default 200000),
 `--native-slice-max-sources` caps the sources rendered per query (default
 200, `sources_total` stays exact). Example: `--native
@@ -401,14 +427,25 @@ carries `elf`, `fn_start`, `fn_end`, `bound` and `queries[]`: `at`,
 `location`, `complete` (false when the budget or the cap was reached),
 `steps`, `sources_total`, `sources_truncated`, `sources[]` with `kind`
 (`arg`, `init_mem`, `const`, `global`, `call`, `indirect_call`, `unknown`),
-`location` or `value`, `insn_addr`, `call_target`, `reason` (for `unknown`),
+`location` or `value`, `insn_addr`, `call_target`, `reason` (for `unknown`:
+`indirect_branch`, `no_predecessor`, `computed_address`, `unmodeled`,
+`alias_depth`),
 `bytes` (the part of the requested location covered) and `chain[]` (a witness
 chain of defining instructions from the source to the query, at most 64,
-`chain_truncated`). Limits: every path of the flow graph is covered,
+`chain_truncated`) and `aliases` (the reloads whose equality with a spill
+was assumed on the source's path, sorted hexadecimal addresses, absent when
+none; such a source reads "if the reloaded register does hold what was
+spilled", and the reload appears in `chain[]` where the alias is crossed).
+Limits: every path of the flow graph is covered,
 impossible ones included, so sources may be too many, never too few within
 the model and the budget, and `complete` says whether the budget cut; memory
 bases are assumed disjoint, so a write through a pointer computed otherwise is
-not seen; a write made by a callee that is not followed comes out as a `call`
+not seen, unless the pointer was reloaded from a stack slot of the function;
+only the function's stack slots are tracked, a pointer kept in a heap
+structure or in a task's state is not; a spill made in an outlined fragment
+or in a callee, a spill narrower than 8 bytes or rebuilt piecewise are not
+candidates; the searches with and without aliases share the step budget; a
+write made by a callee that is not followed comes out as a `call`
 source, not as a value; an unresolved indirect jump cuts the walk on that
 path with an `unknown` source. The `--native --legend` section SLICE defines
 every field.
