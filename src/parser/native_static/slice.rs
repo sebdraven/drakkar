@@ -1664,6 +1664,388 @@ mod tests {
         );
     }
 
+    fn aliases(source: &SliceSource) -> Vec<&str> {
+        source.aliases.iter().map(String::as_str).collect()
+    }
+
+    /// sub sp, sp, #0x20 ; <spill> ; ldr x9, [sp, #8] ; str x1, [x9, #0x10] ;
+    /// ldr x2, [x0, #0x10] ; add sp, sp, #0x20 ; ret. Requête sur x2.
+    fn reloaded_store(spill: u32) -> SliceReport {
+        let code = [
+            0xd10083ff, spill, 0xf94007e9, 0xf9000921, 0xf9400802, 0x910083ff, RET,
+        ];
+        let data = program(&code, &[]);
+        let ctx = loaded(&data, &[(CODE, 28, "f")]);
+        sliced(&ctx, &["0x1014:x2"], |_| {})
+    }
+
+    #[test]
+    fn a_store_through_a_reloaded_pointer_reaches_the_zone() {
+        // str x0, [sp, #8]
+        let report = reloaded_store(0xf90007e0);
+        let expected = [
+            row(KIND_ARG, "x1", "0x1000", [0, 8]),
+            row(KIND_INIT_MEM, "x0+0x10:8", "0x1000", [0, 8]),
+        ];
+        assert_eq!(rows(&report), expected);
+        let sources = &report.queries[0].sources;
+        assert_eq!(aliases(&sources[0]), ["0x1008"]);
+        assert_eq!(chain(&sources[0]), ["0x100c", "0x1008", "0x1010"]);
+        assert!(sources[1].aliases.is_empty());
+        assert_eq!(chain(&sources[1]), ["0x1010"]);
+    }
+
+    /// sub sp, sp, #0x20 ; mov x19, x0 ; str x0, [sp, #8] ; ldr x0, [sp, #8] ;
+    /// bl callee ; ldr x2, [x19, #0x10] ; add sp, sp, #0x20 ; ret. Appelé de
+    /// 0x80 octets : str x1, [x0, #0x10] ; ret. Requête sur x2.
+    fn reloaded_argument(depth: u8) -> SliceReport {
+        let code = [
+            0xd10083ff, 0xaa0003f3, 0xf90007e0, 0xf94007e0, 0x9400003c, 0xf9400a62, 0x910083ff, RET,
+        ];
+        let data = program(&code, &[0xf9000801, RET]);
+        let ctx = loaded(&data, &[(CODE, 32, "f"), (CALLEE, 0x80, "callee")]);
+        sliced(&ctx, &["0x1018:x2"], |o| o.depth = depth)
+    }
+
+    #[test]
+    fn a_callee_writing_through_a_reloaded_pointer_is_followed() {
+        let report = reloaded_argument(DEFAULT_SLICE_DEPTH);
+        let expected = [
+            row(KIND_ARG, "x1", "0x1000", [0, 8]),
+            row(KIND_INIT_MEM, "x0+0x10:8", "0x1000", [0, 8]),
+        ];
+        assert_eq!(rows(&report), expected);
+        let sources = &report.queries[0].sources;
+        assert_eq!(aliases(&sources[0]), ["0x100c"]);
+        assert_eq!(chain(&sources[0]), ["0x1100", "0x100c", "0x1014"]);
+        assert!(sources[1].aliases.is_empty());
+
+        let report = reloaded_argument(0);
+        let expected = [
+            row(KIND_INIT_MEM, "x0+0x10:8", "0x1000", [0, 8]),
+            row(KIND_CALL, "x0+0x10:8", "0x1010", [0, 8]),
+        ];
+        assert_eq!(rows(&report), expected);
+        let sources = &report.queries[0].sources;
+        assert!(sources[0].aliases.is_empty());
+        assert_eq!(sources[1].call_target.as_deref(), Some("0x1100"));
+        assert_eq!(aliases(&sources[1]), ["0x100c"]);
+        assert_eq!(chain(&sources[1]), ["0x100c", "0x1014"]);
+    }
+
+    #[test]
+    fn no_alias_without_a_matching_spill() {
+        // str x3, [sp, #8]
+        let report = reloaded_store(0xf90007e3);
+        assert_eq!(
+            rows(&report),
+            [row(KIND_INIT_MEM, "x0+0x10:8", "0x1000", [0, 8])]
+        );
+        assert!(report.queries[0].sources[0].aliases.is_empty());
+    }
+
+    #[test]
+    fn two_spills_to_one_slot_give_two_candidates() {
+        // sub sp, sp, #0x20 ; cbz x2, 0x1010 ; str x0, [sp, #8] ; b 0x1014 ;
+        // str x3, [sp, #8] ; ldr x9, [sp, #8] ; str x1, [x9, #0x10] ;
+        // add sp, sp, #0x20 ; ret
+        let code = [
+            0xd10083ff, 0xb4000062, 0xf90007e0, 0x14000002, 0xf90007e3, 0xf94007e9, 0xf9000921,
+            0x910083ff, RET,
+        ];
+        let data = program(&code, &[]);
+        let ctx = loaded(&data, &[(CODE, 36, "f")]);
+        for base in ["x0", "x3"] {
+            let zone = format!("{base}+0x10:8");
+            let report = sliced(&ctx, &[&format!("0x101c:{zone}")], |_| {});
+            let expected = [
+                row(KIND_ARG, "x1", "0x1000", [0, 8]),
+                row(KIND_INIT_MEM, &zone, "0x1000", [0, 8]),
+            ];
+            assert_eq!(rows(&report), expected, "{base}");
+            let sources = &report.queries[0].sources;
+            assert_eq!(aliases(&sources[0]), ["0x1014"], "{base}");
+            assert!(sources[1].aliases.is_empty(), "{base}");
+        }
+    }
+
+    #[test]
+    fn a_zone_based_on_a_reloaded_pointer_is_rebased() {
+        // str x1, [x0, #0x10] ; sub sp, sp, #0x20 ; str x0, [sp, #8] ;
+        // ldr x9, [sp, #8] ; ldr x2, [x9, #0x10] ; add sp, sp, #0x20 ; ret
+        let code = [
+            0xf9000801, 0xd10083ff, 0xf90007e0, 0xf94007e9, 0xf9400922, 0x910083ff, RET,
+        ];
+        let data = program(&code, &[]);
+        let ctx = loaded(&data, &[(CODE, 28, "f")]);
+        let report = sliced(&ctx, &["0x1014:x2"], |_| {});
+        let expected = [
+            row(KIND_ARG, "x1", "0x1000", [0, 8]),
+            row(KIND_INIT_MEM, "x9@0x100c+0x10:8", "0x1000", [0, 8]),
+        ];
+        assert_eq!(rows(&report), expected);
+        let sources = &report.queries[0].sources;
+        assert_eq!(aliases(&sources[0]), ["0x100c"]);
+        assert_eq!(chain(&sources[0]), ["0x1000", "0x100c", "0x1010"]);
+        assert!(sources[1].aliases.is_empty());
+    }
+
+    #[test]
+    fn a_partial_spill_is_not_a_candidate() {
+        // str w0, [sp, #8]
+        let report = reloaded_store(0xb9000be0);
+        assert_eq!(
+            rows(&report),
+            [row(KIND_INIT_MEM, "x0+0x10:8", "0x1000", [0, 8])]
+        );
+        let sources = &report.queries[0].sources;
+        assert!(sources.iter().all(|s| s.aliases.is_empty()));
+    }
+
+    #[test]
+    fn a_slot_addressed_through_the_frame_pointer_is_the_same_slot() {
+        // sub sp, sp, #0x20 ; add x29, sp, #0x20 ; stur x0, [x29, #-8] ;
+        // ldr x9, [sp, #0x18] ; str x1, [x9, #0x10] ; ldr x2, [x0, #0x10] ;
+        // add sp, sp, #0x20 ; ret
+        let code = [
+            0xd10083ff, 0x910083fd, 0xf81f83a0, 0xf9400fe9, 0xf9000921, 0xf9400802, 0x910083ff, RET,
+        ];
+        let data = program(&code, &[]);
+        let ctx = loaded(&data, &[(CODE, 32, "f")]);
+        let report = sliced(&ctx, &["0x1018:x2"], |_| {});
+        let expected = [
+            row(KIND_ARG, "x1", "0x1000", [0, 8]),
+            row(KIND_INIT_MEM, "x0+0x10:8", "0x1000", [0, 8]),
+        ];
+        assert_eq!(rows(&report), expected);
+        let sources = &report.queries[0].sources;
+        assert_eq!(aliases(&sources[0]), ["0x100c"]);
+        assert!(sources[1].aliases.is_empty());
+    }
+
+    #[test]
+    fn a_memcpy_to_a_reloaded_pointer_maps_to_its_source() {
+        // sub sp, sp, #0x20 ; mov x19, x0 ; str x0, [sp, #8] ; ldr x0, [sp, #8] ;
+        // mov x1, x3 ; movz x2, #0x20 ; bl memcpy ; ldrb w0, [x19, #0x18] ;
+        // add sp, sp, #0x20 ; ret
+        let code = [
+            0xd10083ff, 0xaa0003f3, 0xf90007e0, 0xf94007e0, 0xaa0303e1, 0xd2800402, 0x9400003a,
+            0x39406260, 0x910083ff, RET,
+        ];
+        let data = program(&code, &[RET]);
+        let ctx = loaded(&data, &[(CODE, 40, "f"), (CALLEE, 16, "memcpy")]);
+        let report = sliced(&ctx, &["0x101c:x19+0x18:1"], |_| {});
+        let expected = [
+            row(KIND_INIT_MEM, "x0+0x18:1", "0x1000", [0, 1]),
+            row(KIND_INIT_MEM, "x3+0x18:1", "0x1000", [0, 1]),
+        ];
+        assert_eq!(rows(&report), expected);
+        let sources = &report.queries[0].sources;
+        assert!(sources[0].aliases.is_empty());
+        assert_eq!(aliases(&sources[1]), ["0x100c"]);
+        assert_eq!(chain(&sources[1]), ["0x1018", "0x100c"]);
+    }
+
+    #[test]
+    fn aliases_are_absent_from_json_when_empty_and_sorted_otherwise() {
+        let report = reloaded_store(0xf90007e0);
+        let sources = &report.queries[0].sources;
+        let plain = serde_json::to_value(&sources[1]).unwrap();
+        assert!(plain.get("aliases").is_none());
+        let aliased = serde_json::to_value(&sources[0]).unwrap();
+        assert_eq!(aliased["aliases"], serde_json::json!(["0x1008"]));
+
+        // sub sp, sp, #0x20 ; str x0, [sp, #8] ; ldr x9, [sp, #8] ;
+        // str x9, [sp, #0x10] ; ldr x10, [sp, #0x10] ; str x1, [x10, #0x10] ;
+        // ldr x2, [x0, #0x10] ; add sp, sp, #0x20 ; ret
+        let code = [
+            0xd10083ff, 0xf90007e0, 0xf94007e9, 0xf9000be9, 0xf9400bea, 0xf9000941, 0xf9400802,
+            0x910083ff, RET,
+        ];
+        let data = program(&code, &[]);
+        let ctx = loaded(&data, &[(CODE, 36, "f")]);
+        let report = sliced(&ctx, &["0x101c:x2"], |_| {});
+        let expected = [
+            row(KIND_ARG, "x1", "0x1000", [0, 8]),
+            row(KIND_INIT_MEM, "x0+0x10:8", "0x1000", [0, 8]),
+        ];
+        assert_eq!(rows(&report), expected);
+        let chained = serde_json::to_value(&report.queries[0].sources[0]).unwrap();
+        assert_eq!(chained["aliases"], serde_json::json!(["0x1008", "0x1010"]));
+    }
+
+    /// aliases de chaque source, dans l'ordre de rows.
+    fn all_aliases(report: &SliceReport) -> Vec<Vec<&str>> {
+        report.queries[0].sources.iter().map(aliases).collect()
+    }
+
+    fn no_alias(report: &SliceReport) -> bool {
+        report.queries[0].sources.iter().all(|s| s.aliases.is_empty())
+    }
+
+    #[test]
+    fn a_spill_overwritten_before_the_reload_is_not_a_candidate() {
+        // sub sp, sp, #0x20 ; str x0, [sp, #8] ; str x3, [sp, #8] ;
+        // ldr x9, [sp, #8] ; str x1, [x9, #0x10] ; add sp, sp, #0x20 ; ret
+        let code = [
+            0xd10083ff, 0xf90007e0, 0xf90007e3, 0xf94007e9, 0xf9000921, 0x910083ff, RET,
+        ];
+        let data = program(&code, &[]);
+        let ctx = loaded(&data, &[(CODE, 28, "f")]);
+        let report = sliced(&ctx, &["0x1014:x0+0x10:8"], |_| {});
+        assert_eq!(
+            rows(&report),
+            [row(KIND_INIT_MEM, "x0+0x10:8", "0x1000", [0, 8])]
+        );
+        assert!(no_alias(&report));
+        let report = sliced(&ctx, &["0x1014:x3+0x10:8"], |_| {});
+        let expected = [
+            row(KIND_ARG, "x1", "0x1000", [0, 8]),
+            row(KIND_INIT_MEM, "x3+0x10:8", "0x1000", [0, 8]),
+        ];
+        assert_eq!(rows(&report), expected);
+        assert_eq!(all_aliases(&report), [vec!["0x100c"], vec![]]);
+    }
+
+    #[test]
+    fn a_spill_after_the_reload_is_not_a_candidate() {
+        // sub sp, sp, #0x20 ; ldr x9, [sp, #8] ; str x1, [x9, #0x10] ;
+        // str x0, [sp, #8] ; add sp, sp, #0x20 ; ret
+        let code = [
+            0xd10083ff, 0xf94007e9, 0xf9000921, 0xf90007e0, 0x910083ff, RET,
+        ];
+        let data = program(&code, &[]);
+        let ctx = loaded(&data, &[(CODE, 24, "f")]);
+        let report = sliced(&ctx, &["0x1010:x0+0x10:8"], |_| {});
+        assert_eq!(
+            rows(&report),
+            [row(KIND_INIT_MEM, "x0+0x10:8", "0x1000", [0, 8])]
+        );
+        assert!(no_alias(&report));
+    }
+
+    #[test]
+    fn a_spill_reaching_through_a_loop_is_a_candidate() {
+        // sub sp, sp, #0x20 ; ldr x9, [sp, #8] ; str x1, [x9, #0x10] ;
+        // str x0, [sp, #8] ; subs x2, x2, #1 ; b.ne 0x1004 ;
+        // add sp, sp, #0x20 ; ret
+        let code = [
+            0xd10083ff, 0xf94007e9, 0xf9000921, 0xf90007e0, 0xf1000442, 0x54ffff81, 0x910083ff, RET,
+        ];
+        let data = program(&code, &[]);
+        let ctx = loaded(&data, &[(CODE, 32, "f")]);
+        let report = sliced(&ctx, &["0x1018:x0+0x10:8"], |_| {});
+        let expected = [
+            row(KIND_ARG, "x1", "0x1000", [0, 8]),
+            row(KIND_INIT_MEM, "x0+0x10:8", "0x1000", [0, 8]),
+        ];
+        assert_eq!(rows(&report), expected);
+        assert_eq!(all_aliases(&report), [vec!["0x1004"], vec![]]);
+    }
+
+    #[test]
+    fn a_partial_overwrite_kills_the_spill() {
+        // sub sp, sp, #0x20 ; str x0, [sp, #8] ; str w3, [sp, #0xc] ;
+        // ldr x9, [sp, #8] ; str x1, [x9, #0x10] ; add sp, sp, #0x20 ; ret
+        let code = [
+            0xd10083ff, 0xf90007e0, 0xb9000fe3, 0xf94007e9, 0xf9000921, 0x910083ff, RET,
+        ];
+        let data = program(&code, &[]);
+        let ctx = loaded(&data, &[(CODE, 28, "f")]);
+        let report = sliced(&ctx, &["0x1014:x0+0x10:8"], |_| {});
+        assert_eq!(
+            rows(&report),
+            [row(KIND_INIT_MEM, "x0+0x10:8", "0x1000", [0, 8])]
+        );
+        assert!(no_alias(&report));
+    }
+
+    #[test]
+    fn a_call_does_not_kill_a_spill() {
+        // sub sp, sp, #0x20 ; mov x19, x0 ; str x0, [sp, #8] ; bl callee ;
+        // ldr x9, [sp, #8] ; str x1, [x9, #0x10] ; add sp, sp, #0x20 ; ret.
+        // Appelé de 0x80 octets : ret.
+        let code = [
+            0xd10083ff, 0xaa0003f3, 0xf90007e0, 0x9400003d, 0xf94007e9, 0xf9000921, 0x910083ff, RET,
+        ];
+        let data = program(&code, &[RET]);
+        let ctx = loaded(&data, &[(CODE, 32, "f"), (CALLEE, 0x80, "callee")]);
+        let report = sliced(&ctx, &["0x1018:x19+0x10:8"], |_| {});
+        let expected = [
+            row(KIND_ARG, "x1", "0x1000", [0, 8]),
+            row(KIND_INIT_MEM, "x0+0x10:8", "0x1000", [0, 8]),
+        ];
+        assert_eq!(rows(&report), expected);
+        assert_eq!(all_aliases(&report), [vec!["0x1010"], vec![]]);
+    }
+
+    /// sub sp, sp, #0x20 ; <x8> ; str x8, [sp, #8] ; ldr x9, [sp, #8] ;
+    /// ldrb w0, [x9, #0xd] ; add sp, sp, #0x20 ; ret. Requête sur x0.
+    fn spilled_constant(x8: u32) -> SliceReport {
+        let code = [
+            0xd10083ff, x8, 0xf90007e8, 0xf94007e9, 0x39403520, 0x910083ff, RET,
+        ];
+        let data = program(&code, &[]);
+        let ctx = loaded(&data, &[(CODE, 28, "f")]);
+        sliced(&ctx, &["0x1014:x0"], |_| {})
+    }
+
+    #[test]
+    fn a_small_integer_spilled_is_not_a_pointer() {
+        // movz x8, #0x2500 : hors du segment de 0x2000 octets.
+        let report = spilled_constant(0xd284a008);
+        let expected = [
+            row(KIND_INIT_MEM, "x9@0x100c+0xd:1", "0x1000", [0, 1]),
+            row(KIND_CONST, "0x0", "0x1010", [1, 8]),
+        ];
+        assert_eq!(rows(&report), expected);
+        assert!(no_alias(&report));
+    }
+
+    #[test]
+    fn an_address_of_the_image_spilled_is_a_candidate() {
+        // adr x8, 0x1800
+        let report = spilled_constant(0x10003fe8);
+        let expected = [
+            row(KIND_INIT_MEM, "0x180d:1", "0x1000", [0, 1]),
+            row(KIND_INIT_MEM, "x9@0x100c+0xd:1", "0x1000", [0, 1]),
+            row(KIND_CONST, "0x0", "0x1010", [1, 8]),
+        ];
+        assert_eq!(rows(&report), expected);
+        assert_eq!(all_aliases(&report), [vec!["0x100c"], vec![], vec![]]);
+    }
+
+    #[test]
+    fn the_third_assumed_reload_gives_an_alias_depth_source() {
+        // sub sp, sp, #0x30 ; str x0, [sp, #8] ; str x3, [sp, #0x10] ;
+        // str x3, [sp, #0x18] ; ldr x11, [sp, #0x18] ; str x1, [x11, #0x20] ;
+        // ldr x10, [sp, #0x10] ; ldr x12, [x10, #0x20] ; ldr x9, [sp, #8] ;
+        // str x12, [x9, #0x10] ; ldr x2, [x0, #0x10] ; add sp, sp, #0x30 ; ret
+        let code = [
+            0xd100c3ff, 0xf90007e0, 0xf9000be3, 0xf9000fe3, 0xf9400feb, 0xf9001161, 0xf9400bea,
+            0xf940114c, 0xf94007e9, 0xf900092c, 0xf9400802, 0x9100c3ff, RET,
+        ];
+        let data = program(&code, &[]);
+        let ctx = loaded(&data, &[(CODE, 52, "f")]);
+        let report = sliced(&ctx, &["0x102c:x2"], |_| {});
+        let expected = [
+            row(KIND_INIT_MEM, "x0+0x10:8", "0x1000", [0, 8]),
+            row(KIND_INIT_MEM, "x10@0x1018+0x20:8", "0x1000", [0, 8]),
+            row(KIND_INIT_MEM, "x3+0x20:8", "0x1000", [0, 8]),
+            row(KIND_UNKNOWN, "x3+0x20:8", "0x1014", [0, 8]),
+        ];
+        assert_eq!(rows(&report), expected);
+        let expected = [
+            vec![],
+            vec!["0x1020"],
+            vec!["0x1018", "0x1020"],
+            vec!["0x1018", "0x1020"],
+        ];
+        assert_eq!(all_aliases(&report), expected);
+        let sources = &report.queries[0].sources;
+        assert_eq!(sources[3].reason, Some(REASON_ALIAS_DEPTH));
+    }
+
     #[test]
     fn queries_are_parsed_or_refused_with_the_item() {
         let items = [
@@ -1742,6 +2124,7 @@ mod tests {
             "bytes",
             "chain[]",
             "chain_truncated",
+            "aliases",
             "emplacement",
             "base",
             "@join:",
@@ -1761,6 +2144,7 @@ mod tests {
             REASON_NO_PREDECESSOR,
             REASON_COMPUTED_ADDRESS,
             REASON_UNMODELED,
+            REASON_ALIAS_DEPTH,
         ];
         for label in labels {
             assert!(legend.contains(label), "{label}");
