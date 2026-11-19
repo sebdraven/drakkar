@@ -3,11 +3,12 @@
 //! d'une fonction AArch64 sur tous les chemins à la fois, jusqu'à un point
 //! fixe. Rien n'est exécuté. Étiquettes définies dans [`super::legend`].
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 
+use object::elf;
 use serde::Serialize;
 
 use super::decode::{decode, Arch, Flow, Via};
@@ -28,6 +29,8 @@ pub const MAX_SLICE_LEN: u8 = 64;
 const MAX_CHAIN: usize = 64;
 const MAX_NESTED: usize = 12;
 const MAX_EXPRESSION: usize = 3;
+const MAX_ALIAS_CHAIN: usize = 4;
+const MAX_ALIAS_PATH: usize = 2;
 const ARGS: u8 = 9;
 const LR: u8 = 30;
 const SP: u8 = 31;
@@ -46,6 +49,7 @@ const REASON_INDIRECT_BRANCH: &str = "indirect_branch";
 const REASON_NO_PREDECESSOR: &str = "no_predecessor";
 const REASON_COMPUTED_ADDRESS: &str = "computed_address";
 const REASON_UNMODELED: &str = "unmodeled";
+const REASON_ALIAS_DEPTH: &str = "alias_depth";
 
 /// Emplacement d'une requête : registre, ou `len` octets à registre +
 /// `offset`, le registre lu juste avant l'instruction de la requête.
@@ -184,6 +188,8 @@ pub struct SliceSource {
     pub bytes: [u8; 2],
     pub chain: Vec<SliceStep>,
     pub chain_truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -246,7 +252,8 @@ impl Fact {
 }
 
 /// Fonction bornée : graphe de flot par instruction, effet de chaque
-/// instruction, valeur de x0..x30 et sp avant chacune.
+/// instruction, valeur de x0..x30 et sp avant chacune, valeurs possibles de
+/// chaque relecture de pile.
 struct Func {
     bound: Bound,
     graph: FlowGraph,
@@ -257,10 +264,15 @@ struct Func {
     /// br dont les cibles sont inconnues.
     open: Vec<usize>,
     values: Vec<Values>,
+    reloads: Reloads,
 }
 
 /// Registres écrits par un bl, par cible.
 type Writes = HashMap<u64, Vec<u8>>;
+
+/// (relecture, registre) : valeurs possibles, chacune avec les relectures
+/// supposées pour l'obtenir, triées.
+type Reloads = HashMap<(u64, u8), Vec<(Value, Vec<u64>)>>;
 
 impl Func {
     fn build(ctx: &Ctx, fdes: &[(u64, u64)], writes: &mut Writes, bound: Bound) -> Option<Func> {
@@ -309,6 +321,7 @@ impl Func {
             }
         }
         let values = forward(ctx, fdes, writes, &graph, &effects, &succs);
+        let reloads = reloads(ctx, &graph, &effects, &values, &succs);
         Some(Func {
             bound,
             graph,
@@ -317,12 +330,262 @@ impl Func {
             exits,
             open,
             values,
+            reloads,
         })
     }
 
     fn address(&self, index: usize) -> u64 {
         self.graph.insns[index].0
     }
+
+    /// Valeurs que peut avoir `value` quand sa base est une relecture de
+    /// pile : valeur, relecture, relectures supposées.
+    fn may_be(&self, value: Value) -> Vec<(Value, u64, Vec<u64>)> {
+        let (Origin::Def(at, reg), k) = value else {
+            return Vec::new();
+        };
+        let Some(found) = self.reloads.get(&(at, reg)) else {
+            return Vec::new();
+        };
+        found
+            .iter()
+            .map(|((origin, j), aliases)| ((*origin, j.wrapping_add(k)), at, aliases.clone()))
+            .collect()
+    }
+}
+
+/// Pour chaque relecture de 8 octets d'un emplacement de pile, la valeur
+/// d'avant chaque rangement de 8 octets d'un registre au même emplacement qui
+/// l'atteint ([`reaching`]), avec les relectures supposées. Un candidat
+/// lui-même relu est remplacé par les siens, sur MAX_ALIAS_CHAIN niveaux ; un
+/// candidat absolu hors des segments LOAD est écarté.
+fn reloads(
+    ctx: &Ctx,
+    graph: &FlowGraph,
+    effects: &[Option<Effect>],
+    values: &[Values],
+    succs: &[Vec<usize>],
+) -> Reloads {
+    let direct = reaching(graph, effects, values, succs);
+    let in_image = |at: i64| {
+        let mut loads = ctx.image.segments.iter().filter(|s| s.p_type == elf::PT_LOAD);
+        loads.any(|s| s.in_memory(at as u64))
+    };
+    let mut table = Reloads::new();
+    for (&(at, reg), found) in &direct {
+        let mut frontier: BTreeSet<(Value, Vec<u64>)> =
+            found.iter().map(|&value| (value, vec![at])).collect();
+        let mut done = BTreeSet::new();
+        for _ in 0..MAX_ALIAS_CHAIN {
+            let mut next = BTreeSet::new();
+            for ((origin, k), aliases) in frontier {
+                let deeper = match origin {
+                    Origin::Def(l, r) => direct.get(&(l, r)).map(|found| (l, found)),
+                    _ => None,
+                };
+                let Some((l, found)) = deeper else {
+                    done.insert(((origin, k), aliases));
+                    continue;
+                };
+                for &(o, j) in found.iter() {
+                    let mut more = aliases.clone();
+                    more.push(l);
+                    more.sort_unstable();
+                    more.dedup();
+                    next.insert(((o, j.wrapping_add(k)), more));
+                }
+            }
+            frontier = next;
+        }
+        done.extend(frontier);
+        let kept: Vec<_> = done
+            .into_iter()
+            .filter(|&((origin, k), _)| origin != Origin::Absolute || in_image(k))
+            .collect();
+        if !kept.is_empty() {
+            table.insert((at, reg), kept);
+        }
+    }
+    table
+}
+
+/// Rangements de 8 octets qui atteignent chaque relecture du même
+/// emplacement : (relecture, registre) → valeurs rangées. Une écriture de la
+/// fonction qui recouvre un octet de l'emplacement tue ses rangements ; un
+/// appel ou une écriture par une autre base ne tue rien. Jonction = union ; le
+/// code non atteint depuis l'entrée part d'un ensemble vide.
+fn reaching(
+    graph: &FlowGraph,
+    effects: &[Option<Effect>],
+    values: &[Values],
+    succs: &[Vec<usize>],
+) -> HashMap<(u64, u8), BTreeSet<Value>> {
+    let count = effects.len();
+    let mut spilled: Vec<Vec<(i64, u8)>> = vec![Vec::new(); count];
+    let mut written: Vec<Vec<(i64, i64)>> = vec![Vec::new(); count];
+    let mut read = Vec::new();
+    for (i, effect) in effects.iter().enumerate() {
+        let called = matches!(
+            graph.insns[i].1.as_ref().map(|(_, insn)| insn.flow),
+            Some(Flow::Call(..) | Flow::CallVia(_))
+        );
+        let Some(effect) = effect.as_ref().filter(|_| !called) else {
+            continue;
+        };
+        spilled[i] = spills(effect, &values[i]);
+        written[i] = stack_writes(effect, &values[i]);
+        for (reg, slot) in stack_reads(effect, &values[i]) {
+            read.push((i, reg, slot));
+        }
+    }
+    let slots: BTreeSet<i64> = read.iter().map(|&(_, _, slot)| slot).collect();
+    let mut defs: Vec<(i64, Value)> = Vec::new();
+    let mut made: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for (i, found) in spilled.iter().enumerate() {
+        for &(slot, reg) in found.iter().filter(|(slot, _)| slots.contains(slot)) {
+            made[i].push(defs.len());
+            defs.push((slot, values[i][usize::from(reg)]));
+        }
+    }
+    if defs.is_empty() {
+        return HashMap::new();
+    }
+    let words = defs.len().div_ceil(64);
+    let bit = |set: &mut Vec<u64>, d: usize| set[d / 64] |= 1 << (d % 64);
+    let mut transfer: Vec<Option<(Vec<u64>, Vec<u64>)>> = vec![None; count];
+    for (i, ranges) in written.iter().enumerate() {
+        if ranges.is_empty() {
+            continue;
+        }
+        let overlaps = |slot: i64| {
+            let end = slot.wrapping_add(8);
+            ranges.iter().any(|&(from, to)| from < end && slot < to)
+        };
+        let (mut kill, mut make) = (vec![0u64; words], vec![0u64; words]);
+        for (d, &(slot, _)) in defs.iter().enumerate() {
+            if overlaps(slot) {
+                bit(&mut kill, d);
+            }
+        }
+        for &d in &made[i] {
+            bit(&mut make, d);
+        }
+        if kill.iter().chain(&make).any(|&w| w != 0) {
+            transfer[i] = Some((kill, make));
+        }
+    }
+    let mut before: Vec<Option<Vec<u64>>> = vec![None; count];
+    let mut work = VecDeque::new();
+    if count > 0 {
+        before[0] = Some(vec![0; words]);
+        work.push_back(0);
+    }
+    while let Some(i) = work.pop_front() {
+        let Some(mut out) = before[i].clone() else {
+            continue;
+        };
+        if let Some((kill, make)) = &transfer[i] {
+            for (w, word) in out.iter_mut().enumerate() {
+                *word = (*word & !kill[w]) | make[w];
+            }
+        }
+        for &j in &succs[i] {
+            let changed = match &mut before[j] {
+                None => {
+                    before[j] = Some(out.clone());
+                    true
+                }
+                Some(known) => {
+                    let mut changed = false;
+                    for (word, &w) in known.iter_mut().zip(&out) {
+                        changed |= (*word | w) != *word;
+                        *word |= w;
+                    }
+                    changed
+                }
+            };
+            if changed {
+                work.push_back(j);
+            }
+        }
+    }
+    let mut direct: HashMap<(u64, u8), BTreeSet<Value>> = HashMap::new();
+    for (i, reg, slot) in read {
+        let Some(reach) = &before[i] else {
+            continue;
+        };
+        let found: BTreeSet<Value> = defs
+            .iter()
+            .enumerate()
+            .filter(|&(d, &(s, _))| s == slot && (reach[d / 64] >> (d % 64)) & 1 == 1)
+            .map(|(_, &(_, value))| value)
+            .collect();
+        if !found.is_empty() {
+            direct.insert((graph.insns[i].0, reg), found);
+        }
+    }
+    direct
+}
+
+/// Octets de pile (décalages depuis sp à l'entrée) qu'écrit l'effet : [début,
+/// fin). Une zone perdue sans fin connue n'en donne pas.
+fn stack_writes(effect: &Effect, values: &Values) -> Vec<(i64, i64)> {
+    let mut found = Vec::new();
+    for (base, off, _) in &effect.stores {
+        if let Some((Origin::Entry(SP), at)) = canonical(*base, *off, values) {
+            found.push((at, at.wrapping_add(1)));
+        }
+    }
+    for &(base, from, to) in &effect.lost {
+        let (Some(to), Some((Origin::Entry(SP), k))) = (to, canonical(base, 0, values)) else {
+            continue;
+        };
+        found.push((k.wrapping_add(from), k.wrapping_add(to)));
+    }
+    found
+}
+
+/// Emplacements de pile (décalage depuis sp à l'entrée) où l'effet range les
+/// octets 0..7 d'un même registre x0..x30, dans l'ordre.
+fn spills(effect: &Effect, values: &Values) -> Vec<(i64, u8)> {
+    let mut stored: HashMap<i64, &[ByteFrom]> = HashMap::new();
+    for (base, off, from) in &effect.stores {
+        if let Some((Origin::Entry(SP), slot)) = canonical(*base, *off, values) {
+            stored.insert(slot, from.as_slice());
+        }
+    }
+    let byte = |slot: i64, i: u8| stored.get(&slot.wrapping_add(i64::from(i))).copied();
+    let mut found = Vec::new();
+    for (&slot, &from) in &stored {
+        let &[ByteFrom::Reg(reg, 0)] = from else {
+            continue;
+        };
+        let whole = (1..8u8).all(|i| byte(slot, i) == Some(&[ByteFrom::Reg(reg, i)][..]));
+        if reg <= LR && whole {
+            found.push((slot, reg));
+        }
+    }
+    found
+}
+
+/// Registres x0..x30 dont l'effet écrit les 8 octets depuis 8 octets
+/// consécutifs d'un emplacement de pile.
+fn stack_reads(effect: &Effect, values: &Values) -> Vec<(u8, i64)> {
+    let mut found = Vec::new();
+    for (reg, bytes) in &effect.regs {
+        let Some(&[ByteFrom::Mem(base, off)]) = bytes.first().map(|b| b.as_slice()) else {
+            continue;
+        };
+        let at = |i: usize| [ByteFrom::Mem(base, off.wrapping_add(i as i64))];
+        let whole = bytes.len() == 8 && bytes.iter().enumerate().all(|(i, b)| *b == at(i));
+        if *reg > LR || !whole {
+            continue;
+        }
+        if let Some((Origin::Entry(SP), slot)) = canonical(base, off, values) {
+            found.push((*reg, slot));
+        }
+    }
+    found
 }
 
 /// Valeurs avant chaque instruction, jusqu'au point fixe : à l'entrée chaque
@@ -526,7 +789,8 @@ fn target(from: ByteFrom, values: &Values) -> Target {
 
 /// Emplacement vu depuis l'appelé, à sa sortie. Un fragment voit tous les
 /// registres de l'appelant et ses globales ; un autre appelé, les zones dont la
-/// base est dans x0..x8.
+/// base est dans x0..x8. Base exacte seulement : un registre relu de la pile
+/// passe par [`alias_into_callee`].
 fn into_callee(loc: Loc, values: &Values, fragment: bool) -> Option<Loc> {
     match loc {
         Loc::Reg { .. } => Some(loc),
@@ -547,6 +811,38 @@ fn into_callee(loc: Loc, values: &Values, fragment: bool) -> Option<Loc> {
             })
         }
     }
+}
+
+/// Comme [`into_callee`], par un registre relu de la pile qui peut valoir la
+/// base de la zone : emplacement, relecture, relectures supposées.
+fn alias_into_callee(
+    func: &Func,
+    loc: Loc,
+    values: &Values,
+    fragment: bool,
+) -> Vec<(Loc, u64, Vec<u64>)> {
+    let Loc::Mem { origin, off, len } = loc else {
+        return Vec::new();
+    };
+    if origin == Origin::Absolute {
+        return Vec::new();
+    }
+    let regs = if fragment { 0..=SP } else { 0..=ARGS - 1 };
+    let mut found = Vec::new();
+    for reg in regs {
+        for ((o, k), reload, aliases) in func.may_be(values[usize::from(reg)]) {
+            if o == origin {
+                let off = off.wrapping_sub(k);
+                let loc = Loc::Mem {
+                    origin: Origin::Entry(reg),
+                    off,
+                    len,
+                };
+                found.push((loc, reload, aliases));
+            }
+        }
+    }
+    found
 }
 
 fn offset_text(off: i64) -> String {
@@ -630,6 +926,7 @@ struct Key {
     value: Option<u64>,
     call_target: Option<String>,
     reason: Option<&'static str>,
+    aliases: Vec<u64>,
 }
 
 impl Key {
@@ -642,25 +939,30 @@ impl Key {
             value: None,
             call_target: None,
             reason: None,
+            aliases: Vec::new(),
         }
     }
 }
 
 /// Définition qui a transformé un emplacement ; `parent` : celle d'après, vers
-/// la requête.
+/// la requête. `aliases` : relectures supposées égales à un rangement pour
+/// franchir ce pas ; `aliased` : ici ou plus près de la requête.
 struct Node {
     insn: Option<u64>,
     parent: Option<usize>,
+    aliases: Vec<u64>,
+    aliased: bool,
 }
 
 /// Fonction remontée : l'analysée, ou une appelée traversée depuis l'appel
-/// `caller`. `seen` : emplacements déjà recherchés à chaque point.
+/// `caller`. `seen` : emplacements déjà recherchés à chaque point, à part
+/// selon qu'un alias a été supposé.
 struct Instance {
     func: Rc<Func>,
     caller: Option<(usize, usize)>,
     level: u8,
     nest: usize,
-    seen: HashMap<usize, HashSet<Fact>>,
+    seen: HashMap<usize, HashSet<(Fact, bool)>>,
 }
 
 /// Recherche d'une requête. Un point est l'indice d'une instruction (juste
@@ -693,22 +995,68 @@ impl Search<'_, '_> {
     }
 
     fn push(&mut self, inst: usize, point: usize, fact: Fact, node: usize) {
+        let aliased = self.nodes[node].aliased;
         let seen = self.instances[inst].seen.entry(point).or_default();
-        if seen.insert(fact) {
+        if seen.insert((fact, aliased)) {
             self.work.push_back((inst, point, fact, node));
         }
     }
 
     fn node(&mut self, insn: u64, parent: usize) -> usize {
+        let aliased = self.nodes[parent].aliased;
         self.nodes.push(Node {
             insn: Some(insn),
             parent: Some(parent),
+            aliases: Vec::new(),
+            aliased,
         });
         self.nodes.len() - 1
     }
 
-    fn source(&mut self, key: Key, node: usize) {
+    /// Pas franchi en supposant que la relecture `reload` rend une valeur
+    /// rangée ; au-delà de MAX_ALIAS_PATH relectures sur le chemin, source
+    /// unknown sur `fact` en `at` à la place.
+    fn assume(
+        &mut self,
+        reload: u64,
+        aliases: Vec<u64>,
+        parent: usize,
+        fact: Fact,
+        at: u64,
+    ) -> Option<usize> {
+        let mut path = self.assumed(parent);
+        path.extend(&aliases);
+        path.sort_unstable();
+        path.dedup();
+        if path.len() > MAX_ALIAS_PATH {
+            self.unknown(fact, at, REASON_ALIAS_DEPTH, parent);
+            return None;
+        }
+        self.nodes.push(Node {
+            insn: Some(reload),
+            parent: Some(parent),
+            aliases,
+            aliased: true,
+        });
+        Some(self.nodes.len() - 1)
+    }
+
+    fn source(&mut self, mut key: Key, node: usize) {
+        key.aliases = self.assumed(node);
         self.sources.entry(key).or_insert(node);
+    }
+
+    /// Relectures supposées de `node` vers la requête, triées.
+    fn assumed(&self, node: usize) -> Vec<u64> {
+        let mut found = Vec::new();
+        let mut at = Some(node).filter(|&n| self.nodes[n].aliased);
+        while let Some(index) = at {
+            found.extend(&self.nodes[index].aliases);
+            at = self.nodes[index].parent;
+        }
+        found.sort_unstable();
+        found.dedup();
+        found
     }
 
     fn unknown(&mut self, fact: Fact, at: u64, reason: &'static str, node: usize) {
@@ -792,12 +1140,33 @@ impl Search<'_, '_> {
         }
     }
 
-    /// Remonte l'instruction `p` : `fact` est recherché juste après elle.
+    /// Remonte l'instruction `p` : `fact` est recherché juste après elle. Une
+    /// zone dont la base est écrite par `p`, relecture de pile, est aussi
+    /// cherchée sur chaque valeur rangée à cet emplacement.
     fn through(&mut self, inst: usize, func: &Func, p: usize, exit: bool, fact: Fact, node: usize) {
         let at = func.address(p);
         let Some((_, insn)) = &func.graph.insns[p].1 else {
             return self.unknown(fact, at, REASON_UNMODELED, node);
         };
+        if let Loc::Mem {
+            origin: origin @ Origin::Def(def, _),
+            off,
+            len,
+        } = fact.loc
+        {
+            let candidates = if def == at {
+                func.may_be((origin, off))
+            } else {
+                Vec::new()
+            };
+            for ((origin, off), reload, aliases) in candidates {
+                let Some(next) = self.assume(reload, aliases, node, fact, at) else {
+                    continue;
+                };
+                let loc = Loc::Mem { origin, off, len };
+                self.push(inst, p, Fact { loc, ..fact }, next);
+            }
+        }
         match insn.flow {
             Flow::Call(to, _) => self.call(inst, func, p, to, fact, node),
             Flow::Jump(to, _) | Flow::Branch(to, _) if exit => {
@@ -815,6 +1184,7 @@ impl Search<'_, '_> {
         };
         let values = &func.values[p];
         let mut out = Vec::new();
+        let mut aliased: BTreeMap<(u64, Vec<u64>), Vec<(Target, u8, bool)>> = BTreeMap::new();
         match fact.loc {
             Loc::Reg { reg, lo, len } => {
                 let written = effect.regs.iter().find(|(r, _)| *r == reg);
@@ -857,9 +1227,30 @@ impl Search<'_, '_> {
                         out.push((Target::Mem(origin, addr), q, true));
                     }
                 }
+                for (base, at_off, origins) in &effect.stores {
+                    let Some(place) = canonical(*base, *at_off, values) else {
+                        continue;
+                    };
+                    for ((o, addr), reload, aliases) in func.may_be(place) {
+                        let rel = addr.wrapping_sub(off);
+                        if o != origin || !(0..i64::from(len)).contains(&rel) {
+                            continue;
+                        }
+                        let q = fact.q + rel as u8;
+                        let found = aliased.entry((reload, aliases)).or_default();
+                        for &from in origins {
+                            found.push((target(from, values), q, false));
+                        }
+                    }
+                }
             }
         }
         self.emit(inst, p, at, fact, node, out);
+        for ((reload, aliases), out) in aliased {
+            if let Some(next) = self.assume(reload, aliases, node, fact, at) {
+                self.emit(inst, p, at, fact, next, out);
+            }
+        }
     }
 
     /// Regroupe les octets en emplacements et en sources.
@@ -942,6 +1333,8 @@ impl Search<'_, '_> {
 
     /// bl, ou b hors de la fonction : memcpy, fragment toujours traversé,
     /// appel suivi, sinon source call si l'appel peut écrire l'emplacement.
+    /// Atteint seulement par un registre relu de la pile : suivi ou source
+    /// call, et l'emplacement continue aussi de remonter.
     fn call(&mut self, inst: usize, func: &Func, p: usize, to: u64, fact: Fact, node: usize) {
         let at = func.address(p);
         let values = &func.values[p];
@@ -953,24 +1346,42 @@ impl Search<'_, '_> {
             Loc::Reg { reg, .. } => fragment || !PRESERVED.contains(&usize::from(reg)),
             Loc::Mem { .. } => into_callee(fact.loc, values, fragment).is_some(),
         };
-        if !reached {
+        let aliased = alias_into_callee(func, fact.loc, values, fragment);
+        if !reached && aliased.is_empty() {
             return self.push(inst, p, fact, node);
         }
         let (level, nest) = (self.instances[inst].level, self.instances[inst].nest);
         let deep = level < self.options.depth || self.options.follow.contains(&at);
         let imported = plt_import(self.ctx, to, false).is_some();
-        if (fragment || deep) && nest < MAX_NESTED && !imported {
+        let child = if (fragment || deep) && nest < MAX_NESTED && !imported {
             let level = if fragment { level } else { level + 1 };
-            let mapped = into_callee(fact.loc, values, fragment);
-            if let (Some(child), Some(loc)) = (self.child(inst, p, to, level), mapped) {
-                return self.push(child, EXIT, Fact { loc, ..fact }, node);
-            }
-        }
+            self.child(inst, p, to, level)
+        } else {
+            None
+        };
         let key = Key {
             location: Some(render(fact.loc)),
             call_target: Some(hex(to)),
             ..Key::new(KIND_CALL, at, fact.bytes())
         };
+        for (loc, reload, aliases) in aliased {
+            if reached && child.is_none() {
+                break;
+            }
+            let Some(next) = self.assume(reload, aliases, node, fact, at) else {
+                continue;
+            };
+            match child {
+                Some(child) => self.push(child, EXIT, Fact { loc, ..fact }, next),
+                None => self.source(key.clone(), next),
+            }
+        }
+        if !reached {
+            return self.push(inst, p, fact, node);
+        }
+        if let (Some(child), Some(loc)) = (child, into_callee(fact.loc, values, fragment)) {
+            return self.push(child, EXIT, Fact { loc, ..fact }, node);
+        }
         self.source(key, node);
     }
 
@@ -1032,11 +1443,37 @@ impl Search<'_, '_> {
                     }
                 }
                 self.emit(inst, p, at, fact, node, out);
+                for ((o, k), reload, aliases) in func.may_be(dst) {
+                    if o != origin {
+                        continue;
+                    }
+                    let mut out = Vec::new();
+                    for i in 0..n {
+                        let (addr, q) = (off.wrapping_add(i64::from(i)), fact.q + i);
+                        let rel = addr.wrapping_sub(k);
+                        if rel < 0 || len.is_some_and(|len| rel >= len) {
+                            continue;
+                        }
+                        let from = match len {
+                            Some(_) => Target::Mem(src.0, src.1.wrapping_add(rel)),
+                            None => Target::Call(to),
+                        };
+                        out.push((from, q, false));
+                    }
+                    if out.is_empty() {
+                        continue;
+                    }
+                    if let Some(next) = self.assume(reload, aliases, node, fact, at) {
+                        self.emit(inst, p, at, fact, next, out);
+                    }
+                }
             }
         }
     }
 
-    /// blr : source indirect_call si l'appel peut écrire l'emplacement.
+    /// blr : source indirect_call si l'appel peut écrire l'emplacement ;
+    /// atteint seulement par un registre relu de la pile, l'emplacement
+    /// continue aussi de remonter.
     fn indirect(&mut self, inst: usize, func: &Func, p: usize, via: Via, fact: Fact, node: usize) {
         let at = func.address(p);
         let values = &func.values[p];
@@ -1044,7 +1481,8 @@ impl Search<'_, '_> {
             Loc::Reg { reg, .. } => !PRESERVED.contains(&usize::from(reg)),
             Loc::Mem { .. } => into_callee(fact.loc, values, false).is_some(),
         };
-        if !reached {
+        let aliased = alias_into_callee(func, fact.loc, values, false);
+        if !reached && aliased.is_empty() {
             return self.push(inst, p, fact, node);
         }
         let shown = match via {
@@ -1056,7 +1494,15 @@ impl Search<'_, '_> {
             call_target: shown,
             ..Key::new(KIND_INDIRECT_CALL, at, fact.bytes())
         };
-        self.source(key, node);
+        if reached {
+            return self.source(key, node);
+        }
+        for (_, reload, aliases) in aliased {
+            if let Some(next) = self.assume(reload, aliases, node, fact, at) {
+                self.source(key.clone(), next);
+            }
+        }
+        self.push(inst, p, fact, node);
     }
 
     fn child(&mut self, inst: usize, call: usize, to: u64, level: u8) -> Option<usize> {
@@ -1220,6 +1666,8 @@ fn answer(
         nodes: vec![Node {
             insn: None,
             parent: None,
+            aliases: Vec::new(),
+            aliased: false,
         }],
         work: VecDeque::new(),
         sources: HashMap::new(),
@@ -1244,6 +1692,7 @@ fn answer(
             bytes: key.bytes,
             chain: chain.into_iter().map(|at| step(ctx, at)).collect(),
             chain_truncated,
+            aliases: key.aliases.into_iter().map(hex).collect(),
         });
     }
     let sources_truncated = sources.len() < sources_total;
