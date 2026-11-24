@@ -736,4 +736,19 @@ mod tests {
         assert_eq!(out[1], DexValue::Type("Lcom/dy/Foo;".into()));
         assert_eq!(out[2], DexValue::Int(7));
     }
+
+    #[test]
+    fn encoded_array_brut_float_double_etendus_a_droite() {
+        let brut = b"\x03\x31\x14\x40\x31\xE0\x3F\x30\x80\x3F";
+        let (valeurs, fin) = dex_parser::dex::decode_encoded_array(brut, 0).unwrap();
+        assert_eq!(fin, brut.len());
+        assert_eq!(
+            valeurs,
+            [
+                EncodedValue::Double(5.0),
+                EncodedValue::Double(0.5),
+                EncodedValue::Float(1.0),
+            ]
+        );
+    }
 }

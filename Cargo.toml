@@ -103,3 +103,7 @@ lief-backend = ["dep:lief"]
 [[bin]]
 name = "drakkar"
 path = "src/main.rs"
+
+# Fork : float/double raccourcis des encoded_value lus à l'envers ; retirer dès que le correctif est fusionné dans androguard/dex-parser main.
+[patch."https://github.com/androguard/dex-parser"]
+dex-parser = { git = "https://github.com/sebdraven/dex-parser", branch = "fix/decompile-fidelity" }
