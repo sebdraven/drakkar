@@ -35,10 +35,12 @@ pub enum Kind {
     SwitchCaseLost,
     LostCall,
     LostString,
+    WideLocal,
+    WideParam,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 10] = [
+    pub const ALL: [Kind; 12] = [
         Kind::LiteralReceiver,
         Kind::UndefinedVar,
         Kind::DeadAfterReturn,
@@ -49,11 +51,18 @@ impl Kind {
         Kind::SwitchCaseLost,
         Kind::LostCall,
         Kind::LostString,
+        Kind::WideLocal,
+        Kind::WideParam,
     ];
 
     /// Ce que le Java a perdu du bytecode, par opposition à ce qu'il a de faux.
     pub fn is_loss(self) -> bool {
         matches!(self, Kind::LostCall | Kind::LostString)
+    }
+
+    /// Type trop large : ni Java faux, ni perte.
+    pub fn is_imprecision(self) -> bool {
+        matches!(self, Kind::WideLocal | Kind::WideParam)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -68,6 +77,29 @@ impl Kind {
             Kind::SwitchCaseLost => "switch_case_lost",
             Kind::LostCall => "lost_call",
             Kind::LostString => "lost_string",
+            Kind::WideLocal => "wide_local",
+            Kind::WideParam => "wide_param",
+        }
+    }
+}
+
+/// Expression qui définit un wide_local.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    Call,
+    Field,
+    Array,
+    Other,
+}
+
+impl Origin {
+    fn of(value: Node<'_>) -> Self {
+        match unparen(value).kind() {
+            "method_invocation" | "object_creation_expression" => Origin::Call,
+            "field_access" | "scoped_identifier" => Origin::Field,
+            "array_access" => Origin::Array,
+            _ => Origin::Other,
         }
     }
 }
@@ -77,9 +109,12 @@ impl Kind {
 pub struct Suspect {
     pub kind: Kind,
     pub line: usize,
-    /// Élément perdu (lost_call, lost_string) : nom de méthode ou chaîne.
+    /// Élément perdu (lost_call, lost_string) : nom de méthode ou chaîne ;
+    /// variable (wide_local, wide_param).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
 }
 
 impl Suspect {
@@ -88,6 +123,7 @@ impl Suspect {
             kind,
             line,
             detail: None,
+            origin: None,
         }
     }
 }
@@ -379,6 +415,7 @@ fn losses(decl: Node<'_>, src: &[u8], facts: &MethodFacts, line: usize) -> Vec<S
         kind,
         line,
         detail: Some(detail),
+        origin: None,
     };
     let mut out: Vec<Suspect> = facts
         .calls
@@ -765,10 +802,128 @@ fn analyze_method(
     for line in numeric_receiver_lines(decl, &nodes, src) {
         out.push(Suspect::at(Kind::LiteralReceiver, line));
     }
+    out.extend(wide_suspects(decl, &nodes, src));
 
     out.sort();
     out.dedup();
     out
+}
+
+/// Paramètres de `decl` et locales typés Object, opérandes directs d'un cast
+/// vers un type référence plus étroit. Un suspect par nom.
+fn wide_suspects(decl: Node<'_>, nodes: &[Node<'_>], src: &[u8]) -> Vec<Suspect> {
+    let casted: HashSet<&str> = nodes
+        .iter()
+        .filter(|n| n.kind() == "cast_expression")
+        .filter_map(|n| narrowed(*n, src))
+        .collect();
+    let wide = |name: &str, line: usize, kind: Kind, origin: Option<Origin>| Suspect {
+        kind,
+        line,
+        detail: Some(name.to_string()),
+        origin,
+    };
+
+    let mut out = Vec::new();
+    let mut params: HashSet<&str> = HashSet::new();
+    let formals = decl
+        .child_by_field_name("parameters")
+        .map(named_children)
+        .unwrap_or_default();
+    for p in formals {
+        if p.kind() != "formal_parameter" {
+            continue;
+        }
+        let Some(name) = p.child_by_field_name("name") else {
+            continue;
+        };
+        let name = text(name, src);
+        params.insert(name);
+        let ty = p.child_by_field_name("type");
+        let scalar = p.child_by_field_name("dimensions").is_none();
+        if scalar && ty.is_some_and(|t| is_object_type(t, src)) && casted.contains(name) {
+            out.push(wide(name, line_of(p), Kind::WideParam, None));
+        }
+    }
+
+    let mut seen: HashSet<&str> = HashSet::new();
+    for &d in nodes {
+        if d.kind() != "variable_declarator" {
+            continue;
+        }
+        let ty = d
+            .parent()
+            .filter(|p| p.kind() == "local_variable_declaration")
+            .and_then(|p| p.child_by_field_name("type"));
+        let Some(name) = d.child_by_field_name("name") else {
+            continue;
+        };
+        let name = text(name, src);
+        let object = ty.is_some_and(|t| is_object_type(t, src));
+        if !object
+            || d.child_by_field_name("dimensions").is_some()
+            || params.contains(name)
+            || !casted.contains(name)
+            || !seen.insert(name)
+        {
+            continue;
+        }
+        let value = d
+            .child_by_field_name("value")
+            .or_else(|| first_assignment(nodes, name, d.end_byte(), src));
+        let origin = value.map_or(Origin::Other, Origin::of);
+        out.push(wide(name, line_of(d), Kind::WideLocal, Some(origin)));
+    }
+    out
+}
+
+const PRIMITIVE_TYPE_NODES: [&str; 4] = [
+    "integral_type",
+    "floating_point_type",
+    "boolean_type",
+    "void_type",
+];
+
+fn is_object_type(ty: Node<'_>, src: &[u8]) -> bool {
+    matches!(text(ty, src), "Object" | "java.lang.Object")
+}
+
+/// Identifiant opérande direct (parenthèses ignorées) d'un cast vers un type
+/// référence autre qu'Object.
+fn narrowed<'s>(cast: Node<'_>, src: &'s [u8]) -> Option<&'s str> {
+    let ty = cast.child_by_field_name("type")?;
+    if PRIMITIVE_TYPE_NODES.contains(&ty.kind()) || is_object_type(ty, src) {
+        return None;
+    }
+    let operand = unparen(cast.child_by_field_name("value")?);
+    if operand.kind() != "identifier" {
+        return None;
+    }
+    Some(text(operand, src))
+}
+
+/// Membre droit du premier `name = …` qui commence à `after` ou plus loin.
+fn first_assignment<'t>(
+    nodes: &[Node<'t>],
+    name: &str,
+    after: usize,
+    src: &[u8],
+) -> Option<Node<'t>> {
+    for &n in nodes {
+        if n.kind() != "assignment_expression"
+            || n.start_byte() < after
+            || operator(n, src) != Some("=")
+        {
+            continue;
+        }
+        let Some(left) = n.child_by_field_name("left") else {
+            continue;
+        };
+        if left.kind() == "identifier" && text(left, src) == name {
+            return n.child_by_field_name("right");
+        }
+    }
+    None
 }
 
 /// Nœuds dont le texte n'est pas du code : masqués par le repli lexical.
@@ -1101,7 +1256,7 @@ fn preorder(root: Node<'_>) -> Vec<Node<'_>> {
 }
 
 /// Compteurs de `fidelity.json`, cumulés sur les classes.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Totals {
     pub methods_total: usize,
     /// Méthodes dont le Java a été lu : `java_lines` non null.
@@ -1113,24 +1268,73 @@ pub struct Totals {
     /// fidelity.json antérieur aux kinds de perte : lu comme 0.
     #[serde(default)]
     pub methods_with_loss: usize,
-    /// Total par kind, chaque kind présent même à 0.
-    pub suspect: BTreeMap<String, usize>,
+    pub suspect: SuspectTotals,
 }
 
-impl Default for Totals {
+/// `suspect` de `fidelity.json`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SuspectTotals {
+    /// Total par kind, chaque kind présent même à 0.
+    #[serde(flatten)]
+    pub by_kind: BTreeMap<String, usize>,
+    /// Absent d'un fidelity.json antérieur à wide_local : lu comme 0.
+    #[serde(default)]
+    pub wide_local_by_origin: ByOrigin,
+}
+
+impl Default for SuspectTotals {
     fn default() -> Self {
         Self {
-            methods_total: 0,
-            methods_analyzed: 0,
-            methods_clean: 0,
-            syntax_errors_total: 0,
-            syntax_errors_outside_methods: 0,
-            methods_with_loss: 0,
-            suspect: Kind::ALL
+            by_kind: Kind::ALL
                 .iter()
                 .map(|k| (k.as_str().to_string(), 0))
                 .collect(),
+            wide_local_by_origin: ByOrigin::default(),
         }
+    }
+}
+
+/// wide_local réparti par origine ; la somme vaut `suspect.wide_local`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByOrigin {
+    pub call: usize,
+    pub field: usize,
+    pub array: usize,
+    pub other: usize,
+}
+
+impl SuspectTotals {
+    fn add(&mut self, s: &Suspect) {
+        *self.by_kind.entry(s.kind.as_str().to_string()).or_insert(0) += 1;
+        if s.kind == Kind::WideLocal {
+            let origin = s.origin.unwrap_or(Origin::Other);
+            *self.wide_local_by_origin.slot(origin) += 1;
+        }
+    }
+
+    fn merge(&mut self, o: &SuspectTotals) {
+        for (k, n) in &o.by_kind {
+            *self.by_kind.entry(k.clone()).or_insert(0) += n;
+        }
+        self.wide_local_by_origin.merge(&o.wide_local_by_origin);
+    }
+}
+
+impl ByOrigin {
+    fn slot(&mut self, origin: Origin) -> &mut usize {
+        match origin {
+            Origin::Call => &mut self.call,
+            Origin::Field => &mut self.field,
+            Origin::Array => &mut self.array,
+            Origin::Other => &mut self.other,
+        }
+    }
+
+    fn merge(&mut self, other: &ByOrigin) {
+        self.call += other.call;
+        self.field += other.field;
+        self.array += other.array;
+        self.other += other.other;
     }
 }
 
@@ -1139,7 +1343,7 @@ impl Totals {
         self.methods_total += 1;
         if analyzed {
             self.methods_analyzed += 1;
-            if syntax_errors == 0 && suspect.is_empty() {
+            if syntax_errors == 0 && suspect.iter().all(|s| s.kind.is_imprecision()) {
                 self.methods_clean += 1;
             }
         }
@@ -1148,7 +1352,7 @@ impl Totals {
         }
         self.syntax_errors_total += syntax_errors;
         for s in suspect {
-            *self.suspect.entry(s.kind.as_str().to_string()).or_insert(0) += 1;
+            self.suspect.add(s);
         }
     }
 
@@ -1164,9 +1368,7 @@ impl Totals {
         self.syntax_errors_total += other.syntax_errors_total;
         self.syntax_errors_outside_methods += other.syntax_errors_outside_methods;
         self.methods_with_loss += other.methods_with_loss;
-        for (k, n) in &other.suspect {
-            *self.suspect.entry(k.clone()).or_insert(0) += n;
-        }
+        self.suspect.merge(&other.suspect);
     }
 }
 
@@ -1221,6 +1423,8 @@ struct SuspectRow {
     line: usize,
     #[serde(default)]
     detail: Option<String>,
+    #[serde(default)]
+    origin: Option<String>,
 }
 
 /// `(id de classe, nom, descripteur)`.
@@ -1338,13 +1542,10 @@ pub fn bench_diff(a: &Path, b: &Path) -> Result<BenchDiff> {
 
     let mut counters = Vec::new();
     let mut worse = false;
+    let by_kind_a = &report_a.totals.suspect.by_kind;
+    let by_kind_b = &report_b.totals.suspect.by_kind;
     let mut kinds: Vec<String> = Kind::ALL.iter().map(|k| k.as_str().to_string()).collect();
-    for k in report_a
-        .totals
-        .suspect
-        .keys()
-        .chain(report_b.totals.suspect.keys())
-    {
+    for k in by_kind_a.keys().chain(by_kind_b.keys()) {
         if !kinds.contains(k) {
             kinds.push(k.clone());
         }
@@ -1356,9 +1557,12 @@ pub fn bench_diff(a: &Path, b: &Path) -> Result<BenchDiff> {
         delta: b as i64 - a as i64,
     };
     for k in &kinds {
-        let ka = report_a.totals.suspect.get(k).copied().unwrap_or(0);
-        let kb = report_b.totals.suspect.get(k).copied().unwrap_or(0);
-        worse |= kb > ka;
+        let ka = by_kind_a.get(k).copied().unwrap_or(0);
+        let kb = by_kind_b.get(k).copied().unwrap_or(0);
+        let imprecision = Kind::ALL
+            .iter()
+            .any(|kind| kind.is_imprecision() && k == kind.as_str());
+        worse |= kb > ka && !imprecision;
         counters.push(row(k, ka, kb));
     }
     let (sa, sb) = (
@@ -1466,10 +1670,14 @@ fn method_defects(dir: &Path, ids: &BTreeSet<usize>) -> Result<BTreeMap<MethodKe
             };
             let defects: &mut Defects = out.entry((id, name, descriptor)).or_default();
             for s in &row.suspect {
+                let detail = match (s.detail.clone(), s.origin.as_deref()) {
+                    (Some(d), Some(o)) => Some(format!("{d} ({o})")),
+                    (d, o) => d.or(o.map(str::to_string)),
+                };
                 defects
                     .entry(s.kind.clone())
                     .or_default()
-                    .push((Some(s.line), s.detail.clone()));
+                    .push((Some(s.line), detail));
             }
             if row.syntax_errors > 0 {
                 defects
@@ -1685,6 +1893,7 @@ mod tests {
             kind,
             line: 1,
             detail: Some(detail.to_string()),
+            origin: None,
         }
     }
 
@@ -1772,6 +1981,117 @@ mod tests {
         assert!(class.methods[0].syntax_errors > 0);
     }
 
+    fn wide(kind: Kind, line: usize, name: &str, origin: Option<Origin>) -> Suspect {
+        Suspect {
+            kind,
+            line,
+            detail: Some(name.to_string()),
+            origin,
+        }
+    }
+
+    fn suspects_of(java: &str, name: &str) -> Vec<Suspect> {
+        let class = class_of(java, name, &MethodFacts::default(), &[]);
+        class.methods[0].suspect.clone()
+    }
+
+    #[test]
+    fn locale_object_castee_definie_par_un_appel() {
+        let java = "    public void f() {\n        Object o = foo();\n        ((String) o).length();\n    }\n";
+        assert_eq!(
+            suspects_of(java, "f"),
+            [wide(Kind::WideLocal, 2, "o", Some(Origin::Call))]
+        );
+    }
+
+    #[test]
+    fn locale_object_castee_definie_par_un_champ() {
+        let java =
+            "    public void f() {\n        Object o = this.f;\n        ((A) o).m();\n    }\n";
+        assert_eq!(
+            suspects_of(java, "f"),
+            [wide(Kind::WideLocal, 2, "o", Some(Origin::Field))]
+        );
+    }
+
+    #[test]
+    fn locale_object_castee_definie_par_un_tableau() {
+        let java = "    public void f(Object[] arr) {\n        Object o = arr[0];\n        ((A) o).m();\n    }\n";
+        assert_eq!(
+            suspects_of(java, "f"),
+            [wide(Kind::WideLocal, 2, "o", Some(Origin::Array))]
+        );
+    }
+
+    #[test]
+    fn origine_lue_sur_la_premiere_affectation() {
+        let java = "    public void f(Object[] arr) {\n        Object o;\n        o = arr[0];\n        o = foo();\n        ((A) o).m();\n    }\n";
+        assert_eq!(
+            suspects_of(java, "f"),
+            [wide(Kind::WideLocal, 2, "o", Some(Origin::Array))]
+        );
+    }
+
+    #[test]
+    fn locale_object_sans_cast_n_est_pas_suspecte() {
+        let java =
+            "    public void f() {\n        Object o = foo();\n        o.hashCode();\n    }\n";
+        assert!(
+            suspects_of(java, "f").is_empty(),
+            "{:?}",
+            suspects_of(java, "f")
+        );
+    }
+
+    #[test]
+    fn cast_vers_object_d_une_locale_typee_n_est_pas_suspect() {
+        let java = "    public void f() {\n        String s = foo();\n        ((Object) s).hashCode();\n    }\n";
+        assert!(
+            suspects_of(java, "f").is_empty(),
+            "{:?}",
+            suspects_of(java, "f")
+        );
+    }
+
+    #[test]
+    fn parametre_object_caste_est_wide_param() {
+        let java = "    void m(Object p) {\n        ((A) p).m();\n    }\n";
+        assert_eq!(
+            suspects_of(java, "m"),
+            [wide(Kind::WideParam, 1, "p", None)]
+        );
+    }
+
+    #[test]
+    fn wide_local_reparti_par_origine_dans_fidelity_json() {
+        let found = [
+            wide(Kind::WideLocal, 2, "a", Some(Origin::Call)),
+            wide(Kind::WideLocal, 3, "b", Some(Origin::Call)),
+            wide(Kind::WideLocal, 4, "c", Some(Origin::Array)),
+            wide(Kind::WideParam, 1, "p", None),
+        ];
+        let mut t = Totals::default();
+        t.add_method(true, 0, &found);
+        assert_eq!(t.methods_clean, 1);
+        let report = Report::new(
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            None,
+            t,
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["suspect"]["wide_local"], 3);
+        assert_eq!(json["suspect"]["wide_param"], 1);
+        let by_origin = &json["suspect"]["wide_local_by_origin"];
+        assert_eq!(by_origin["call"], 2);
+        assert_eq!(by_origin["field"], 0);
+        assert_eq!(by_origin["array"], 1);
+        assert_eq!(by_origin["other"], 0);
+        let back: Report = serde_json::from_value(json).unwrap();
+        let back = back.totals.suspect;
+        assert!(!back.by_kind.contains_key("wide_local_by_origin"));
+        assert_eq!(back.wide_local_by_origin.call, 2);
+    }
+
     #[test]
     fn totaux_comptent_les_methodes_propres() {
         let mut t = Totals::default();
@@ -1784,15 +2104,15 @@ mod tests {
         assert_eq!(t.methods_analyzed, 3);
         assert_eq!(t.methods_clean, 1);
         assert_eq!(t.syntax_errors_total, 3);
-        assert_eq!(t.suspect["undefined_var"], 1);
-        assert_eq!(t.suspect["switch_case_lost"], 0);
+        assert_eq!(t.suspect.by_kind["undefined_var"], 1);
+        assert_eq!(t.suspect.by_kind["switch_case_lost"], 0);
     }
 
     fn write_bundle(dir: &Path, rev: &str, kind: &str, line: usize) {
         let mut totals = Totals::default();
         totals.add_method(true, 0, &[]);
         totals.add_method(true, 0, &[]);
-        *totals.suspect.get_mut(kind).unwrap() += 1;
+        *totals.suspect.by_kind.get_mut(kind).unwrap() += 1;
         totals.methods_clean -= 1;
         let report = Report::new(
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
@@ -1863,5 +2183,65 @@ mod tests {
         other.sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into();
         std::fs::write(b.join("fidelity.json"), serde_json::to_vec(&other).unwrap()).unwrap();
         assert!(bench_diff(&a, &b).is_err());
+    }
+
+    #[test]
+    fn imprecisions_seules_laissent_la_methode_propre() {
+        let wide_only = [
+            wide(Kind::WideLocal, 2, "o", Some(Origin::Call)),
+            wide(Kind::WideParam, 1, "p", None),
+        ];
+        let mut t = Totals::default();
+        t.add_method(true, 0, &wide_only);
+        assert_eq!(t.methods_clean, 1);
+        let mut with_defect = wide_only.to_vec();
+        with_defect.push(Suspect::at(Kind::UndefinedVar, 3));
+        t.add_method(true, 0, &with_defect);
+        assert_eq!(t.methods_clean, 1);
+        assert_eq!(t.suspect.by_kind["wide_local"], 2);
+        assert_eq!(t.suspect.by_kind["wide_param"], 2);
+        assert_eq!(t.suspect.wide_local_by_origin.call, 2);
+    }
+
+    #[test]
+    fn bench_diff_hausse_de_wide_local_ne_rend_pas_worse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        write_bundle(
+            &a,
+            "1111111111111111111111111111111111111111",
+            "wide_local",
+            3,
+        );
+        write_bundle(
+            &b,
+            "2222222222222222222222222222222222222222",
+            "wide_local",
+            3,
+        );
+        let mut rb: Report = read_json(&b.join("fidelity.json")).unwrap();
+        *rb.totals.suspect.by_kind.get_mut("wide_local").unwrap() += 1;
+        std::fs::write(b.join("fidelity.json"), serde_json::to_vec(&rb).unwrap()).unwrap();
+        let methods = serde_json::json!([
+            { "signature": "La;->f(I)V", "syntax_errors": 0, "suspect": [
+                { "kind": "wide_local", "line": 3 },
+                { "kind": "wide_local", "line": 5 },
+            ] },
+            { "signature": "La;->g()V", "syntax_errors": 0, "suspect": [] },
+        ]);
+        std::fs::write(b.join("classes/000000.json"), methods.to_string()).unwrap();
+
+        let diff = bench_diff(&a, &b).unwrap();
+        assert!(!diff.worse);
+        assert_eq!(diff.exit_code(), 0);
+        let row = diff
+            .counters
+            .iter()
+            .find(|c| c.counter == "wide_local")
+            .unwrap();
+        assert_eq!((row.a, row.b, row.delta), (1, 2, 1));
+        assert_eq!(diff.regressions.len(), 1);
+        assert_eq!(diff.regressions[0].kind, "wide_local");
+        assert_eq!(diff.regressions[0].lines, [3, 5]);
     }
 }
