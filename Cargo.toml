@@ -72,7 +72,7 @@ md-5 = "0.10"
 dex-bytecode = { git = "https://github.com/androguard/dex-bytecode" }
 
 # Fork sebdraven: utf8 byte push (androguard/dex-decompiler#1) + noms hors litteraux + variables par définition (def-use webs).
-dex-decompiler = { git = "https://github.com/sebdraven/dex-decompiler", rev = "41b4e40c52872bac3af83d18da5c23f36911befc" }
+dex-decompiler = { git = "https://github.com/sebdraven/dex-decompiler", rev = "0975bba20b8a59844e8168e98a5ddb46e447db69" }
 
 # Parseur Java pour le banc de fidélité du bundle (parser::fidelity) ; compile du C via cc.
 tree-sitter = "0.24"
