@@ -1582,8 +1582,9 @@ fidelity.json
   decompiler       {crate, rev}, repris de bundle.json.
   methods_total    Méthodes de tous les classes/<id>.json.
   methods_analyzed Méthodes dont le Java a été relu (java_lines non null).
-  methods_clean    Méthodes relues sans suspect ni erreur de syntaxe. Une
-                   méthode failed n'est jamais propre.
+  methods_clean    Méthodes relues sans erreur de syntaxe ni suspect autre
+                   que wide_local et wide_param (imprécisions de type, pas
+                   des défauts). Une méthode failed n'est jamais propre.
   syntax_errors_total
                    Somme des syntax_errors des méthodes et des
                    syntax_errors_outside_methods des classes.
@@ -1618,14 +1619,16 @@ fidelity.json
   (`o (call)`). Méthodes rapprochées par id de classe + nom + descripteur :
   deux bundles d'une même entrée ont les mêmes id. Un kind est comparé en
   NOMBRE : une méthode qui perd g au lieu de f ne change pas. wide_local et
-  wide_param y sont des kinds comme les autres : leur hausse rend worse vrai.
-  wide_local_by_origin n'est pas dans le tableau. --format json : {sha256,
+  wide_param figurent dans le tableau, mais leur hausse ne rend pas worse
+  vrai : ce sont des imprécisions, pas des défauts. wide_local_by_origin n'est
+  pas dans le tableau. --format json : {sha256,
   rev_a, rev_b, same_rev, counters: [{counter, a, b, delta}], regressions et
   corrections: [{class_id, method, descriptor, kind, a, b, lines, details?}],
   worse}.
-  Code de sortie : 0 si aucun compteur de défauts ne monte, ni
-  methods_with_loss, et que methods_clean ne baisse pas ; 1 sinon ; 2 en cas
-  d'erreur d'usage (fidelity.json absent, entrées différentes, JSON illisible).
+  Code de sortie : 0 si aucun compteur de défauts (hors wide_local et
+  wide_param) ne monte, ni methods_with_loss, et que methods_clean ne baisse
+  pas ; 1 sinon ; 2 en cas d'erreur d'usage (fidelity.json absent, entrées
+  différentes, JSON illisible).
 
 strings.json
   pool             Une entrée par DEX : {dex, declared, unreadable, strings}.

@@ -60,6 +60,11 @@ impl Kind {
         matches!(self, Kind::LostCall | Kind::LostString)
     }
 
+    /// Type trop large : ni Java faux, ni perte.
+    pub fn is_imprecision(self) -> bool {
+        matches!(self, Kind::WideLocal | Kind::WideParam)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::LiteralReceiver => "literal_receiver",
@@ -1338,7 +1343,7 @@ impl Totals {
         self.methods_total += 1;
         if analyzed {
             self.methods_analyzed += 1;
-            if syntax_errors == 0 && suspect.is_empty() {
+            if syntax_errors == 0 && suspect.iter().all(|s| s.kind.is_imprecision()) {
                 self.methods_clean += 1;
             }
         }
@@ -1554,7 +1559,10 @@ pub fn bench_diff(a: &Path, b: &Path) -> Result<BenchDiff> {
     for k in &kinds {
         let ka = by_kind_a.get(k).copied().unwrap_or(0);
         let kb = by_kind_b.get(k).copied().unwrap_or(0);
-        worse |= kb > ka;
+        let imprecision = Kind::ALL
+            .iter()
+            .any(|kind| kind.is_imprecision() && k == kind.as_str());
+        worse |= kb > ka && !imprecision;
         counters.push(row(k, ka, kb));
     }
     let (sa, sb) = (
@@ -2064,7 +2072,7 @@ mod tests {
         ];
         let mut t = Totals::default();
         t.add_method(true, 0, &found);
-        assert_eq!(t.methods_clean, 0);
+        assert_eq!(t.methods_clean, 1);
         let report = Report::new(
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
             None,
@@ -2175,5 +2183,65 @@ mod tests {
         other.sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into();
         std::fs::write(b.join("fidelity.json"), serde_json::to_vec(&other).unwrap()).unwrap();
         assert!(bench_diff(&a, &b).is_err());
+    }
+
+    #[test]
+    fn imprecisions_seules_laissent_la_methode_propre() {
+        let wide_only = [
+            wide(Kind::WideLocal, 2, "o", Some(Origin::Call)),
+            wide(Kind::WideParam, 1, "p", None),
+        ];
+        let mut t = Totals::default();
+        t.add_method(true, 0, &wide_only);
+        assert_eq!(t.methods_clean, 1);
+        let mut with_defect = wide_only.to_vec();
+        with_defect.push(Suspect::at(Kind::UndefinedVar, 3));
+        t.add_method(true, 0, &with_defect);
+        assert_eq!(t.methods_clean, 1);
+        assert_eq!(t.suspect.by_kind["wide_local"], 2);
+        assert_eq!(t.suspect.by_kind["wide_param"], 2);
+        assert_eq!(t.suspect.wide_local_by_origin.call, 2);
+    }
+
+    #[test]
+    fn bench_diff_hausse_de_wide_local_ne_rend_pas_worse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        write_bundle(
+            &a,
+            "1111111111111111111111111111111111111111",
+            "wide_local",
+            3,
+        );
+        write_bundle(
+            &b,
+            "2222222222222222222222222222222222222222",
+            "wide_local",
+            3,
+        );
+        let mut rb: Report = read_json(&b.join("fidelity.json")).unwrap();
+        *rb.totals.suspect.by_kind.get_mut("wide_local").unwrap() += 1;
+        std::fs::write(b.join("fidelity.json"), serde_json::to_vec(&rb).unwrap()).unwrap();
+        let methods = serde_json::json!([
+            { "signature": "La;->f(I)V", "syntax_errors": 0, "suspect": [
+                { "kind": "wide_local", "line": 3 },
+                { "kind": "wide_local", "line": 5 },
+            ] },
+            { "signature": "La;->g()V", "syntax_errors": 0, "suspect": [] },
+        ]);
+        std::fs::write(b.join("classes/000000.json"), methods.to_string()).unwrap();
+
+        let diff = bench_diff(&a, &b).unwrap();
+        assert!(!diff.worse);
+        assert_eq!(diff.exit_code(), 0);
+        let row = diff
+            .counters
+            .iter()
+            .find(|c| c.counter == "wide_local")
+            .unwrap();
+        assert_eq!((row.a, row.b, row.delta), (1, 2, 1));
+        assert_eq!(diff.regressions.len(), 1);
+        assert_eq!(diff.regressions[0].kind, "wide_local");
+        assert_eq!(diff.regressions[0].lines, [3, 5]);
     }
 }
