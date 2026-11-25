@@ -1383,13 +1383,16 @@ classes/<id>.json — une entrée par méthode : direct puis virtual, ordre du D
                    --disasm (errors.json, stage disasm).
   syntax_errors    Nœuds ERROR et MISSING que tree-sitter-java pose dans
                    java_lines. 0 quand java_lines est null.
-  suspect          [{kind, line, detail?}] : défauts détectés dans le Java de
-                   la méthode, line = ligne dans classes/<id>.java. kind : voir
-                   Fidélité du Java. Vide quand java_lines est null.
-    detail         Présent pour lost_call (nom de la méthode appelée) et
-                   lost_string (la chaîne, en clair) ; absent sinon. Une
-                   chaîne de plus de 120 caractères est coupée et suivie de
+  suspect          [{kind, line, detail?, origin?}] : défauts détectés dans le
+                   Java de la méthode, line = ligne dans classes/<id>.java.
+                   kind : voir Fidélité du Java. Vide quand java_lines est null.
+    detail         Présent pour lost_call (nom de la méthode appelée),
+                   lost_string (la chaîne, en clair), wide_local et wide_param
+                   (nom de la variable) ; absent sinon. Une chaîne de plus de
+                   120 caractères est coupée et suivie de
                    `… [tronquée, N caractères]`.
+    origin         Présent pour wide_local seulement : call, field, array ou
+                   other (voir wide_local).
 
 decompile_status
   ok       decompile_method de dex-decompiler a rendu du Java sans erreur et
@@ -1539,6 +1542,38 @@ Fidélité du Java — banc de mesure du décompilateur
                        bloc de texte (\"\"\") n'est pas désindenté ; la même
                        chaîne chargée deux fois ne compte qu'une fois — borne
                        basse.
+  Les deux kinds suivants signalent un type TROP LARGE, pas une erreur du
+  Java : le code reste valide. Ils mesurent ce que le typage n'a pas su
+  restreindre. Un suspect par variable (pas par cast), à la ligne de sa
+  déclaration, le nom dans detail. « Casté » : opérande direct, parenthèses
+  ignorées, d'au moins un cast de la méthode vers un type référence autre
+  qu'Object ou java.lang.Object (`((String) o).length()`) ; un cast vers un
+  primitif ne compte pas, `(T) o.f()` non plus.
+    wide_local         Locale (déclaration, initialisation d'un for ; pas la
+                       variable d'un for-each) de type Object ou
+                       java.lang.Object, castée. Les paramètres de la méthode
+                       en sont exclus (wide_param). origin est lu sur
+                       l'expression qui définit la variable : l'initialiseur,
+                       sinon le membre droit de la première affectation
+                       `o = …` qui suit la déclaration.
+                         call   appel de méthode ou new T(…)
+                         field  accès de champ (`this.f`, `x.f`, `C.f` d'un
+                                champ statique)
+                         array  accès de tableau (`a[i]`)
+                         other  tout le reste : constante, variable (y
+                                compris un champ écrit sans qualificatif),
+                                cast, ternaire… ; locale jamais affectée.
+                       Aucun suivi de portée : un nom déclaré plusieurs fois
+                       compte une fois, à sa première déclaration Object, et
+                       le cast d'un homonyme d'un autre bloc suffit.
+    wide_param         Paramètre de la méthode (hors varargs) de type Object
+                       ou java.lang.Object, casté dans le corps. Le type d'un
+                       paramètre est fixé par le descripteur Dalvik : ce kind
+                       relève de la signature (equals(Object), méthode
+                       générique effacée, pont synthétique), pas du typage des
+                       locales — d'où sa séparation de wide_local.
+  Les paramètres des lambdas et des méthodes de classes anonymes inlinées ne
+  relèvent d'aucun des deux.
   syntax_errors et suspect sont dans classes/<id>.json par méthode ;
   suspect_methods et syntax_errors_outside_methods dans index.json par classe.
 
@@ -1558,7 +1593,13 @@ fidelity.json
                    Méthodes ayant au moins un lost_call ou un lost_string.
                    Absent d'un fidelity.json antérieur à ces kinds :
                    --bench-diff le lit alors comme 0.
-  suspect          {kind: total}, chaque kind présent, même à 0.
+  suspect          {kind: total}, chaque kind présent, même à 0, plus :
+    wide_local_by_origin
+                   {call, field, array, other} : wide_local réparti par
+                   origin ; la somme vaut suspect.wide_local. Absent d'un
+                   fidelity.json antérieur : --bench-diff le lit comme 0, et
+                   les kinds absents aussi — comparé à un bundle plus ancien,
+                   wide_local et wide_param ressortent en régressions.
   Une classe que le banc n'a pas pu relire (errors.json, stage fidelity)
   compte ses méthodes sans défaut : vérifier errors.json avant de conclure.
 
@@ -1573,9 +1614,12 @@ fidelity.json
   methods_clean et methods_with_loss ; puis Régressions (méthodes qui gagnent
   des défauts d'un kind, lignes et detail dans B) et Corrections (qui en
   perdent, lignes et detail dans A). syntax_errors y figure comme un kind sans
-  ligne. Méthodes rapprochées par id de classe + nom + descripteur : deux
-  bundles d'une même entrée ont les mêmes id. Un kind est comparé en NOMBRE :
-  une méthode qui perd g au lieu de f ne change pas. --format json : {sha256,
+  ligne. Pour wide_local, detail est suivi de l'origin entre parenthèses
+  (`o (call)`). Méthodes rapprochées par id de classe + nom + descripteur :
+  deux bundles d'une même entrée ont les mêmes id. Un kind est comparé en
+  NOMBRE : une méthode qui perd g au lieu de f ne change pas. wide_local et
+  wide_param y sont des kinds comme les autres : leur hausse rend worse vrai.
+  wide_local_by_origin n'est pas dans le tableau. --format json : {sha256,
   rev_a, rev_b, same_rev, counters: [{counter, a, b, delta}], regressions et
   corrections: [{class_id, method, descriptor, kind, a, b, lines, details?}],
   worse}.
