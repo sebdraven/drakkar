@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use tree_sitter::{Node, Parser};
 
-use crate::parser::dex_facade::{Code, DexBin};
+use crate::parser::dex_facade::{Code, DexBin, TryBlock};
 use crate::parser::disasm::{self, Operand};
 
 /// Ouverture de la classe factice qui rend `classes/<id>.java` analysable :
@@ -27,6 +27,7 @@ const WRAP_OPEN: &str = "class DrakkarFidelity { ";
 pub enum Kind {
     LiteralReceiver,
     UndefinedVar,
+    OutOfScope,
     DeadAfterReturn,
     TypeMismatch,
     NullOnPrimitive,
@@ -40,9 +41,10 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 12] = [
+    pub const ALL: [Kind; 13] = [
         Kind::LiteralReceiver,
         Kind::UndefinedVar,
+        Kind::OutOfScope,
         Kind::DeadAfterReturn,
         Kind::TypeMismatch,
         Kind::NullOnPrimitive,
@@ -69,6 +71,7 @@ impl Kind {
         match self {
             Kind::LiteralReceiver => "literal_receiver",
             Kind::UndefinedVar => "undefined_var",
+            Kind::OutOfScope => "out_of_scope",
             Kind::DeadAfterReturn => "dead_after_return",
             Kind::TypeMismatch => "type_mismatch",
             Kind::NullOnPrimitive => "null_on_primitive",
@@ -104,17 +107,35 @@ impl Origin {
     }
 }
 
+/// Ventilation d'un undefined_var (assigned, never_assigned) ou d'un
+/// out_of_scope (région de la déclaration).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cause {
+    Assigned,
+    NeverAssigned,
+    Try,
+    Catch,
+    Finally,
+    Switch,
+    Loop,
+    If,
+    Block,
+}
+
 /// Un défaut signalé ; `line` est la ligne dans `classes/<id>.java`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct Suspect {
     pub kind: Kind,
     pub line: usize,
     /// Élément perdu (lost_call, lost_string) : nom de méthode ou chaîne ;
-    /// variable (wide_local, wide_param).
+    /// variable (wide_local, wide_param, undefined_var, out_of_scope).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<Origin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<Cause>,
 }
 
 impl Suspect {
@@ -124,8 +145,57 @@ impl Suspect {
             line,
             detail: None,
             origin: None,
+            cause: None,
         }
     }
+}
+
+/// Trait de structure du bytecode d'une méthode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Structure {
+    Try,
+    CatchAll,
+    Monitor,
+    Switch,
+    Loop,
+}
+
+/// Traits de structure d'une méthode, d'après ses instructions (offsets en
+/// octets, comme `decode_all(insns, 0)`) et sa table de try.
+pub fn structure_of(
+    instructions: &[Instruction],
+    insns: &[u8],
+    tries: &[TryBlock<'_>],
+) -> BTreeSet<Structure> {
+    let mut out = BTreeSet::new();
+    if !tries.is_empty() {
+        out.insert(Structure::Try);
+    }
+    if tries.iter().flat_map(|t| &t.handlers).any(|h| h.catch_all) {
+        out.insert(Structure::CatchAll);
+    }
+    for ins in instructions {
+        let m = ins.mnemonic();
+        match m {
+            "monitor-enter" => {
+                out.insert(Structure::Monitor);
+            }
+            "packed-switch" | "sparse-switch" => {
+                out.insert(Structure::Switch);
+            }
+            _ if m.starts_with("goto") || m.starts_with("if-") => {
+                let backward = dex_bytecode::branch_targets(insns, ins.offset as usize)
+                    .iter()
+                    .any(|&t| t <= ins.offset);
+                if backward {
+                    out.insert(Structure::Loop);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Au-delà, une chaîne perdue est tronquée dans `detail`.
@@ -164,6 +234,7 @@ pub struct MethodFacts {
     pub calls: BTreeSet<String>,
     /// Littéraux const-string non vides.
     pub strings: BTreeSet<String>,
+    pub structure: BTreeSet<Structure>,
 }
 
 impl MethodFacts {
@@ -183,7 +254,14 @@ impl MethodFacts {
             }
             false
         };
-        let mut facts = MethodFacts::default();
+        let mut facts = MethodFacts {
+            structure: structure_of(
+                instructions,
+                code.insns,
+                code.tries.as_deref().unwrap_or(&[]),
+            ),
+            ..MethodFacts::default()
+        };
         for block in code.tries.iter().flatten() {
             for h in &block.handlers {
                 let catch_type = match (h.catch_all, h.catch_type) {
@@ -416,6 +494,7 @@ fn losses(decl: Node<'_>, src: &[u8], facts: &MethodFacts, line: usize) -> Vec<S
         line,
         detail: Some(detail),
         origin: None,
+        cause: None,
     };
     let mut out: Vec<Suspect> = facts
         .calls
@@ -547,17 +626,26 @@ fn analyze_method(
 ) -> Vec<Suspect> {
     let nodes = preorder(decl);
 
-    let mut declared: HashSet<&str> = HashSet::new();
+    let mut decls: HashMap<&str, Vec<Decl<'_>>> = HashMap::new();
+    let mut declare = |name, site| {
+        let (scope, ordered) = scope_of(site, decl);
+        decls.entry(text(name, src)).or_default().push(Decl {
+            at: name,
+            scope,
+            ordered,
+        });
+    };
+    let mut assigned: HashSet<&str> = HashSet::new();
     let mut types: HashMap<&str, &str> = HashMap::new();
     let mut strings: HashSet<&str> = HashSet::new();
     for &n in &nodes {
         match n.kind() {
             "variable_declarator" => {
-                let Some(name) = n.child_by_field_name("name") else {
+                let Some(name_node) = n.child_by_field_name("name") else {
                     continue;
                 };
-                let name = text(name, src);
-                declared.insert(name);
+                declare(name_node, n);
+                let name = text(name_node, src);
                 let ty = n
                     .parent()
                     .filter(|p| p.kind() == "local_variable_declaration")
@@ -582,7 +670,7 @@ fn analyze_method(
                 if name.kind() != "identifier" {
                     continue;
                 }
-                declared.insert(text(name, src));
+                declare(name, n);
                 if let Some(ty) = n.child_by_field_name("type") {
                     types.insert(text(name, src), text(ty, src));
                 }
@@ -590,22 +678,27 @@ fn analyze_method(
             "lambda_expression" => {
                 if let Some(p) = n.child_by_field_name("parameters") {
                     if p.kind() == "identifier" {
-                        declared.insert(text(p, src));
+                        declare(p, n);
                     }
                 }
             }
             "inferred_parameters" => {
                 for c in named_children(n) {
-                    declared.insert(text(c, src));
+                    declare(c, n);
                 }
             }
             "assignment_expression" => {
-                let left = n.child_by_field_name("left");
-                let right = n.child_by_field_name("right");
-                if let (Some(l), Some(r)) = (left, right) {
-                    if l.kind() == "identifier" && is_string_literal(r) {
-                        strings.insert(text(l, src));
-                    }
+                let Some(l) = n
+                    .child_by_field_name("left")
+                    .filter(|l| l.kind() == "identifier")
+                else {
+                    continue;
+                };
+                assigned.insert(text(l, src));
+                if n.child_by_field_name("right")
+                    .is_some_and(is_string_literal)
+                {
+                    strings.insert(text(l, src));
                 }
             }
             _ => {}
@@ -624,6 +717,14 @@ fn analyze_method(
     };
 
     let mut out = Vec::new();
+    let mut scoped = Vec::new();
+    let named = |kind: Kind, n: Node<'_>, cause: Cause| Suspect {
+        kind,
+        line: line_of(n),
+        detail: Some(text(n, src).to_string()),
+        origin: None,
+        cause: Some(cause),
+    };
     let mut push = |kind: Kind, n: Node<'_>| out.push(Suspect::at(kind, line_of(n)));
     for &n in &nodes {
         match n.kind() {
@@ -644,8 +745,22 @@ fn analyze_method(
                 let name = text(n, src);
                 if name.starts_with(|c: char| c.is_ascii_digit()) {
                     push(Kind::InvalidIdent, n);
-                } else if in_expression(n) && !declared.contains(name) && !fields.contains(name) {
-                    push(Kind::UndefinedVar, n);
+                } else if in_expression(n) && !fields.contains(name) {
+                    match decls.get(name) {
+                        None => {
+                            let cause = if assigned.contains(name) {
+                                Cause::Assigned
+                            } else {
+                                Cause::NeverAssigned
+                            };
+                            scoped.push(named(Kind::UndefinedVar, n, cause));
+                        }
+                        Some(ds) => {
+                            if let Some(cause) = out_of_scope(n, ds) {
+                                scoped.push(named(Kind::OutOfScope, n, cause));
+                            }
+                        }
+                    }
                 }
             }
             "block" | "constructor_body" => {
@@ -803,10 +918,125 @@ fn analyze_method(
         out.push(Suspect::at(Kind::LiteralReceiver, line));
     }
     out.extend(wide_suspects(decl, &nodes, src));
+    out.extend(scoped);
 
     out.sort();
     out.dedup();
     out
+}
+
+/// Déclaration d'un nom, vue par out_of_scope.
+struct Decl<'t> {
+    /// Nœud du nom déclaré.
+    at: Node<'t>,
+    scope: Node<'t>,
+    /// Faux pour un champ de classe anonyme : visible avant sa déclaration.
+    ordered: bool,
+}
+
+const CALLABLES: [&str; 4] = [
+    "method_declaration",
+    "constructor_declaration",
+    "compact_constructor_declaration",
+    "lambda_expression",
+];
+
+/// Portée d'une déclaration portée par `site`, dans la méthode `root`.
+fn scope_of<'t>(site: Node<'t>, root: Node<'t>) -> (Node<'t>, bool) {
+    let up = |kinds: &[&str]| ancestor(site, kinds).unwrap_or(root);
+    match site.kind() {
+        "variable_declarator" => match site.parent() {
+            Some(p) if p.kind() == "local_variable_declaration" => {
+                let holder = p.parent().unwrap_or(root);
+                let scope = if holder.kind() == "switch_block_statement_group" {
+                    holder.parent().unwrap_or(holder)
+                } else {
+                    holder
+                };
+                (scope, true)
+            }
+            Some(p) if matches!(p.kind(), "field_declaration" | "constant_declaration") => {
+                (p.parent().unwrap_or(root), false)
+            }
+            _ => (up(&CALLABLES), true),
+        },
+        "formal_parameter" => (up(&CALLABLES), true),
+        "catch_formal_parameter" => (up(&["catch_clause"]), true),
+        "resource" => (up(&["try_with_resources_statement"]), true),
+        "enhanced_for_statement" | "lambda_expression" => (site, true),
+        "inferred_parameters" => (site.parent().unwrap_or(root), true),
+        _ => (root, true),
+    }
+}
+
+fn ancestor<'t>(n: Node<'t>, kinds: &[&str]) -> Option<Node<'t>> {
+    let mut cur = n.parent();
+    while let Some(p) = cur {
+        if kinds.contains(&p.kind()) {
+            return Some(p);
+        }
+        cur = p.parent();
+    }
+    None
+}
+
+fn contains(outer: Node<'_>, inner: Node<'_>) -> bool {
+    outer.start_byte() <= inner.start_byte() && inner.end_byte() <= outer.end_byte()
+}
+
+/// `None` si une déclaration de `decls` est visible depuis `usage` ; sinon la
+/// région de la plus proche qui le précède, à défaut de la première.
+fn out_of_scope(usage: Node<'_>, decls: &[Decl<'_>]) -> Option<Cause> {
+    let at = usage.start_byte();
+    let visible = decls
+        .iter()
+        .any(|d| contains(d.scope, usage) && (!d.ordered || d.at.start_byte() < at));
+    if visible {
+        return None;
+    }
+    let nearest = decls
+        .iter()
+        .filter(|d| d.at.start_byte() < at)
+        .max_by_key(|d| d.at.start_byte())
+        .or_else(|| decls.iter().min_by_key(|d| d.at.start_byte()))?;
+    Some(region(nearest.at, usage))
+}
+
+/// Région la plus intérieure qui contient `decl` sans contenir `usage`.
+fn region(decl: Node<'_>, usage: Node<'_>) -> Cause {
+    let mut cur = decl.parent();
+    while let Some(n) = cur {
+        if contains(n, usage) {
+            break;
+        }
+        let found = match n.kind() {
+            "block" => match n.parent().map(|p| p.kind()) {
+                Some("try_statement") => Some(Cause::Try),
+                Some(k) => statement_region(k),
+                None => None,
+            },
+            k => statement_region(k),
+        };
+        if let Some(cause) = found {
+            return cause;
+        }
+        cur = n.parent();
+    }
+    Cause::Block
+}
+
+fn statement_region(kind: &str) -> Option<Cause> {
+    Some(match kind {
+        "try_with_resources_statement" => Cause::Try,
+        "catch_clause" => Cause::Catch,
+        "finally_clause" => Cause::Finally,
+        "switch_block" | "switch_block_statement_group" | "switch_rule" => Cause::Switch,
+        "for_statement" | "enhanced_for_statement" | "while_statement" | "do_statement" => {
+            Cause::Loop
+        }
+        "if_statement" => Cause::If,
+        _ => return None,
+    })
 }
 
 /// Paramètres de `decl` et locales typés Object, opérandes directs d'un cast
@@ -822,6 +1052,7 @@ fn wide_suspects(decl: Node<'_>, nodes: &[Node<'_>], src: &[u8]) -> Vec<Suspect>
         line,
         detail: Some(name.to_string()),
         origin,
+        cause: None,
     };
 
     let mut out = Vec::new();
@@ -1269,6 +1500,8 @@ pub struct Totals {
     #[serde(default)]
     pub methods_with_loss: usize,
     pub suspect: SuspectTotals,
+    #[serde(default)]
+    pub by_structure: ByStructure,
 }
 
 /// `suspect` de `fidelity.json`.
@@ -1280,6 +1513,10 @@ pub struct SuspectTotals {
     /// Absent d'un fidelity.json antérieur à wide_local : lu comme 0.
     #[serde(default)]
     pub wide_local_by_origin: ByOrigin,
+    #[serde(default)]
+    pub undefined_var_by_cause: ByUndefinedCause,
+    #[serde(default)]
+    pub out_of_scope_by_cause: ByScopeCause,
 }
 
 impl Default for SuspectTotals {
@@ -1290,7 +1527,121 @@ impl Default for SuspectTotals {
                 .map(|k| (k.as_str().to_string(), 0))
                 .collect(),
             wide_local_by_origin: ByOrigin::default(),
+            undefined_var_by_cause: ByUndefinedCause::default(),
+            out_of_scope_by_cause: ByScopeCause::default(),
         }
+    }
+}
+
+/// undefined_var réparti par cause ; la somme vaut `suspect.undefined_var`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByUndefinedCause {
+    pub assigned: usize,
+    pub never_assigned: usize,
+}
+
+/// out_of_scope réparti par cause ; la somme vaut `suspect.out_of_scope`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByScopeCause {
+    #[serde(rename = "try")]
+    pub try_: usize,
+    pub catch: usize,
+    pub finally: usize,
+    pub switch: usize,
+    #[serde(rename = "loop")]
+    pub loop_: usize,
+    #[serde(rename = "if")]
+    pub if_: usize,
+    pub block: usize,
+}
+
+impl ByScopeCause {
+    fn slot(&mut self, cause: Cause) -> &mut usize {
+        match cause {
+            Cause::Try => &mut self.try_,
+            Cause::Catch => &mut self.catch,
+            Cause::Finally => &mut self.finally,
+            Cause::Switch => &mut self.switch,
+            Cause::Loop => &mut self.loop_,
+            Cause::If => &mut self.if_,
+            Cause::Block | Cause::Assigned | Cause::NeverAssigned => &mut self.block,
+        }
+    }
+
+    fn merge(&mut self, o: &ByScopeCause) {
+        self.try_ += o.try_;
+        self.catch += o.catch;
+        self.finally += o.finally;
+        self.switch += o.switch;
+        self.loop_ += o.loop_;
+        self.if_ += o.if_;
+        self.block += o.block;
+    }
+}
+
+/// Une ligne de `by_structure`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructureRow {
+    pub methods: usize,
+    pub clean: usize,
+    pub with_syntax_errors: usize,
+    pub syntax_errors: usize,
+    pub with_undefined_var: usize,
+    pub with_out_of_scope: usize,
+}
+
+impl StructureRow {
+    fn add(&mut self, clean: bool, syntax_errors: usize, suspect: &[Suspect]) {
+        let has = |kind: Kind| usize::from(suspect.iter().any(|s| s.kind == kind));
+        self.methods += 1;
+        self.clean += usize::from(clean);
+        self.with_syntax_errors += usize::from(syntax_errors > 0);
+        self.syntax_errors += syntax_errors;
+        self.with_undefined_var += has(Kind::UndefinedVar);
+        self.with_out_of_scope += has(Kind::OutOfScope);
+    }
+
+    fn merge(&mut self, o: &StructureRow) {
+        self.methods += o.methods;
+        self.clean += o.clean;
+        self.with_syntax_errors += o.with_syntax_errors;
+        self.syntax_errors += o.syntax_errors;
+        self.with_undefined_var += o.with_undefined_var;
+        self.with_out_of_scope += o.with_out_of_scope;
+    }
+}
+
+/// Méthodes relues par trait de structure ; `none` : sans aucun trait.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByStructure {
+    #[serde(rename = "try")]
+    pub try_: StructureRow,
+    pub catch_all: StructureRow,
+    pub monitor: StructureRow,
+    pub switch: StructureRow,
+    #[serde(rename = "loop")]
+    pub loop_: StructureRow,
+    pub none: StructureRow,
+}
+
+impl ByStructure {
+    fn slot(&mut self, s: Structure) -> &mut StructureRow {
+        match s {
+            Structure::Try => &mut self.try_,
+            Structure::CatchAll => &mut self.catch_all,
+            Structure::Monitor => &mut self.monitor,
+            Structure::Switch => &mut self.switch,
+            Structure::Loop => &mut self.loop_,
+        }
+    }
+
+    fn merge(&mut self, o: &ByStructure) {
+        self.try_.merge(&o.try_);
+        self.catch_all.merge(&o.catch_all);
+        self.monitor.merge(&o.monitor);
+        self.switch.merge(&o.switch);
+        self.loop_.merge(&o.loop_);
+        self.none.merge(&o.none);
     }
 }
 
@@ -1306,9 +1657,21 @@ pub struct ByOrigin {
 impl SuspectTotals {
     fn add(&mut self, s: &Suspect) {
         *self.by_kind.entry(s.kind.as_str().to_string()).or_insert(0) += 1;
-        if s.kind == Kind::WideLocal {
-            let origin = s.origin.unwrap_or(Origin::Other);
-            *self.wide_local_by_origin.slot(origin) += 1;
+        match (s.kind, s.cause) {
+            (Kind::WideLocal, _) => {
+                let origin = s.origin.unwrap_or(Origin::Other);
+                *self.wide_local_by_origin.slot(origin) += 1;
+            }
+            (Kind::UndefinedVar, Some(Cause::Assigned)) => {
+                self.undefined_var_by_cause.assigned += 1;
+            }
+            (Kind::UndefinedVar, _) => self.undefined_var_by_cause.never_assigned += 1,
+            (Kind::OutOfScope, cause) => {
+                *self
+                    .out_of_scope_by_cause
+                    .slot(cause.unwrap_or(Cause::Block)) += 1;
+            }
+            _ => {}
         }
     }
 
@@ -1317,6 +1680,10 @@ impl SuspectTotals {
             *self.by_kind.entry(k.clone()).or_insert(0) += n;
         }
         self.wide_local_by_origin.merge(&o.wide_local_by_origin);
+        let undefined = &o.undefined_var_by_cause;
+        self.undefined_var_by_cause.assigned += undefined.assigned;
+        self.undefined_var_by_cause.never_assigned += undefined.never_assigned;
+        self.out_of_scope_by_cause.merge(&o.out_of_scope_by_cause);
     }
 }
 
@@ -1339,12 +1706,27 @@ impl ByOrigin {
 }
 
 impl Totals {
-    pub fn add_method(&mut self, analyzed: bool, syntax_errors: usize, suspect: &[Suspect]) {
+    pub fn add_method(
+        &mut self,
+        analyzed: bool,
+        syntax_errors: usize,
+        suspect: &[Suspect],
+        structure: &BTreeSet<Structure>,
+    ) {
         self.methods_total += 1;
         if analyzed {
             self.methods_analyzed += 1;
-            if syntax_errors == 0 && suspect.iter().all(|s| s.kind.is_imprecision()) {
+            let clean = syntax_errors == 0 && suspect.iter().all(|s| s.kind.is_imprecision());
+            if clean {
                 self.methods_clean += 1;
+            }
+            if structure.is_empty() {
+                self.by_structure.none.add(clean, syntax_errors, suspect);
+            }
+            for s in structure {
+                self.by_structure
+                    .slot(*s)
+                    .add(clean, syntax_errors, suspect);
             }
         }
         if suspect.iter().any(|s| s.kind.is_loss()) {
@@ -1369,6 +1751,7 @@ impl Totals {
         self.syntax_errors_outside_methods += other.syntax_errors_outside_methods;
         self.methods_with_loss += other.methods_with_loss;
         self.suspect.merge(&other.suspect);
+        self.by_structure.merge(&other.by_structure);
     }
 }
 
@@ -1772,7 +2155,197 @@ mod tests {
         let java = "    public void f() {\n        this.g(v3, count);\n    }\n";
         let class = class_of(java, "f", &MethodFacts::default(), &["count"]);
         let found = &class.methods[0].suspect;
-        assert_eq!(found, &[Suspect::at(Kind::UndefinedVar, 2)]);
+        assert_eq!(
+            found,
+            &[named(Kind::UndefinedVar, 2, "v3", Cause::NeverAssigned)]
+        );
+    }
+
+    fn named(kind: Kind, line: usize, name: &str, cause: Cause) -> Suspect {
+        Suspect {
+            kind,
+            line,
+            detail: Some(name.to_string()),
+            origin: None,
+            cause: Some(cause),
+        }
+    }
+
+    #[test]
+    fn variable_du_try_lue_dans_le_finally() {
+        let java = "    public void f() {\n        try {\n            int x = 1;\n        } finally {\n            this.g(x);\n        }\n    }\n";
+        assert_eq!(
+            suspects_of(java, "f"),
+            [named(Kind::OutOfScope, 5, "x", Cause::Try)]
+        );
+    }
+
+    #[test]
+    fn parametre_du_catch_lu_apres_le_try() {
+        let java = "    public void f() {\n        try {\n            this.g();\n        } catch (Exception e) {\n        }\n        this.h(e);\n    }\n";
+        assert_eq!(
+            suspects_of(java, "f"),
+            [named(Kind::OutOfScope, 6, "e", Cause::Catch)]
+        );
+    }
+
+    #[test]
+    fn variable_visible_n_est_pas_hors_portee() {
+        for body in [
+            "int x = 1;\n        this.g(x);",
+            "int n = 0;\n        while (n < 3) {\n            n++;\n        }",
+            "int s = 0;\n        for (int i = 0; i < 3; i++) {\n            s += i;\n        }",
+        ] {
+            let java = format!("    public void f() {{\n        {body}\n    }}\n");
+            let found = suspects_of(&java, "f");
+            assert!(found.is_empty(), "{body} : {found:?}");
+        }
+    }
+
+    #[test]
+    fn locale_d_un_case_visible_dans_les_case_suivants() {
+        let java = "    public void f(int k) {\n        switch (k) {\n            case 0:\n                int x = 1;\n                break;\n            case 1:\n                x = 2;\n                this.g(x);\n                break;\n        }\n    }\n";
+        let found = suspects_of(java, "f");
+        assert!(
+            found
+                .iter()
+                .all(|s| !matches!(s.kind, Kind::OutOfScope | Kind::UndefinedVar)),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn variable_jamais_declaree_ventilee_par_affectation() {
+        let java = "    public void f() {\n        v1 = 2;\n        this.g(v1, v2);\n    }\n";
+        assert_eq!(
+            suspects_of(java, "f"),
+            [
+                named(Kind::UndefinedVar, 2, "v1", Cause::Assigned),
+                named(Kind::UndefinedVar, 3, "v1", Cause::Assigned),
+                named(Kind::UndefinedVar, 3, "v2", Cause::NeverAssigned),
+            ]
+        );
+    }
+
+    #[test]
+    fn causes_cumulees_dans_fidelity_json() {
+        let found = [
+            named(Kind::UndefinedVar, 2, "a", Cause::Assigned),
+            named(Kind::UndefinedVar, 3, "b", Cause::NeverAssigned),
+            named(Kind::OutOfScope, 4, "c", Cause::Finally),
+        ];
+        let mut t = Totals::default();
+        t.add_method(true, 0, &found, &BTreeSet::new());
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(json["suspect"]["undefined_var"], 2);
+        assert_eq!(json["suspect"]["out_of_scope"], 1);
+        let undefined = &json["suspect"]["undefined_var_by_cause"];
+        assert_eq!(undefined["assigned"], 1);
+        assert_eq!(undefined["never_assigned"], 1);
+        let scope = &json["suspect"]["out_of_scope_by_cause"];
+        assert_eq!(scope["finally"], 1);
+        assert_eq!(scope["try"], 0);
+    }
+
+    #[test]
+    fn by_structure_compte_les_methodes_par_trait() {
+        let mut t = Totals::default();
+        let try_monitor = BTreeSet::from([Structure::Try, Structure::Monitor]);
+        let undefined = [named(Kind::UndefinedVar, 3, "v", Cause::NeverAssigned)];
+        t.add_method(true, 2, &undefined, &try_monitor);
+        t.add_method(true, 0, &[], &BTreeSet::new());
+        t.add_method(false, 0, &[], &try_monitor);
+        let faulty = StructureRow {
+            methods: 1,
+            clean: 0,
+            with_syntax_errors: 1,
+            syntax_errors: 2,
+            with_undefined_var: 1,
+            with_out_of_scope: 0,
+        };
+        let clean = StructureRow {
+            methods: 1,
+            clean: 1,
+            ..StructureRow::default()
+        };
+        assert_eq!(t.by_structure.try_, faulty);
+        assert_eq!(t.by_structure.monitor, faulty);
+        assert_eq!(t.by_structure.none, clean);
+        assert_eq!(t.by_structure.loop_, StructureRow::default());
+        let mut sum = Totals::default();
+        sum.merge(&t);
+        sum.merge(&t);
+        assert_eq!(sum.by_structure.try_.syntax_errors, 4);
+        assert_eq!(sum.by_structure.none.clean, 2);
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(json["by_structure"]["try"]["with_syntax_errors"], 1);
+        assert_eq!(json["by_structure"]["none"]["methods"], 1);
+    }
+
+    #[test]
+    fn fidelity_json_ancien_se_relit() {
+        let old = serde_json::json!({
+            "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "decompiler": { "crate": "dex-decompiler", "rev": null },
+            "methods_total": 2,
+            "methods_analyzed": 2,
+            "methods_clean": 1,
+            "syntax_errors_total": 0,
+            "syntax_errors_outside_methods": 0,
+            "methods_with_loss": 0,
+            "suspect": {
+                "undefined_var": 1,
+                "wide_local": 0,
+                "wide_local_by_origin": { "call": 0, "field": 0, "array": 0, "other": 0 }
+            }
+        });
+        let back: Report = serde_json::from_value(old).unwrap();
+        let suspect = &back.totals.suspect;
+        assert_eq!(suspect.by_kind["undefined_var"], 1);
+        assert!(!suspect.by_kind.contains_key("undefined_var_by_cause"));
+        assert_eq!(suspect.undefined_var_by_cause, ByUndefinedCause::default());
+        assert_eq!(suspect.out_of_scope_by_cause, ByScopeCause::default());
+        assert_eq!(back.totals.by_structure, ByStructure::default());
+    }
+
+    fn insn(offset: u32, length: u32, opcode: u8, mnemonic: &'static str) -> Instruction {
+        Instruction::new(offset, length, opcode, mnemonic, String::new())
+    }
+
+    #[test]
+    fn traits_de_structure_du_bytecode() {
+        use crate::parser::dex_facade::Handler;
+        // monitor-enter v0 ; goto +2 ; nop ; goto -2 (vers l'offset 2).
+        let insns = [0x1d, 0x00, 0x28, 0x02, 0x00, 0x00, 0x28, 0xfe];
+        let forward = [
+            insn(0, 2, 0x1d, "monitor-enter"),
+            insn(2, 2, 0x28, "goto"),
+            insn(4, 2, 0x00, "nop"),
+        ];
+        let tries = [TryBlock {
+            start_unit: 0,
+            insn_count: 2,
+            handlers: vec![Handler {
+                catch_type: None,
+                catch_all: true,
+                addr: 2,
+            }],
+        }];
+        assert_eq!(
+            structure_of(&forward, &insns, &tries),
+            BTreeSet::from([Structure::Try, Structure::CatchAll, Structure::Monitor])
+        );
+
+        let backward = [
+            insn(4, 2, 0x00, "nop"),
+            insn(6, 2, 0x28, "goto"),
+            insn(8, 6, 0x2b, "packed-switch"),
+        ];
+        assert_eq!(
+            structure_of(&backward, &insns, &[]),
+            BTreeSet::from([Structure::Switch, Structure::Loop])
+        );
+        assert!(structure_of(&[], &[], &[]).is_empty());
     }
 
     #[test]
@@ -1894,6 +2467,7 @@ mod tests {
             line: 1,
             detail: Some(detail.to_string()),
             origin: None,
+            cause: None,
         }
     }
 
@@ -1987,6 +2561,7 @@ mod tests {
             line,
             detail: Some(name.to_string()),
             origin,
+            cause: None,
         }
     }
 
@@ -2071,7 +2646,7 @@ mod tests {
             wide(Kind::WideParam, 1, "p", None),
         ];
         let mut t = Totals::default();
-        t.add_method(true, 0, &found);
+        t.add_method(true, 0, &found, &BTreeSet::new());
         assert_eq!(t.methods_clean, 1);
         let report = Report::new(
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
@@ -2095,10 +2670,15 @@ mod tests {
     #[test]
     fn totaux_comptent_les_methodes_propres() {
         let mut t = Totals::default();
-        t.add_method(true, 0, &[]);
-        t.add_method(true, 1, &[]);
-        t.add_method(false, 0, &[]);
-        t.add_method(true, 0, &[Suspect::at(Kind::UndefinedVar, 3)]);
+        t.add_method(true, 0, &[], &BTreeSet::new());
+        t.add_method(true, 1, &[], &BTreeSet::new());
+        t.add_method(false, 0, &[], &BTreeSet::new());
+        t.add_method(
+            true,
+            0,
+            &[Suspect::at(Kind::UndefinedVar, 3)],
+            &BTreeSet::new(),
+        );
         t.add_outside(2);
         assert_eq!(t.methods_total, 4);
         assert_eq!(t.methods_analyzed, 3);
@@ -2110,8 +2690,8 @@ mod tests {
 
     fn write_bundle(dir: &Path, rev: &str, kind: &str, line: usize) {
         let mut totals = Totals::default();
-        totals.add_method(true, 0, &[]);
-        totals.add_method(true, 0, &[]);
+        totals.add_method(true, 0, &[], &BTreeSet::new());
+        totals.add_method(true, 0, &[], &BTreeSet::new());
         *totals.suspect.by_kind.get_mut(kind).unwrap() += 1;
         totals.methods_clean -= 1;
         let report = Report::new(
@@ -2192,11 +2772,11 @@ mod tests {
             wide(Kind::WideParam, 1, "p", None),
         ];
         let mut t = Totals::default();
-        t.add_method(true, 0, &wide_only);
+        t.add_method(true, 0, &wide_only, &BTreeSet::new());
         assert_eq!(t.methods_clean, 1);
         let mut with_defect = wide_only.to_vec();
         with_defect.push(Suspect::at(Kind::UndefinedVar, 3));
-        t.add_method(true, 0, &with_defect);
+        t.add_method(true, 0, &with_defect, &BTreeSet::new());
         assert_eq!(t.methods_clean, 1);
         assert_eq!(t.suspect.by_kind["wide_local"], 2);
         assert_eq!(t.suspect.by_kind["wide_param"], 2);

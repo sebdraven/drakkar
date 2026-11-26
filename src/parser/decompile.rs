@@ -10,7 +10,7 @@ use crate::parser::diff_dex::opcode_fingerprint;
 use crate::parser::diff_matrix::is_application_class;
 use crate::parser::disasm::{self, ClassDisasm, DisasmReport, Insn, MethodDisasm};
 use crate::parser::dyn_entrypoints::InputKind;
-use crate::parser::fidelity::{self, MethodFacts, MethodSpan, Suspect};
+use crate::parser::fidelity::{self, MethodFacts, MethodSpan, Structure, Suspect};
 use crate::parser::source::Source;
 use anyhow::{bail, Context, Result};
 use dex_decompiler::java::descriptor_to_java;
@@ -18,6 +18,7 @@ use dex_decompiler::{Decompiler, DexFile, EncodedMethod};
 use rayon::prelude::*;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 
@@ -106,6 +107,7 @@ pub struct MethodRecord {
     /// Nœuds ERROR et MISSING de tree-sitter-java dans `java_lines`.
     pub syntax_errors: usize,
     pub suspect: Vec<Suspect>,
+    pub structure: BTreeSet<Structure>,
 }
 
 #[derive(Debug, Serialize)]
@@ -697,7 +699,12 @@ fn process_class<'a>(
     let statuses: Vec<Status> = methods.iter().map(|m| m.decompile_status).collect();
     let mut totals = fidelity::Totals::default();
     for m in &methods {
-        totals.add_method(m.java_lines.is_some(), m.syntax_errors, &m.suspect);
+        totals.add_method(
+            m.java_lines.is_some(),
+            m.syntax_errors,
+            &m.suspect,
+            &m.structure,
+        );
     }
     totals.add_outside(syntax_errors_outside_methods);
     let suspect_methods = methods
@@ -822,6 +829,7 @@ fn render_class<'a>(
             },
         }
         dasm_slots.push(slot);
+        let structure = method_facts.structure.clone();
         facts.push(method_facts);
 
         let outcome = match (enc, dec.as_ref()) {
@@ -890,6 +898,7 @@ fn render_class<'a>(
             dasm_lines: None,
             syntax_errors: 0,
             suspect: Vec::new(),
+            structure,
         });
     }
     if id.is_some() {
@@ -1387,12 +1396,31 @@ classes/<id>.json — une entrée par méthode : direct puis virtual, ordre du D
                    Java de la méthode, line = ligne dans classes/<id>.java.
                    kind : voir Fidélité du Java. Vide quand java_lines est null.
     detail         Présent pour lost_call (nom de la méthode appelée),
-                   lost_string (la chaîne, en clair), wide_local et wide_param
-                   (nom de la variable) ; absent sinon. Une chaîne de plus de
-                   120 caractères est coupée et suivie de
-                   `… [tronquée, N caractères]`.
+                   lost_string (la chaîne, en clair), wide_local, wide_param,
+                   undefined_var et out_of_scope (nom de la variable) ; absent
+                   sinon. Une chaîne de plus de 120 caractères est coupée et
+                   suivie de `… [tronquée, N caractères]`.
     origin         Présent pour wide_local seulement : call, field, array ou
                    other (voir wide_local).
+    cause          Présent pour undefined_var (assigned ou never_assigned) et
+                   out_of_scope (try, catch, finally, switch, loop, if ou
+                   block) seulement ; valeurs définies sous ces deux kinds.
+  structure        Traits de structure du BYTECODE de la méthode, liste triée,
+                   vide si aucun trait, sans code ou si le décodage échoue.
+                   Lus sur les instructions et la table de try, pas sur le
+                   Java :
+                     try        au moins un try_item ;
+                     catch_all  au moins un handler catch-all, forme que
+                                prennent finally et synchronized une fois
+                                compilés ;
+                     monitor    au moins un monitor-enter ;
+                     switch     au moins un packed-switch ou sparse-switch ;
+                     loop       au moins un goto, goto/16, goto/32 ou if-*
+                                dont la cible est à un offset inférieur ou
+                                égal au sien. Un saut arrière est un indice de
+                                boucle, pas une preuve : l'ordre des blocs est
+                                celui du compilateur.
+                   Une table de try illisible ne donne ni try ni catch_all.
 
 decompile_status
   ok       decompile_method de dex-decompiler a rendu du Java sans erreur et
@@ -1447,8 +1475,9 @@ Fidélité du Java — banc de mesure du décompilateur
   constructeur, <clinit> ↔ bloc static, sinon le nom de la déclaration. Une
   déclaration introuvable ou d'un autre nom : syntax_errors est compté, suspect
   reste vide. Les détecteurs sont SYNTAXIQUES : ils signalent un Java
-  suspect, ils ne prouvent rien sur le bytecode. Aucun ne suit la portée des
-  blocs : un nom est « déclaré » s'il l'est n'importe où dans la méthode.
+  suspect, ils ne prouvent rien sur le bytecode. Seul out_of_scope suit la
+  portée des blocs ; pour les autres, un nom est « déclaré » s'il l'est
+  n'importe où dans la méthode.
   kind
     literal_receiver   L'objet d'un appel ou d'un accès de champ est un
                        littéral numérique, null, true, false ou un caractère,
@@ -1472,6 +1501,56 @@ Fidélité du Java — banc de mesure du décompilateur
                        (lu dans le class_data du DEX). Faux positifs attendus :
                        champ hérité d'une superclasse écrit sans this., champ
                        d'une classe englobante, constante importée en static.
+                       Un suspect par usage, le nom dans detail ; deux usages
+                       du même nom sur une même ligne n'en font qu'un.
+                       cause :
+                         assigned        le nom est le membre gauche d'une
+                                         affectation (=, +=…) quelque part
+                                         dans la méthode : la valeur existe,
+                                         sa déclaration a été perdue ;
+                         never_assigned  aucune affectation : la définition
+                                         elle-même a été perdue.
+    out_of_scope       Identifiant aux mêmes positions qu'undefined_var, ni
+                       champ de la classe ni undefined_var (donc déclaré
+                       quelque part dans la méthode), dont AUCUNE déclaration
+                       n'est visible depuis l'usage. Une déclaration est
+                       visible si le nœud qui porte sa portée contient l'usage
+                       et si son nom commence avant lui. Portée :
+                         locale              le bloc qui contient directement
+                                             la déclaration ; déclarée dans
+                                             un case, le reste du bloc
+                                             switch, case suivants compris ;
+                                             le nœud ERROR qui la contient
+                                             directement, le cas échéant ;
+                         init d'un for, variable d'un for-each
+                                             le for ;
+                         paramètre de catch  la clause catch ;
+                         ressource           le try-with-resources ;
+                         paramètre           la méthode, ou la lambda ;
+                         motif instanceof    toute la méthode —
+                                             APPROXIMATION : Java le limite
+                                             aux endroits où le test est
+                                             vrai ;
+                         champ d'une classe anonyme inlinée
+                                             le corps de cette classe, sans
+                                             condition d'ordre.
+                       Un suspect par usage, le nom dans detail ; deux usages
+                       du même nom sur une même ligne n'en font qu'un.
+                       cause : région de la déclaration la plus proche qui
+                       précède l'usage (à défaut, la première de la méthode),
+                       soit la plus intérieure des régions suivantes qui
+                       contient cette déclaration sans contenir l'usage :
+                         try      bloc d'un try, ou ressource d'un
+                                  try-with-resources ;
+                         catch    clause catch (paramètre ou corps) ;
+                         finally  bloc finally ;
+                         switch   bloc d'un switch, groupe de case, règle -> ;
+                         loop     for, for-each, while, do (en-tête ou
+                                  corps) ;
+                         if       if (condition, then ou else) ;
+                         block    aucune de ces régions : bloc simple, ou
+                                  déclaration placée après l'usage dans une
+                                  portée qui le contient.
     dead_after_return  Instruction qui suit return, throw, break ou continue
                        dans le même bloc (ou le même groupe de case). Une seule
                        par bloc : la première. Faux positif : aucun connu en
@@ -1601,6 +1680,36 @@ fidelity.json
                    fidelity.json antérieur : --bench-diff le lit comme 0, et
                    les kinds absents aussi — comparé à un bundle plus ancien,
                    wide_local et wide_param ressortent en régressions.
+    undefined_var_by_cause
+                   {assigned, never_assigned} : undefined_var réparti par
+                   cause ; la somme vaut suspect.undefined_var.
+    out_of_scope_by_cause
+                   {try, catch, finally, switch, loop, if, block} :
+                   out_of_scope réparti par cause ; la somme vaut
+                   suspect.out_of_scope.
+                   Ces deux objets sont absents d'un fidelity.json antérieur
+                   à out_of_scope : lus comme 0.
+  by_structure     Une ligne par trait de structure (try, catch_all, monitor,
+                   switch, loop : voir structure dans classes/<id>.json),
+                   plus none pour les méthodes sans aucun trait. Méthodes
+                   relues seulement (java_lines non null). Une méthode à
+                   plusieurs traits compte dans chacune de leurs lignes : les
+                   lignes ne se somment pas en methods_analyzed, seule none
+                   est disjointe des autres. Chaque ligne :
+    methods        Méthodes relues qui ont le trait.
+    clean          Parmi elles, propres au sens de methods_clean.
+    with_syntax_errors
+                   Parmi elles, au moins une erreur de syntaxe.
+    syntax_errors  Somme de leurs syntax_errors.
+    with_undefined_var
+                   Parmi elles, au moins un undefined_var.
+    with_out_of_scope
+                   Parmi elles, au moins un out_of_scope.
+                   CORRÉLATION, pas attribution de cause : une ligne compte
+                   les méthodes QUI ONT le trait, pas les défauts que le
+                   trait provoque ; le défaut d'une méthode try + loop compte
+                   dans les deux lignes. Absent d'un fidelity.json antérieur :
+                   lu comme des lignes à 0.
   Une classe que le banc n'a pas pu relire (errors.json, stage fidelity)
   compte ses méthodes sans défaut : vérifier errors.json avant de conclure.
 
@@ -1620,8 +1729,12 @@ fidelity.json
   deux bundles d'une même entrée ont les mêmes id. Un kind est comparé en
   NOMBRE : une méthode qui perd g au lieu de f ne change pas. wide_local et
   wide_param figurent dans le tableau, mais leur hausse ne rend pas worse
-  vrai : ce sont des imprécisions, pas des défauts. wide_local_by_origin n'est
-  pas dans le tableau. --format json : {sha256,
+  vrai : ce sont des imprécisions, pas des défauts. out_of_scope est un défaut
+  comme les autres. wide_local_by_origin, undefined_var_by_cause,
+  out_of_scope_by_cause et by_structure ne sont pas dans le tableau. Comparé à
+  un bundle antérieur à out_of_scope, out_of_scope ressort en régression et
+  undefined_var peut monter : il comptait alors un suspect par ligne, il en
+  compte désormais un par nom et par ligne. --format json : {sha256,
   rev_a, rev_b, same_rev, counters: [{counter, a, b, delta}], regressions et
   corrections: [{class_id, method, descriptor, kind, a, b, lines, details?}],
   worse}.
